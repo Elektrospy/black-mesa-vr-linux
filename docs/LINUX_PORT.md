@@ -4,7 +4,7 @@ Two separate things live here. Keep them apart.
 
 | | Black Mesa **through Proton** (Windows build) | Black Mesa **native Linux build** |
 |---|---|---|
-| Status | Reported working (see `docs/open-work-2026-10.md`: PSVR2, SteamVR on Linux, OpenXR helper) | **Not working. Milestone 1 only (observe-only shim).** |
+| Status | Reported working (see `docs/open-work-2026-10.md`: PSVR2, SteamVR on Linux, OpenXR helper) | **Not working. Milestone 1 done (observe-only shim); stage 2a (GPU hand-off test) in progress.** |
 | Mod | The normal `d3d9.dll` + `OpenXRHelper64.exe` | `linux/` (this port, not a VR mod yet) |
 | Install | `scripts/bmvr-linux.sh` | `scripts/build-linux.sh` |
 
@@ -121,13 +121,59 @@ Verified (on a Linux dev machine, with stand-ins):
   called through the PLT, every call is forwarded with correct arguments and return values.
 - GL report and log rate-limiting against a mock SDL/GL.
 
-**Not verified**: anything inside the real game. The shim has not been run against the real
-`libtogl.so` / `shaderapidx9.so`, no frame has been captured, and no VR output exists.
+**Verified in the real game** (NVIDIA RTX 3080, driver 620.70.06, CachyOS, Steam Linux Runtime
+soldier): the launcher chain (host wrapper -> `bmvr-bms.sh` -> original `bms.sh`) puts the shim
+into `bms_linux`; `CreateDevice` / `Present` / `CreateRenderTarget` are interposed and forwarded;
+the render-target list is logged (3840x2160 `_rt_fullframefb`, `_rt_fullscreen`, `_rt_hud`,
+`_rt_gbdepth`, CSM shadow targets, ...); the GL report works and shows `GL_EXT_memory_object_fd`
+and `GL_EXT_semaphore_fd` are available. Gotcha found on the way: the engine loads `libtogl.so` and
+SDL with `RTLD_LOCAL`, so `dlsym(RTLD_NEXT/RTLD_DEFAULT)` cannot see them; the shim looks them up
+through an explicit `RTLD_NOLOAD` handle (see `find_loaded_lib`).
+
+## Stage 2a: GPU hand-off test (`linux/bmvr_xfer_helper.c` + `xfer_*` in the shim)
+
+Question it answers: can a 64-bit process share GPU memory with the 32-bit game? (Required for
+OpenXR: the runtime is 64-bit, the game is 32-bit.)
+
+    64-bit helper                                32-bit game (shim)
+    Vulkan image, exportable memory   --fd-->    glImportMemoryFdEXT -> GL texture
+    (VK_KHR_external_memory_fd)       (unix      glBlitFramebuffer(back buffer -> texture)
+    reads the image back, writes      socket,    every ~120 presents, then glFinish
+    bmvr_snapshot_N.ppm               SCM_RIGHTS) and waits for the helper's ack
+
+Use it: start `"<game>/bmvr_xfer_helper"` in a terminal **before** the game (the installer puts
+it there; it needs the Vulkan headers to build, see `scripts/build-linux.sh` output), start the
+game from Steam, load a map for ~10 s. Result: `bmvr_snapshot_0.ppm` in the game folder (a
+picture, scaled to 1920x1080 and upright) and `xfer:` lines in `bmvr_linux_log.txt`. Options:
+`--size WxH`, `--gpu N`, `--snapshots N`. The helper prints its Vulkan device UUID; the shim logs
+`GL device UUID`. They must match (relevant on hybrid-GPU laptops).
+
+Design notes:
+- The shim does nothing unless `<game>/bmvr_xfer.sock` exists; if the helper dies, the shim
+  logs it, deletes its GL objects and goes back to looking. It never blocks longer than 2 s
+  (socket timeouts), uses `MSG_NOSIGNAL`, and saves/restores the GL state it touches (FBO
+  bindings, texture binding, scissor enable).
+- Synchronisation here is a full `glFinish` plus an explicit ack message, so a frame is never read
+  while it is being written. The real renderer must use `GL_EXT_semaphore_fd` /
+  `VK_KHR_external_semaphore_fd` instead; that is the next step after this test works.
+- The image is kept in `VK_IMAGE_LAYOUT_GENERAL` (an `UNDEFINED` old layout may discard
+  contents).
+- The test copies the default framebuffer, i.e. the final composed desktop frame, not an eye
+  target. If ToGL renders to an offscreen target and only blits during `Present`, the snapshot
+  could be black; the helper reports the share of non-black pixels and the shim logs the
+  bound framebuffers, which tells us what to read instead.
+
+Verified with stand-ins on a Linux dev machine (no GPU there): the socket protocol and fd passing
+against a mock helper; the exact sequence and arguments of the GL calls against a recording fake
+GL (import, tiling, storage, flipped blit, state restore); helper death mid-session (no hang, no
+crash, clean teardown and re-search); the 64-bit helper compiles and runs up to Vulkan device
+enumeration. **Not verified**: the Vulkan side on a real GPU, the real `glImportMemoryFdEXT`, and
+whether the snapshot contains the game picture. That is what the test is for.
 
 ## Plan (not implemented)
 
-1. Read the milestone-1 log; confirm eye-target candidates and driver extensions.
-2. Capture the eye render targets (GL texture names via the bound framebuffer after
+1. ~~Read the milestone-1 log; confirm eye-target candidates and driver extensions.~~ Done.
+2. (Stage 2a above tests the transport.) Then capture the eye render targets (GL texture names via the bound framebuffer after
    `SetRenderTarget`/draw), hand them to a 64-bit native OpenXR helper through
    `VK_KHR_external_memory_fd` / `GL_EXT_memory_object_fd`.
 3. Find and port the ~100 game hooks (Itanium ABI: cdecl with `this` first, destructor

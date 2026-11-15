@@ -30,6 +30,10 @@
 #include <sys/time.h>
 #include <dlfcn.h>
 #include <stdlib.h>
+#include <errno.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include "bmvr_xfer.h"
 
 /* Portability: this library is loaded into the game, which Steam may run inside an OLDER
  * glibc (Steam Linux Runtime). Built on a modern distro it would require dlsym@GLIBC_2.34
@@ -179,6 +183,7 @@ typedef void *(*PFN_SDL_GL_GetCurrentContext)(void);
 #define GL_VIEWPORT 0x0BA2
 
 static int g_gl_reported;
+static PFN_SDL_GL_GetProcAddress g_getproc; /* set once the GL report succeeded; used by the xfer code */
 
 static int str_eq(const char *a, const char *b) { return strcmp(a, b) == 0; }
 
@@ -212,6 +217,7 @@ static void report_gl_once(void)
     }
 
     g_gl_reported = 1;
+    g_getproc = getproc;
     bmvr_log("GL vendor:   %s", glGetString(GL_VENDOR));
     bmvr_log("GL renderer: %s", glGetString(GL_RENDERER));
     bmvr_log("GL version:  %s", glGetString(GL_VERSION));
@@ -234,9 +240,316 @@ static void report_gl_once(void)
     bmvr_log("  GL_EXT_semaphore          : %s", has_sem ? "YES" : "no");
     bmvr_log("  GL_EXT_semaphore_fd       : %s", has_semfd ? "YES" : "no");
     bmvr_log("  GL_EXT_EGL_image_storage  : %s", has_dma ? "YES" : "no");
+    if (has_memfd) { /* must equal the helper's Vulkan device UUID, or the memory cannot be shared */
+        typedef void (*PFN_glGetUnsignedBytevEXT)(unsigned, unsigned char *);
+        PFN_glGetUnsignedBytevEXT getub = (PFN_glGetUnsignedBytevEXT)getproc("glGetUnsignedBytevEXT");
+        if (getub) {
+            unsigned char u[16];
+            char s[40];
+            memset(u, 0, sizeof u);
+            getub(0x9597 /* GL_DEVICE_UUID_EXT */, u);
+            for (int i = 0; i < 16; i++) snprintf(s + i * 2, 3, "%02x", u[i]);
+            bmvr_log("GL device UUID: %s", s);
+        }
+    }
     int vp[4] = {0, 0, 0, 0};
     glGetIntegerv(GL_VIEWPORT, vp);
     bmvr_log("GL viewport at first Present: %d %d %d %d", vp[0], vp[1], vp[2], vp[3]);
+}
+
+/* ============================================================ stage 2a: GPU hand-off test
+ * Optional and passive: nothing happens unless the 64-bit helper (bmvr_xfer_helper) is running
+ * and has created "<game folder>/bmvr_xfer.sock". Then, once per XFER_EVERY presents, the frame
+ * about to be presented is blitted into a texture backed by the helper's Vulkan memory. The helper
+ * writes it to a PPM file. See linux/bmvr_xfer.h for the protocol.
+ *
+ * Safety: if anything fails the shim logs "xfer: ..." and goes back to doing nothing; the game is
+ * never blocked for longer than the 2 s socket timeout, and GL state is saved/restored around
+ * every use. */
+#define XFER_EVERY 120          /* presents between snapshots (~2 s at 60 fps) */
+#define XFER_RETRY 240          /* presents between attempts to find the helper */
+#define XFER_TIMEOUT_SEC 2
+
+#define GL_TEXTURE_2D 0x0DE1
+#define GL_TEXTURE_BINDING_2D 0x8069
+#define GL_READ_FRAMEBUFFER 0x8CA8
+#define GL_DRAW_FRAMEBUFFER 0x8CA9
+#define GL_READ_FRAMEBUFFER_BINDING 0x8CAA
+#define GL_COLOR_ATTACHMENT0 0x8CE0
+#define GL_FRAMEBUFFER_COMPLETE 0x8CD5
+#define GL_COLOR_BUFFER_BIT 0x4000
+#define GL_LINEAR 0x2601
+#define GL_SCISSOR_TEST 0x0C11
+#define GL_READ_BUFFER 0x0C02
+#define GL_TEXTURE_TILING_EXT 0x9580
+#define GL_DEDICATED_MEMORY_OBJECT_EXT 0x9581
+#define GL_OPTIMAL_TILING_EXT 0x9584
+#define GL_HANDLE_TYPE_OPAQUE_FD_EXT 0x9586
+
+typedef void (*PFN_glCreateMemoryObjectsEXT)(int, unsigned *);
+typedef void (*PFN_glDeleteMemoryObjectsEXT)(int, const unsigned *);
+typedef void (*PFN_glMemoryObjectParameterivEXT)(unsigned, unsigned, const int *);
+typedef void (*PFN_glImportMemoryFdEXT)(unsigned, uint64_t, unsigned, int);
+typedef void (*PFN_glTexStorageMem2DEXT)(unsigned, int, unsigned, int, int, unsigned, uint64_t);
+typedef void (*PFN_glGenTextures)(int, unsigned *);
+typedef void (*PFN_glDeleteTextures)(int, const unsigned *);
+typedef void (*PFN_glBindTexture)(unsigned, unsigned);
+typedef void (*PFN_glTexParameteri)(unsigned, unsigned, int);
+typedef void (*PFN_glGenFramebuffers)(int, unsigned *);
+typedef void (*PFN_glDeleteFramebuffers)(int, const unsigned *);
+typedef void (*PFN_glBindFramebuffer)(unsigned, unsigned);
+typedef void (*PFN_glFramebufferTexture2D)(unsigned, unsigned, unsigned, unsigned, int);
+typedef unsigned (*PFN_glCheckFramebufferStatus)(unsigned);
+typedef void (*PFN_glBlitFramebuffer)(int, int, int, int, int, int, int, int, unsigned, unsigned);
+typedef void (*PFN_glFinish)(void);
+typedef unsigned (*PFN_glGetError)(void);
+typedef unsigned char (*PFN_glIsEnabled)(unsigned);
+typedef void (*PFN_glEnable)(unsigned);
+typedef void (*PFN_glDisable)(unsigned);
+
+static struct {
+    PFN_glCreateMemoryObjectsEXT CreateMemoryObjects;
+    PFN_glDeleteMemoryObjectsEXT DeleteMemoryObjects;
+    PFN_glMemoryObjectParameterivEXT MemoryObjectParameteriv;
+    PFN_glImportMemoryFdEXT ImportMemoryFd;
+    PFN_glTexStorageMem2DEXT TexStorageMem2D;
+    PFN_glGenTextures GenTextures;
+    PFN_glDeleteTextures DeleteTextures;
+    PFN_glBindTexture BindTexture;
+    PFN_glTexParameteri TexParameteri;
+    PFN_glGenFramebuffers GenFramebuffers;
+    PFN_glDeleteFramebuffers DeleteFramebuffers;
+    PFN_glBindFramebuffer BindFramebuffer;
+    PFN_glFramebufferTexture2D FramebufferTexture2D;
+    PFN_glCheckFramebufferStatus CheckFramebufferStatus;
+    PFN_glBlitFramebuffer BlitFramebuffer;
+    PFN_glFinish Finish;
+    PFN_glGetError GetError;
+    PFN_glIsEnabled IsEnabled;
+    PFN_glEnable Enable;
+    PFN_glDisable Disable;
+    PFN_glGetIntegerv GetIntegerv;
+} xgl;
+
+static int g_x_state;            /* 0 = looking for the helper, 1 = connected, -1 = given up */
+static int g_x_sock = -1;
+static unsigned g_x_tick;
+static unsigned g_x_snapshots;
+static uint32_t g_x_w, g_x_h;
+static unsigned g_x_mem, g_x_tex, g_x_fbo;
+
+static int xfer_resolve_gl(void)
+{
+    static int tried, ok;
+    if (tried) return ok;
+    tried = 1;
+    PFN_SDL_GL_GetProcAddress gp = g_getproc;
+    if (!gp) { tried = 0; return 0; }
+#define R(field, name) xgl.field = (void *)gp(name); if (!xgl.field) { bmvr_log("xfer: GL entry point %s missing", name); return 0; }
+    R(CreateMemoryObjects, "glCreateMemoryObjectsEXT") R(DeleteMemoryObjects, "glDeleteMemoryObjectsEXT")
+    R(MemoryObjectParameteriv, "glMemoryObjectParameterivEXT") R(ImportMemoryFd, "glImportMemoryFdEXT")
+    R(TexStorageMem2D, "glTexStorageMem2DEXT") R(GenTextures, "glGenTextures") R(DeleteTextures, "glDeleteTextures")
+    R(BindTexture, "glBindTexture") R(TexParameteri, "glTexParameteri") R(GenFramebuffers, "glGenFramebuffers")
+    R(DeleteFramebuffers, "glDeleteFramebuffers") R(BindFramebuffer, "glBindFramebuffer")
+    R(FramebufferTexture2D, "glFramebufferTexture2D") R(CheckFramebufferStatus, "glCheckFramebufferStatus")
+    R(BlitFramebuffer, "glBlitFramebuffer") R(Finish, "glFinish") R(GetError, "glGetError") R(IsEnabled, "glIsEnabled")
+    R(Enable, "glEnable") R(Disable, "glDisable") R(GetIntegerv, "glGetIntegerv")
+#undef R
+    ok = 1;
+    return 1;
+}
+
+static void xfer_teardown(void)
+{
+    if (g_x_sock >= 0) { close(g_x_sock); g_x_sock = -1; }
+    if (xgl.DeleteFramebuffers && g_x_fbo) xgl.DeleteFramebuffers(1, &g_x_fbo);
+    if (xgl.DeleteTextures && g_x_tex) xgl.DeleteTextures(1, &g_x_tex);
+    if (xgl.DeleteMemoryObjects && g_x_mem) xgl.DeleteMemoryObjects(1, &g_x_mem);
+    g_x_fbo = g_x_tex = g_x_mem = 0;
+}
+
+static void xfer_set_timeout(int fd)
+{
+    struct timeval tv;
+    tv.tv_sec = XFER_TIMEOUT_SEC;
+    tv.tv_usec = 0;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+}
+
+/* GL errors are drained and logged (first few only) so a bad call shows up in the log. */
+static int xfer_gl_ok(const char *what)
+{
+    unsigned e = xgl.GetError();
+    if (!e) return 1;
+    static unsigned logged;
+    if (logged++ < 8) bmvr_log("xfer: GL error 0x%x after %s", e, what);
+    while (xgl.GetError()) { /* drain */ }
+    return 0;
+}
+
+/* Receive hello + fd from the helper and import the memory as a GL texture. */
+static int xfer_connect_and_import(void)
+{
+    char path[sizeof(((struct sockaddr_un *)0)->sun_path) + 400];
+    char exe[400];
+    ssize_t n = readlink("/proc/self/exe", exe, sizeof exe - 1);
+    if (n <= 0) return 0;
+    exe[n] = 0;
+    char *slash = strrchr(exe, '/');
+    if (!slash) return 0;
+    *slash = 0;
+    snprintf(path, sizeof path, "%s/%s", exe, BMVR_XFER_SOCKET_NAME);
+    struct sockaddr_un sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sun_family = AF_UNIX;
+    if (strlen(path) >= sizeof sa.sun_path) {
+        bmvr_log("xfer: socket path too long for a unix socket (%u chars): %s", (unsigned)strlen(path), path);
+        g_x_state = -1;
+        return 0;
+    }
+    strcpy(sa.sun_path, path);
+
+    int s = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (s < 0) return 0;
+    if (connect(s, (struct sockaddr *)&sa, sizeof sa) < 0) {
+        static int told;
+        if (!told++) bmvr_log("xfer: helper not running (no %s); will keep checking quietly", path);
+        close(s);
+        return 0;
+    }
+    xfer_set_timeout(s);
+
+    struct bmvr_xfer_hello h;
+    struct iovec iov;
+    iov.iov_base = &h;
+    iov.iov_len = sizeof h;
+    char ctl[CMSG_SPACE(sizeof(int))];
+    memset(ctl, 0, sizeof ctl);
+    struct msghdr m;
+    memset(&m, 0, sizeof m);
+    m.msg_iov = &iov;
+    m.msg_iovlen = 1;
+    m.msg_control = ctl;
+    m.msg_controllen = sizeof ctl;
+    ssize_t got = recvmsg(s, &m, 0);
+    int fd = -1;
+    struct cmsghdr *c = CMSG_FIRSTHDR(&m);
+    if (c && c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_RIGHTS) memcpy(&fd, CMSG_DATA(c), sizeof fd);
+    if (got != (ssize_t)sizeof h || fd < 0 || h.magic != BMVR_XFER_MAGIC_HELLO || h.version != BMVR_XFER_VERSION ||
+        !h.width || !h.height || h.width > 8192 || h.height > 8192) {
+        bmvr_log("xfer: bad hello from helper (got %d bytes, fd %d)", (int)got, fd);
+        if (fd >= 0) close(fd);
+        close(s);
+        return 0;
+    }
+    bmvr_log("xfer: helper connected: shared image %ux%u, memory %llu bytes, fd %d", h.width, h.height,
+             (unsigned long long)h.memory_size, fd);
+
+    if (!xfer_resolve_gl()) { close(fd); close(s); g_x_state = -1; return 0; }
+    while (xgl.GetError()) { /* drain errors left by the game */ }
+
+    int old_tex = 0;
+    xgl.GetIntegerv(GL_TEXTURE_BINDING_2D, &old_tex);
+
+    int one = 1, ok = 1;
+    xgl.CreateMemoryObjects(1, &g_x_mem);
+    ok &= xfer_gl_ok("glCreateMemoryObjectsEXT");
+    if (h.dedicated) { xgl.MemoryObjectParameteriv(g_x_mem, GL_DEDICATED_MEMORY_OBJECT_EXT, &one); ok &= xfer_gl_ok("dedicated flag"); }
+    xgl.ImportMemoryFd(g_x_mem, h.memory_size, GL_HANDLE_TYPE_OPAQUE_FD_EXT, fd); /* on success GL owns the fd */
+    int imp = xfer_gl_ok("glImportMemoryFdEXT");
+    ok &= imp;
+    if (!imp) close(fd);
+    xgl.GenTextures(1, &g_x_tex);
+    xgl.BindTexture(GL_TEXTURE_2D, g_x_tex);
+    if (h.optimal_tiling) xgl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_TILING_EXT, (int)GL_OPTIMAL_TILING_EXT);
+    xgl.TexStorageMem2D(GL_TEXTURE_2D, 1, h.gl_internal_format, (int)h.width, (int)h.height, g_x_mem, 0);
+    ok &= xfer_gl_ok("glTexStorageMem2DEXT");
+    xgl.BindTexture(GL_TEXTURE_2D, (unsigned)old_tex);
+
+    if (ok) {
+        int old_draw = 0, old_read = 0;
+        xgl.GetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &old_draw);
+        xgl.GetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &old_read);
+        xgl.GenFramebuffers(1, &g_x_fbo);
+        xgl.BindFramebuffer(GL_DRAW_FRAMEBUFFER, g_x_fbo);
+        xgl.FramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g_x_tex, 0);
+        unsigned st = xgl.CheckFramebufferStatus(GL_DRAW_FRAMEBUFFER);
+        xgl.BindFramebuffer(GL_DRAW_FRAMEBUFFER, (unsigned)old_draw);
+        xgl.BindFramebuffer(GL_READ_FRAMEBUFFER, (unsigned)old_read);
+        if (st != GL_FRAMEBUFFER_COMPLETE) { bmvr_log("xfer: framebuffer on the imported texture is incomplete (0x%x)", st); ok = 0; }
+        ok &= xfer_gl_ok("framebuffer setup");
+    }
+    if (!ok) {
+        bmvr_log("xfer: import failed; stage 2a disabled for this session");
+        xfer_teardown();
+        close(s);
+        g_x_state = -1;
+        return 0;
+    }
+    g_x_w = h.width;
+    g_x_h = h.height;
+    g_x_sock = s;
+    g_x_state = 1;
+    bmvr_log("xfer: imported the helper's Vulkan memory as GL texture %u; snapshots every %d presents", g_x_tex, XFER_EVERY);
+    return 1;
+}
+
+/* Blit the frame about to be presented into the shared texture, then tell the helper. */
+static void xfer_snapshot(void)
+{
+    int vp[4] = {0, 0, 0, 0}, old_draw = 0, old_read = 0, read_buf = 0;
+    xgl.GetIntegerv(GL_VIEWPORT, vp);
+    xgl.GetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &old_draw);
+    xgl.GetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &old_read);
+    xgl.GetIntegerv(GL_READ_BUFFER, &read_buf);
+    int sw = vp[2], sh = vp[3];
+    if (sw <= 0 || sh <= 0) return;
+    if (g_x_snapshots == 0)
+        bmvr_log("xfer: first snapshot: read fb=%d draw fb=%d read buffer=0x%x viewport=%dx%d (reading from the default framebuffer)",
+                 old_read, old_draw, read_buf, sw, sh);
+
+    unsigned char scissor = xgl.IsEnabled(GL_SCISSOR_TEST);
+    if (scissor) xgl.Disable(GL_SCISSOR_TEST);
+    while (xgl.GetError()) { /* drain */ }
+    xgl.BindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+    xgl.BindFramebuffer(GL_DRAW_FRAMEBUFFER, g_x_fbo);
+    /* Destination Y range is flipped: GL rows start at the bottom, the Vulkan image's row 0 is the top. */
+    xgl.BlitFramebuffer(0, 0, sw, sh, 0, (int)g_x_h, (int)g_x_w, 0, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+    int blit_ok = xfer_gl_ok("glBlitFramebuffer");
+    xgl.Finish(); /* test only: the real renderer will use GL_EXT_semaphore_fd instead of a full stall */
+    xgl.BindFramebuffer(GL_READ_FRAMEBUFFER, (unsigned)old_read);
+    xgl.BindFramebuffer(GL_DRAW_FRAMEBUFFER, (unsigned)old_draw);
+    if (scissor) xgl.Enable(GL_SCISSOR_TEST);
+    if (!blit_ok) return;
+
+    struct bmvr_xfer_frame fr;
+    fr.magic = BMVR_XFER_MAGIC_FRAME;
+    fr.tick = g_x_tick;
+    fr.src_w = (uint32_t)sw;
+    fr.src_h = (uint32_t)sh;
+    struct bmvr_xfer_ack ack;
+    if (send(g_x_sock, &fr, sizeof fr, MSG_NOSIGNAL) != (ssize_t)sizeof fr ||
+        recv(g_x_sock, &ack, sizeof ack, MSG_WAITALL) != (ssize_t)sizeof ack || ack.magic != BMVR_XFER_MAGIC_ACK) {
+        bmvr_log("xfer: lost the helper (no ack); back to searching");
+        xfer_teardown();
+        g_x_state = 0;
+        return;
+    }
+    if (g_x_snapshots++ < 3) bmvr_log("xfer: snapshot %u delivered (tick %u, %dx%d -> %ux%u)", g_x_snapshots, g_x_tick, sw, sh, g_x_w, g_x_h);
+}
+
+/* Called once per Present, after report_gl_once(), on the render thread (GL context current). */
+static void xfer_tick(void)
+{
+    if (g_x_state < 0 || !g_gl_reported) return;
+    g_x_tick++;
+    if (g_x_state == 0) {
+        if (g_x_tick % XFER_RETRY != 1) return;
+        if (!xfer_resolve_gl() || !xfer_connect_and_import()) return;
+        return; /* first snapshot on the next period */
+    }
+    if (g_x_tick % XFER_EVERY == 0) xfer_snapshot();
 }
 
 /* ------------------------------------------------------------------ counters */
@@ -276,6 +589,7 @@ BMVR_EXPORT HRESULT bmvr_Present(void *self, const void *src, const void *dst, v
     if (!real) real = (PFN_Present)real_sym(SYM_PRESENT);
     if (g_frames == 0) bmvr_log("Present: first call (device=%p) - interposition works", self);
     report_gl_once();
+    xfer_tick();
     g_frames++;
     uint64_t t = now_ns();
     if (!g_last_ns) g_last_ns = t;

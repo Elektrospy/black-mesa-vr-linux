@@ -58,7 +58,7 @@ SO="$GAME/bin/bmvr_preload32.so"
 [[ -f "$SO" ]] || { [[ -f "$GAME/bmvr_preload32.so" ]] && SO="$GAME/bmvr_preload32.so"; }
 
 echo; echo "== 1. files"
-for f in bms_linux bms.sh bms.exe bin/bmvr_preload32.so bmvr-run.sh bmvr-bms.sh bmvr_run_marker.txt bmvr_inner_marker.txt bmvr_preload32.so bmvr_linux_log.txt; do
+for f in bms_linux bms.sh bms.exe bin/bmvr_preload32.so bmvr-run.sh bmvr-bms.sh bmvr_run_marker.txt bmvr_inner_marker.txt bmvr_preload32.so bmvr_linux_log.txt bmvr_xfer_helper bmvr_xfer.sock; do
   if [[ -e "$GAME/$f" ]]; then printf '  %-22s present  (%s)\n' "$f" "$(stat -c '%y' "$GAME/$f" | cut -d. -f1)"; else printf '  %-22s MISSING\n' "$f"; fi
 done
 
@@ -130,6 +130,14 @@ for d in "$GAME" "$HOME" /tmp; do
   [[ -f "$d/bmvr_linux_log.txt" ]] && { echo "  FOUND $d/bmvr_linux_log.txt"; head -5 "$d/bmvr_linux_log.txt" | sed 's/^/    /'; }
 done
 find "$HOME" -maxdepth 4 -name bmvr_linux_log.txt -not -path "$GAME/*" 2>/dev/null | head -3 | sed 's/^/  also: /'
+
+echo; echo "== 5a. stage 2a (GPU hand-off test)"
+if [[ -f "$GAME/bmvr_linux_log.txt" ]]; then
+  grep -E "GL device UUID|xfer:" "$GAME/bmvr_linux_log.txt" | cut -c1-200 | sed 's/^/  /'
+  grep -q "xfer:" "$GAME/bmvr_linux_log.txt" || echo "  no xfer lines (helper not started before the game, or an old shim)"
+fi
+ls "$GAME"/bmvr_snapshot_*.ppm 2>/dev/null | sed 's/^/  snapshot: /'
+[[ -S "$GAME/bmvr_xfer.sock" ]] && echo "  helper socket present (helper is running)" || echo "  no helper socket (helper not running)"
 
 echo; echo "== 5b. did the wrapper run?"
 if [[ -f "$GAME/bmvr_run_marker.txt" ]]; then

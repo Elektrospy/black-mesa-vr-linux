@@ -51,9 +51,11 @@ if [[ "${1:-}" == "--uninstall" ]]; then
   U="${U%/}"
   [[ -f "$U/bms_linux" ]] || { echo "Not a native Black Mesa folder (no bms_linux): $U" >&2; exit 1; }
   for f in bin/bmvr_preload32.so bmvr_preload32.so bmvr-run.sh bmvr-bms.sh \
-           bmvr_run_marker.txt bmvr_inner_marker.txt bmvr_linux_log.txt; do
+           bmvr_run_marker.txt bmvr_inner_marker.txt bmvr_linux_log.txt \
+           bmvr_xfer_helper bmvr_xfer.sock; do
     [[ -e "$U/$f" ]] && { rm -f -- "$U/$f"; echo "Removed $U/$f"; }
   done
+  rm -f -- "$U"/bmvr_snapshot_*.ppm
   echo "Done. Now clear the Black Mesa launch options in Steam (they point at bmvr-run.sh)."
   exit 0
 fi
@@ -77,6 +79,27 @@ for s in _ZN16IDirect3DDevice97PresentEPK5_RECTS2_PvPK7RGNDATA \
 done
 [[ $missing -eq 0 ]] || exit 1
 echo "Exports OK."
+
+# Stage 2a: the 64-bit Vulkan helper for the GPU hand-off test. Built with the HOST compiler (64-bit),
+# not the 32-bit toolchain. Needs the Vulkan headers only (libvulkan is loaded with dlopen).
+# Failure here is not fatal: the shim itself does not need it.
+HELPER=""
+VKINC=""
+if ! echo '#include <vulkan/vulkan.h>' | cc -E -x c - >/dev/null 2>&1; then
+  for d in "$ROOT/research/dxvk-gplasync/drop-in-dxvk_new/include/vulkan/include"; do
+    [[ -f "$d/vulkan/vulkan.h" ]] && VKINC="-I$d"
+  done
+fi
+if echo '#include <vulkan/vulkan.h>' | cc $VKINC -E -x c - >/dev/null 2>&1; then
+  if cc -O2 -Wall -Wextra -std=gnu11 $VKINC -I"$ROOT/linux" -o "$BUILD/bmvr_xfer_helper" "$ROOT/linux/bmvr_xfer_helper.c" -ldl; then
+    HELPER="$BUILD/bmvr_xfer_helper"; echo "Built $HELPER (64-bit)"
+  else
+    echo "WARNING: could not build the 64-bit helper (stage 2a test unavailable)." >&2
+  fi
+else
+  echo "WARNING: Vulkan headers not found, so the stage 2a helper was not built." >&2
+  echo "         Install them (Arch/CachyOS: sudo pacman -S vulkan-headers; Debian/Ubuntu: libvulkan-dev) and re-run." >&2
+fi
 
 # Portability: the game may run inside an OLDER glibc (Steam Linux Runtime). A preload that needs
 # newer symbol versions is silently skipped by the dynamic loader. List what this build needs.
@@ -149,6 +172,7 @@ exec "${BMVR_REAL_BMS:-$D/bms.sh}" "$@"
 INNER
   chmod +x "$GAME/bmvr-run.sh" "$GAME/bmvr-bms.sh"
   echo "Copied to $GAME/bin/bmvr_preload32.so and wrote bmvr-run.sh + bmvr-bms.sh (bms.sh untouched)"
+  if [[ -n "$HELPER" ]]; then cp -f "$HELPER" "$GAME/bmvr_xfer_helper" && chmod +x "$GAME/bmvr_xfer_helper" && echo "Installed $GAME/bmvr_xfer_helper (64-bit, stage 2a)"; fi
 
   # End-to-end self-test in a folder WITH A SPACE: fake game dir, fake bms.sh, same argument shape Steam uses.
   T="$(mktemp -d)"
@@ -178,6 +202,13 @@ Start the game, load a map for a few seconds, quit, then look for:
   $GAME/bmvr_linux_log.txt      the shim's log (send this)
   $GAME/bmvr_run_marker.txt     written by the host wrapper (proves the launch option is applied)
   $GAME/bmvr_inner_marker.txt   written inside the container (proves bms.sh was swapped and LD_PRELOAD set)
+
+Stage 2a (GPU hand-off test, optional): BEFORE starting the game, in a terminal:
+  "$GAME/bmvr_xfer_helper"
+Leave it running, start the game, load a map for ~10 s. The helper then writes
+  $GAME/bmvr_snapshot_0.ppm ...   (the game picture, copied through shared GPU memory)
+and the shim log gets "xfer:" lines. Send me the helper's terminal output, those lines, and
+bmvr_snapshot_0.ppm (or tell me what it looks like).
 
 The shim only observes. Remove the launch option to go back to normal.
 No log file appears? Run tools/linux/bmvr-diagnose-linux.sh (ideally while the game is running).
