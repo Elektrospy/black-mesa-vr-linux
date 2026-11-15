@@ -22,3 +22,5 @@ build-linux-helper/
 build-stable*/
 build-beta/
 build-beta-helper/
+build_linux_native/
+bmvr_linux_log.txt

@@ -1,0 +1,37 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "BMVR Linux: build",
+      "type": "shell",
+      "command": "scripts/build-linux.sh",
+      "options": { "cwd": "${workspaceFolder}" },
+      "group": { "kind": "build", "isDefault": true },
+      "problemMatcher": ["$gcc"]
+    },
+    {
+      "label": "BMVR Linux: build + install into game (auto-detect)",
+      "type": "shell",
+      "command": "scripts/build-linux.sh",
+      "args": ["--auto"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": ["$gcc"]
+    },
+    {
+      "label": "BMVR Linux: build + install into game (choose folder)",
+      "type": "shell",
+      "command": "scripts/build-linux.sh",
+      "args": ["${input:bmGameDir}"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": ["$gcc"]
+    }
+  ],
+  "inputs": [
+    {
+      "id": "bmGameDir",
+      "type": "promptString",
+      "description": "Native Black Mesa folder (the one containing bms_linux)",
+      "default": "${env:HOME}/.local/share/Steam/steamapps/common/Black Mesa"
+    }
+  ]
+}

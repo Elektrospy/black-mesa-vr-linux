@@ -1,0 +1,9 @@
+{
+  "cmake.buildDirectory": "${workspaceFolder}/build_linux_native",
+  "cmake.configureArgs": [
+    "-DCMAKE_TOOLCHAIN_FILE=${workspaceFolder}/cmake/linux-x86.cmake"
+  ],
+  "cmake.buildType": "Release",
+  "cmake.configureOnOpen": false,
+  "C_Cpp.default.configurationProvider": "ms-vscode.cmake-tools"
+}

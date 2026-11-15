@@ -1,6 +1,14 @@
 cmake_minimum_required(VERSION 3.20)
 project(BMVR LANGUAGES C CXX)
 
+# Native Linux (ToGL) port: separate, additive target in linux/. Windows builds
+# (including the clang-cl/xwin cross build, which sets CMAKE_SYSTEM_NAME=Windows)
+# skip this block and are unchanged.
+if(NOT WIN32)
+  add_subdirectory(linux)
+  return()
+endif()
+
 if(NOT CMAKE_SIZEOF_VOID_P EQUAL 4)
   message(FATAL_ERROR "Black Mesa is Win32. Configure with: cmake -A Win32 -B build")
 endif()
