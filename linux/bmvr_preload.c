@@ -27,21 +27,70 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <time.h>
+#include <sys/time.h>
 #include <dlfcn.h>
+#include <stdlib.h>
+
+/* Portability: this library is loaded into the game, which Steam may run inside an OLDER
+ * glibc (Steam Linux Runtime). Built on a modern distro it would require dlsym@GLIBC_2.34
+ * and clock_gettime@GLIBC_2.17; the dynamic loader then silently skips the whole preload
+ * library (no error, no log). So: pin dlsym to its oldest version, avoid clock_gettime. */
+#if defined(__i386__)
+__asm__(".symver dlsym,dlsym@GLIBC_2.0");
+__asm__(".symver dlopen,dlopen@GLIBC_2.1");
+#endif
 
 typedef int32_t HRESULT;
 #define BMVR_EXPORT __attribute__((visibility("default")))
 
 /* ------------------------------------------------------------------ logging */
 static int g_log_fd = -2;
+static char g_log_path[512];
+
+static int try_open_log(const char *path)
+{
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd >= 0) snprintf(g_log_path, sizeof g_log_path, "%s", path);
+    return fd;
+}
+
+/* Preferred: next to the game executable. Fallbacks make sure a log shows up somewhere. */
+static void open_log_once(void)
+{
+    char dir[400], path[512];
+    g_log_fd = -1;
+    ssize_t n = readlink("/proc/self/exe", dir, sizeof dir - 1);
+    if (n > 0) {
+        dir[n] = 0;
+        char *slash = strrchr(dir, '/');
+        if (slash) {
+            *slash = 0;
+            snprintf(path, sizeof path, "%s/bmvr_linux_log.txt", dir);
+            g_log_fd = try_open_log(path);
+        }
+    }
+    if (g_log_fd < 0) g_log_fd = try_open_log("bmvr_linux_log.txt"); /* cwd */
+    if (g_log_fd < 0) {
+        const char *home = getenv("HOME");
+        if (home) {
+            snprintf(path, sizeof path, "%s/bmvr_linux_log.txt", home);
+            g_log_fd = try_open_log(path);
+        }
+    }
+    if (g_log_fd < 0) g_log_fd = try_open_log("/tmp/bmvr_linux_log.txt");
+    {
+        char msg[640];
+        int m = snprintf(msg, sizeof msg, "bmvr_preload: log file = %s\n",
+                         g_log_fd >= 0 ? g_log_path : "(could not open any log location)");
+        if (m > 0 && write(2, msg, (size_t)m) < 0) { /* best effort */ }
+    }
+}
 
 static void bmvr_log(const char *fmt, ...)
 {
     char buf[1024];
     va_list ap;
-    if (g_log_fd == -2) {
-        g_log_fd = open("bmvr_linux_log.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    }
+    if (g_log_fd == -2) open_log_once();
     if (g_log_fd < 0) return;
     va_start(ap, fmt);
     int n = vsnprintf(buf, sizeof buf - 1, fmt, ap);
@@ -53,10 +102,55 @@ static void bmvr_log(const char *fmt, ...)
 }
 
 /* ---------------------------------------------------------- symbol forwarding */
+/* libtogl.so is usually loaded by the game with dlopen(..., RTLD_LOCAL) (via shaderapidx9.so), and
+ * dlsym(RTLD_NEXT, ...) from a preload library cannot see such a library. So look it up explicitly:
+ * first by name (RTLD_NOLOAD = only if already loaded, never loads anything), then by the full path
+ * from /proc/self/maps (the game folder has a space in it, so take the rest of the line). */
+#ifndef BMVR_TOGL_NAME
+#define BMVR_TOGL_NAME "libtogl.so"
+#endif
+static void *g_togl;
+static int g_togl_tried;
+
+/* Handle of an ALREADY LOADED library (never loads anything): by soname first, then by the path found
+ * in /proc/self/maps (line text after the first '/', so folders with spaces work). */
+static void *find_loaded_lib(const char *soname, const char *maps_substr)
+{
+    void *h = dlopen(soname, RTLD_LAZY | RTLD_NOLOAD);
+    if (h) return h;
+    FILE *f = fopen("/proc/self/maps", "r");
+    char line[1024];
+    while (f && fgets(line, sizeof line, f)) {
+        char *start = strchr(line, '/');
+        if (!start || !strstr(start, maps_substr)) continue;
+        size_t n = strlen(start);
+        while (n && (start[n - 1] == '\n' || start[n - 1] == '\r')) start[--n] = 0;
+        h = dlopen(start, RTLD_LAZY | RTLD_NOLOAD);
+        if (h) { bmvr_log("found %s via /proc/self/maps: %s", soname, start); break; }
+    }
+    if (f) fclose(f);
+    return h;
+}
+
+static void *togl_handle(void)
+{
+    if (!g_togl) g_togl = find_loaded_lib(BMVR_TOGL_NAME, "/" BMVR_TOGL_NAME);
+    if (!g_togl_tried) {
+        g_togl_tried = 1;
+        bmvr_log("ToGL handle (%s): %p", BMVR_TOGL_NAME, g_togl);
+    }
+    return g_togl;
+}
+
 static void *real_sym(const char *mangled)
 {
     void *p = dlsym(RTLD_NEXT, mangled);
-    if (!p) bmvr_log("ERROR: dlsym(RTLD_NEXT, %s) failed - interposition target missing", mangled);
+    if (!p) {
+        void *h = togl_handle();
+        if (h) p = dlsym(h, mangled);
+    }
+    if (!p) bmvr_log("ERROR: real %s not found (RTLD_NEXT and libtogl handle %p) - interposition target missing",
+                     mangled, togl_handle());
     return p;
 }
 
@@ -94,8 +188,17 @@ static void report_gl_once(void)
     PFN_SDL_GL_GetProcAddress getproc = (PFN_SDL_GL_GetProcAddress)dlsym(RTLD_DEFAULT, "SDL_GL_GetProcAddress");
     PFN_SDL_GL_GetCurrentContext getctx = (PFN_SDL_GL_GetCurrentContext)dlsym(RTLD_DEFAULT, "SDL_GL_GetCurrentContext");
     static unsigned warned;
+    static void *sdl;
     if (!getproc || !getctx) {
-        if (warned++ < 3) bmvr_log("GL: SDL_GL_* not visible via dlsym (will retry, %u/3)", warned);
+        /* SDL is usually dlopen'ed RTLD_LOCAL by the engine: look in its own handle. */
+        if (!sdl) sdl = find_loaded_lib("libSDL2-2.0.so.0", "libSDL2");
+        if (sdl) {
+            getproc = (PFN_SDL_GL_GetProcAddress)dlsym(sdl, "SDL_GL_GetProcAddress");
+            getctx = (PFN_SDL_GL_GetCurrentContext)dlsym(sdl, "SDL_GL_GetCurrentContext");
+        }
+    }
+    if (!getproc || !getctx) {
+        if (warned++ < 3) bmvr_log("GL: SDL_GL_* not found (SDL handle %p, try %u/3)", sdl, warned);
         return;
     }
     if (!getctx()) return; /* no current context on this thread yet */
@@ -142,9 +245,9 @@ static uint64_t g_last_ns;
 
 static uint64_t now_ns(void)
 {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (uint64_t)tv.tv_sec * 1000000000ull + (uint64_t)tv.tv_usec * 1000ull;
 }
 
 /* ------------------------------------------------------------ constructor */

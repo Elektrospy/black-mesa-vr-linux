@@ -28,6 +28,23 @@ DLL loads without it):
 
     WINEDLLOVERRIDES="d3d9=n,b" %command% -heapsize 524288 -processheap -high -novid -windowed -oldgameui -enabledxvk
 
+### Separate copy, Steam library entry, Blue Shift
+
+    scripts/bmvr-linux.sh install --separate                          # copy + install the mod into the copy only
+    scripts/bmvr-linux.sh install --separate --steam-shortcut         # ... plus a Steam library entry (Steam closed)
+    scripts/bmvr-linux.sh install --separate --steam-shortcut --campaign bms --campaign bshift
+
+`--separate` makes a copy-on-write copy (plain copy when the filesystem has no reflinks; never
+hardlinks) named "Black Mesa VR" next to the original and installs only there, so the original
+game and its normal launch stay untouched and both can be started independently. The copy has
+its own saves and settings. `--steam-shortcut` adds a non-Steam shortcut per `--campaign`
+(`bms`, `bshift` = Blue Shift `-game bshift`, `asheep` = Azure Sheep `-game asheep`) to
+`userdata/<id>/config/shortcuts.vdf`, with a timestamped backup, and refuses to touch a file it
+cannot rewrite byte for byte. Proton must still be selected for the shortcut in Steam
+(Properties -> Compatibility). Blue Shift: the mod detects `-game bshift` itself and always
+reads `bms/cfg/bmvr.cfg`, so the same install covers it. The shortcut writer was tested only
+against hand-built files, not a live Steam; `steam_appid.txt` for the copy is unverified.
+
 Needs the Windows build of the game: force a Proton tool in Steam (the folder must contain
 `bms.exe`). The mod patches fixed offsets in the Windows `client.dll` / `server.dll`.
 
@@ -75,7 +92,23 @@ Build and install (native build only, **not** Proton):
     scripts/build-linux.sh --auto                                  # finds the native game in your Steam libraries
     scripts/build-linux.sh "/path/to/steamapps/common/Black Mesa"  # or pass the folder (or set BMVR_GAME_DIR)
 
-Then set the Steam launch option it prints and send `bmvr_linux_log.txt`.
+Then set the Steam launch option it prints and send `bmvr_linux_log.txt`:
+
+    "<game folder>/bmvr-run.sh" %command%
+
+Why two launcher files: Steam expands `"<wrapper>" %command%` to
+`<wrapper> steam-launch-wrapper -- reaper ... -- scout-on-soldier-entry-point-v2 -- <game>/bms.sh ...`,
+so the wrapper runs on the HOST, outside the Steam Linux Runtime container (pressure-vessel), which
+rebuilds `LD_PRELOAD` and drops what was set outside (observed: the game process had only Steam's
+overlay entries). `bmvr-run.sh` (host) therefore swaps the `bms.sh` argument for `bmvr-bms.sh`, a new
+file in the game folder that runs inside the container, sets `LD_PRELOAD` and `LD_LIBRARY_PATH`, and
+then runs the original `bms.sh`, which is never modified. Nothing needs patching or undoing;
+`scripts/build-linux.sh --uninstall` deletes the files this port added. It uses the bare name
+`bmvr_preload32.so`, not a path: `LD_PRELOAD` splits on spaces and the game folder is "Black Mesa".
+The shim is installed to `<game>/bin/`. Markers: `bmvr_run_marker.txt` (host wrapper ran, and whether
+the swap happened) and `bmvr_inner_marker.txt` (container side ran).
+If no log appears: `tools/linux/bmvr-diagnose-linux.sh` (run it while the game is running).
+The shim also avoids glibc symbols newer than 2.1.3 so an older Steam runtime can load it.
 VS Code: `.vscode/tasks.json` has build / build+install (auto) / build+install (choose folder).
 
 ### What is verified and what is not

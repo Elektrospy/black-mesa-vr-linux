@@ -82,4 +82,4 @@ echo "XR_RUNTIME_JSON=${XR_RUNTIME_JSON:-unset}"
 ls ~/.config/openxr/1/active_runtime.json 2>/dev/null && cat ~/.config/openxr/1/active_runtime.json | head -12
 } > "$OUT" 2>&1
 
-echo "Wrote $OUT ($(wc -l < "$OUT") lines)."
+echo "Wrote $OUT ($(wc -l < "$OUT") lines). Please send it."

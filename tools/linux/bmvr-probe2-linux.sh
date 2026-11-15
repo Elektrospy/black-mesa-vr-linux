@@ -57,4 +57,4 @@ ls ~/.local/share/Steam/steamapps/common/SteamVR/bin/linux32 2>/dev/null | head 
 ls ~/.local/share/Steam/steamapps/common/SteamVR/bin/linux64 2>/dev/null | head -5 || true
 } > "$OUT" 2>&1
 
-echo "Wrote $OUT ($(wc -l < "$OUT") lines)."
+echo "Wrote $OUT ($(wc -l < "$OUT") lines). Please send it."

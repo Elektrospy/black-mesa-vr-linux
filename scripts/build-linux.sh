@@ -5,7 +5,9 @@
 #   scripts/build-linux.sh --auto                            # build + find the native game in your Steam libraries
 #   scripts/build-linux.sh "/path/to/steamapps/common/Black Mesa"   # build + copy to that folder
 #   (BMVR_GAME_DIR=... is used when set, instead of searching.)
+#   scripts/build-linux.sh --uninstall [/path/to/Black Mesa]  # remove everything this script installed
 #
+# Always does a clean build (the build folder is deleted first).
 # Needs: cmake >= 3.20, gcc with 32-bit support (`gcc -m32` must work).
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -40,6 +42,25 @@ find_native_game() {
   return 1
 }
 
+# ------------------------------------------------------------------ uninstall
+# Everything this script adds lives in NEW files (the game's own bms.sh is never modified),
+# so uninstalling is just deleting them. Also remove the Steam launch option by hand.
+if [[ "${1:-}" == "--uninstall" ]]; then
+  U="${2:-${BMVR_GAME_DIR:-}}"
+  [[ -n "$U" ]] || U="$(find_native_game)" || { echo "Could not find the native Black Mesa; pass the folder." >&2; exit 2; }
+  U="${U%/}"
+  [[ -f "$U/bms_linux" ]] || { echo "Not a native Black Mesa folder (no bms_linux): $U" >&2; exit 1; }
+  for f in bin/bmvr_preload32.so bmvr_preload32.so bmvr-run.sh bmvr-bms.sh \
+           bmvr_run_marker.txt bmvr_inner_marker.txt bmvr_linux_log.txt; do
+    [[ -e "$U/$f" ]] && { rm -f -- "$U/$f"; echo "Removed $U/$f"; }
+  done
+  echo "Done. Now clear the Black Mesa launch options in Steam (they point at bmvr-run.sh)."
+  exit 0
+fi
+
+# Always build from scratch: a stale build dir once made the installer ship an old shim ("no work to do").
+# $BUILD is a fixed folder inside the project, so removing it is safe.
+[[ "$BUILD" == "$ROOT/build_linux_native" ]] && rm -rf -- "$BUILD"
 cmake -S "$ROOT" -B "$BUILD" -DCMAKE_TOOLCHAIN_FILE="$ROOT/cmake/linux-x86.cmake" -DCMAKE_BUILD_TYPE=Release
 cmake --build "$BUILD" --parallel
 SO="$(find "$BUILD" -name bmvr_preload32.so -print -quit)"
@@ -57,6 +78,15 @@ done
 [[ $missing -eq 0 ]] || exit 1
 echo "Exports OK."
 
+# Portability: the game may run inside an OLDER glibc (Steam Linux Runtime). A preload that needs
+# newer symbol versions is silently skipped by the dynamic loader. List what this build needs.
+maxver="$(objdump -T "$SO" | grep -oE 'GLIBC_[0-9.]+' | sort -uV | tail -1)"
+echo "Highest glibc symbol version required: ${maxver:-none}"
+case "${maxver:-GLIBC_2.0}" in
+  GLIBC_2.0|GLIBC_2.1*|GLIBC_2.2*|GLIBC_2.3*|GLIBC_2.4) ;;
+  *) echo "WARNING: requires ${maxver}; the game's runtime may be older, and then this library would NOT load." >&2 ;;
+esac
+
 TARGET="${1:-${BMVR_GAME_DIR:-}}"
 if [[ "$TARGET" == "--auto" ]]; then
   TARGET="${BMVR_GAME_DIR:-}"
@@ -72,18 +102,84 @@ fi
 
 if [[ -n "$TARGET" ]]; then  GAME="${TARGET%/}"
   [[ -f "$GAME/bms_linux" ]] || { echo "Not a native Black Mesa folder (no bms_linux): $GAME" >&2; exit 1; }
-  cp -f "$SO" "$GAME/bmvr_preload32.so"
-  echo "Copied to $GAME/bmvr_preload32.so"
+  mkdir -p "$GAME/bin"
+  cp -f "$SO" "$GAME/bin/bmvr_preload32.so"
+  rm -f "$GAME/bmvr_preload32.so"   # older versions of this script copied it to the game root
+
+  # Two small launcher files, both NEW; the game's own bms.sh is never touched.
+  #
+  # Why two: Steam expands the launch option "<wrapper> %command%" to
+  #     <wrapper> steam-launch-wrapper -- reaper ... -- scout-on-soldier-entry-point-v2 -- <game>/bms.sh -game bms ...
+  # so <wrapper> runs on the HOST, in front of the Steam Linux Runtime container (pressure-vessel),
+  # and pressure-vessel REBUILDS LD_PRELOAD inside the container (a bare library name set outside is
+  # dropped). Only code that runs INSIDE the container can set it. The only thing inside the container
+  # we control is the path of the start script, so the host wrapper swaps the "bms.sh" argument for
+  # bmvr-bms.sh, which sets LD_PRELOAD and then runs the original, unmodified bms.sh.
+  cat > "$GAME/bmvr-run.sh" <<'WRAP'
+#!/bin/sh
+# Black Mesa VR (native Linux), HOST side. Steam launch options:   "<game folder>/bmvr-run.sh" %command%
+# Replaces the ".../bms.sh" argument by ".../bmvr-bms.sh" (see build-linux.sh), then runs the command.
+D="$(cd "$(dirname "$0")" && pwd)"
+swapped=0
+n=$#
+while [ "$n" -gt 0 ]; do
+  a="$1"; shift
+  if [ "$swapped" = 0 ]; then
+    case "$a" in
+      */bms.sh) a="${a%bms.sh}bmvr-bms.sh"; swapped=1 ;;
+    esac
+  fi
+  set -- "$@" "$a"
+  n=$((n - 1))
+done
+{ date; echo "stage: host wrapper (outside the container)"; echo "swapped bms.sh -> bmvr-bms.sh: $swapped"; echo "args: $*"; } > "$D/bmvr_run_marker.txt" 2>/dev/null
+exec "$@"
+WRAP
+  cat > "$GAME/bmvr-bms.sh" <<'INNER'
+#!/bin/sh
+# Black Mesa VR (native Linux), CONTAINER side. Started instead of bms.sh by bmvr-run.sh; sets
+# LD_PRELOAD inside the Steam Linux Runtime and then runs the original, unmodified bms.sh.
+D="$(cd "$(dirname "$0")" && pwd)"
+# Bare file name on purpose: LD_PRELOAD splits on spaces ("Black Mesa"), so an absolute path breaks.
+# The loader finds it through LD_LIBRARY_PATH.
+export LD_LIBRARY_PATH="$D/bin${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export LD_PRELOAD="bmvr_preload32.so${LD_PRELOAD:+:$LD_PRELOAD}"
+{ date; echo "stage: inside the container"; echo "LD_PRELOAD=$LD_PRELOAD"; echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH"; } > "$D/bmvr_inner_marker.txt" 2>/dev/null
+exec "${BMVR_REAL_BMS:-$D/bms.sh}" "$@"
+INNER
+  chmod +x "$GAME/bmvr-run.sh" "$GAME/bmvr-bms.sh"
+  echo "Copied to $GAME/bin/bmvr_preload32.so and wrote bmvr-run.sh + bmvr-bms.sh (bms.sh untouched)"
+
+  # End-to-end self-test in a folder WITH A SPACE: fake game dir, fake bms.sh, same argument shape Steam uses.
+  T="$(mktemp -d)"
+  printf 'int main(void){return 0;}\n' > "$T/t.c"
+  if gcc -m32 "$T/t.c" -o "$T/t32" 2>/dev/null; then
+    G="$T/Black Mesa"; mkdir -p "$G/bin"
+    cp "$GAME/bin/bmvr_preload32.so" "$G/bin/"; cp "$GAME/bmvr-run.sh" "$GAME/bmvr-bms.sh" "$G/"
+    cp "$T/t32" "$G/t32"
+    printf '#!/bin/sh\nexec "$(dirname "$0")/t32"\n' > "$G/bms.sh"; chmod +x "$G/bms.sh"
+    ( cd "$G" && "$G/bmvr-run.sh" env -i /bin/sh -c 'exec "$@"' sh "$G/bms.sh" -game bms >/dev/null 2>&1 )
+    if [[ -s "$G/bmvr_linux_log.txt" ]]; then echo "Self-test: PASS (host wrapper -> bmvr-bms.sh -> bms.sh -> shim loads, path with a space)"
+    else echo "Self-test: FAILED - run tools/linux/bmvr-diagnose-linux.sh" >&2; fi
+  fi
+  rm -rf "$T"
+
   cat <<EOT
 
 Steam -> Black Mesa -> Properties -> Launch Options (NATIVE Linux build, not Proton):
 
-  LD_PRELOAD="\$LD_PRELOAD:$GAME/bmvr_preload32.so" %command%
+  "$GAME/bmvr-run.sh" %command%
 
-Start the game, load a map for a few seconds, quit, then send:
-  $GAME/bmvr_linux_log.txt
+Keep the quotes: the folder name contains a space. Do NOT put LD_PRELOAD=... in the launch
+options: Steam's container (pressure-vessel) discards it before the game starts.
+The game's own bms.sh is NOT modified. To undo everything:  scripts/build-linux.sh --uninstall
 
-Steam's 64-bit helper processes may print "wrong ELF class" for the 32-bit preload; harmless.
-The shim only observes. Remove the launch option to return to normal.
+Start the game, load a map for a few seconds, quit, then look for:
+  $GAME/bmvr_linux_log.txt      the shim's log (send this)
+  $GAME/bmvr_run_marker.txt     written by the host wrapper (proves the launch option is applied)
+  $GAME/bmvr_inner_marker.txt   written inside the container (proves bms.sh was swapped and LD_PRELOAD set)
+
+The shim only observes. Remove the launch option to go back to normal.
+No log file appears? Run tools/linux/bmvr-diagnose-linux.sh (ideally while the game is running).
 EOT
 fi
