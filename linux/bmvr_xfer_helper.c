@@ -1,5 +1,5 @@
 /*
- * Black Mesa VR - native Linux port, stage 2a: 64-bit helper for the GPU hand-off test.
+ * Black Mesa VR - native Linux port, stage 2a/2b: 64-bit helper for the GPU hand-off test.
  *
  * What it does:
  *   1. Creates a Vulkan image whose memory can be exported (VK_KHR_external_memory_fd).
@@ -7,7 +7,10 @@
  *      it sends the exported memory fd; the shim imports it as an OpenGL texture
  *      (GL_EXT_memory_object_fd) and blits the game's frame into it every ~2 s.
  *   3. After each frame message it copies the image into host memory and writes
- *      bmvr_snapshot_<n>.ppm into the game folder (first few only), then acks.
+ *      bmvr_snapshot_<n>_<what>_flip<0|1>.ppm into the game folder (first few only), then acks.
+ *      <what> is the engine render-target label the shim copied (or "window"); flip says whether
+ *      the shim inverted Y. With the default flip=alt the snapshots alternate, so the pair shows
+ *      which orientation is upright.
  *
  * If a snapshot shows the game picture, GPU memory sharing between the 32-bit game and a
  * 64-bit process works on this system: the prerequisite for the OpenXR path.
@@ -387,10 +390,18 @@ static void serve(const char *gamedir, int max_snaps)
             if (fr.magic != BMVR_XFER_MAGIC_FRAME) { LOG("bad frame message, dropping the game connection"); break; }
             if (snaps < max_snaps) {
                 read_back_image();
-                char path[1024 + 64];
-                snprintf(path, sizeof path, "%s/bmvr_snapshot_%d.ppm", gamedir, snaps);
+                char what[sizeof fr.name + 1], path[1024 + 128];
+                fr.name[sizeof fr.name - 1] = 0;                 /* never trust the peer's terminator */
+                size_t k = 0;
+                for (const char *q = fr.name; *q && k < sizeof what - 1; q++)   /* file-name safe */
+                    what[k++] = ((*q >= 'a' && *q <= 'z') || (*q >= 'A' && *q <= 'Z') || (*q >= '0' && *q <= '9') || *q == '_' || *q == '-') ? *q : '_';
+                what[k] = 0;
+                if (!what[0]) strcpy(what, "unnamed");
+                snprintf(path, sizeof path, "%s/bmvr_snapshot_%d_%s_flip%d.ppm", gamedir, snaps, what, (fr.flags & BMVR_XFER_FLAG_FLIPPED) ? 1 : 0);
                 write_ppm(path, fr.tick);
-                if (snaps == 0) LOG("  game frame was %ux%u, scaled into the shared image", fr.src_w, fr.src_h);
+                LOG("  source '%s' (%s) was %ux%u, GL object %u, y-flipped by the shim: %s; scaled into the shared image",
+                    fr.name, (fr.flags & BMVR_XFER_FLAG_WINDOW) ? "window" : "render target", fr.src_w, fr.src_h, fr.gl_name,
+                    (fr.flags & BMVR_XFER_FLAG_FLIPPED) ? "yes" : "no");
                 snaps++;
             }
             struct bmvr_xfer_ack ack = { .magic = BMVR_XFER_MAGIC_ACK, .status = 0 };

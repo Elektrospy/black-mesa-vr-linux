@@ -52,7 +52,7 @@ if [[ "${1:-}" == "--uninstall" ]]; then
   [[ -f "$U/bms_linux" ]] || { echo "Not a native Black Mesa folder (no bms_linux): $U" >&2; exit 1; }
   for f in bin/bmvr_preload32.so bmvr_preload32.so bmvr-run.sh bmvr-bms.sh \
            bmvr_run_marker.txt bmvr_inner_marker.txt bmvr_linux_log.txt \
-           bmvr_xfer_helper bmvr_xfer.sock; do
+           bmvr_xfer_helper bmvr_xfer.sock bmvr_target.txt; do
     [[ -e "$U/$f" ]] && { rm -f -- "$U/$f"; echo "Removed $U/$f"; }
   done
   rm -f -- "$U"/bmvr_snapshot_*.ppm
@@ -74,13 +74,14 @@ file "$SO" | sed 's/^/  /'
 missing=0
 for s in _ZN16IDirect3DDevice97PresentEPK5_RECTS2_PvPK7RGNDATA \
          _ZN16IDirect3DDevice915SetRenderTargetEjP17IDirect3DSurface9 \
-         _ZN16IDirect3DDevice913CreateTextureEjjjj10_D3DFORMAT8_D3DPOOLPP17IDirect3DTexture9PPvPc; do
+         _ZN16IDirect3DDevice913CreateTextureEjjjj10_D3DFORMAT8_D3DPOOLPP17IDirect3DTexture9PPvPc \
+         _ZN17IDirect3DTexture915GetSurfaceLevelEjPP17IDirect3DSurface9; do
   nm -D --defined-only "$SO" | grep -q " $s\$" || { echo "MISSING export: $s" >&2; missing=1; }
 done
 [[ $missing -eq 0 ]] || exit 1
 echo "Exports OK."
 
-# Stage 2a: the 64-bit Vulkan helper for the GPU hand-off test. Built with the HOST compiler (64-bit),
+# Stage 2a/2b: the 64-bit Vulkan helper for the GPU hand-off test. Built with the HOST compiler (64-bit),
 # not the 32-bit toolchain. Needs the Vulkan headers only (libvulkan is loaded with dlopen).
 # Failure here is not fatal: the shim itself does not need it.
 HELPER=""
@@ -203,12 +204,19 @@ Start the game, load a map for a few seconds, quit, then look for:
   $GAME/bmvr_run_marker.txt     written by the host wrapper (proves the launch option is applied)
   $GAME/bmvr_inner_marker.txt   written inside the container (proves bms.sh was swapped and LD_PRELOAD set)
 
-Stage 2a (GPU hand-off test, optional): BEFORE starting the game, in a terminal:
+Stages 2a/2b (GPU hand-off test, optional): BEFORE starting the game, in a terminal:
   "$GAME/bmvr_xfer_helper"
-Leave it running, start the game, load a map for ~10 s. The helper then writes
-  $GAME/bmvr_snapshot_0.ppm ...   (the game picture, copied through shared GPU memory)
-and the shim log gets "xfer:" lines. Send me the helper's terminal output, those lines, and
-bmvr_snapshot_0.ppm (or tell me what it looks like).
+Leave it running, start the game, load a MAP (gameplay, not just the menu) and stay in it ~15 s.
+The helper then writes, in the game folder, pictures of an engine render target copied through
+shared GPU memory:
+  bmvr_snapshot_0_<target>_flip0.ppm, bmvr_snapshot_1_<target>_flip1.ppm, ...
+(two orientations on purpose: one of them is upright - tell me which, flip0 or flip1).
+The shim log gets "xfer:" lines and, twice per session, an "rt-trace:" block that lists the render
+targets of one frame in order, with what OpenGL reports for each. That block is the most useful
+thing to send even if no snapshot appears (it also works without the helper).
+Choose another source (default is the render target whose label contains _rt_FullFrameFB) with a
+file "$GAME/bmvr_target.txt":   target=name:<part of label>   or   target=size:WxH   or   target=window
+and optionally   flip=0|1|alt.
 
 The shim only observes. Remove the launch option to go back to normal.
 No log file appears? Run tools/linux/bmvr-diagnose-linux.sh (ideally while the game is running).

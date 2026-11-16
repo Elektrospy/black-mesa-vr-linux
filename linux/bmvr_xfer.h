@@ -1,5 +1,5 @@
 /*
- * Black Mesa VR - native Linux port, stage 2a: GPU hand-off test.
+ * Black Mesa VR - native Linux port, stage 2a/2b: GPU hand-off test.
  * Wire protocol between the 32-bit shim (bmvr_preload.c, inside the game) and the
  * 64-bit helper (bmvr_xfer_helper.c). Included by both: fixed-width types only, so the
  * structs have the same layout in a 32-bit and a 64-bit build (checked below).
@@ -14,6 +14,10 @@
  *
  * The explicit ack replaces GL/Vulkan semaphores for this test. The real renderer will use
  * GL_EXT_semaphore_fd / VK_KHR_external_semaphore_fd instead (planned, not implemented).
+ *
+ * Version 2 (stage 2b): the frame message says WHAT was blitted (an engine render target, by
+ * label, or the window) and whether the blit flipped Y, so the helper can name its snapshots
+ * and the person reading them can tell which orientation is the upright one.
  */
 #ifndef BMVR_XFER_H
 #define BMVR_XFER_H
@@ -21,7 +25,7 @@
 #include <stdint.h>
 
 #define BMVR_XFER_SOCKET_NAME "bmvr_xfer.sock"
-#define BMVR_XFER_VERSION 1u
+#define BMVR_XFER_VERSION 2u
 #define BMVR_XFER_MAGIC_HELLO 0x31564d42u /* "BMV1" */
 #define BMVR_XFER_MAGIC_FRAME 0x31524642u /* "BFR1" */
 #define BMVR_XFER_MAGIC_ACK   0x314b4341u /* "ACK1" */
@@ -37,10 +41,16 @@ struct bmvr_xfer_hello {
     uint64_t memory_size;       /* VkMemoryAllocateInfo::allocationSize */
 };
 
+#define BMVR_XFER_FLAG_FLIPPED 1u  /* the blit inverted Y (GL bottom-up -> top-down) */
+#define BMVR_XFER_FLAG_WINDOW  2u  /* source was the window's default framebuffer, not a render target */
+
 struct bmvr_xfer_frame {
     uint32_t magic;             /* BMVR_XFER_MAGIC_FRAME */
     uint32_t tick;              /* shim-side counter, for the log / file names */
     uint32_t src_w, src_h;      /* size of the source frame that was blitted */
+    uint32_t flags;             /* BMVR_XFER_FLAG_* */
+    uint32_t gl_name;           /* GL texture/renderbuffer name of the source (0 for the window); diagnostics only */
+    char     name[24];          /* engine render-target label, NUL-terminated ("window" for the window) */
 };
 
 struct bmvr_xfer_ack {
@@ -49,7 +59,7 @@ struct bmvr_xfer_ack {
 };
 
 _Static_assert(sizeof(struct bmvr_xfer_hello) == 40, "bmvr_xfer_hello layout differs between 32/64-bit");
-_Static_assert(sizeof(struct bmvr_xfer_frame) == 16, "bmvr_xfer_frame layout");
+_Static_assert(sizeof(struct bmvr_xfer_frame) == 48, "bmvr_xfer_frame layout");
 _Static_assert(sizeof(struct bmvr_xfer_ack) == 8, "bmvr_xfer_ack layout");
 
 #endif

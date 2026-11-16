@@ -4,7 +4,7 @@ Two separate things live here. Keep them apart.
 
 | | Black Mesa **through Proton** (Windows build) | Black Mesa **native Linux build** |
 |---|---|---|
-| Status | Reported working (see `docs/open-work-2026-10.md`: PSVR2, SteamVR on Linux, OpenXR helper) | **Not working. Milestone 1 done (observe-only shim); stage 2a (GPU hand-off test) in progress.** |
+| Status | Reported working (see `docs/open-work-2026-10.md`: PSVR2, SteamVR on Linux, OpenXR helper) | **Not working. Milestone 1 done (observe-only shim); stage 2a (GPU hand-off) verified in the real game; stage 2b (engine render target through the hand-off) implemented and tested against stand-ins, NOT yet run in the real game; stage 3 (semaphore sync, real eye targets) next.** |
 | Mod | The normal `d3d9.dll` + `OpenXRHelper64.exe` | `linux/` (this port, not a VR mod yet) |
 | Install | `scripts/bmvr-linux.sh` | `scripts/build-linux.sh` |
 
@@ -163,20 +163,113 @@ Design notes:
   could be black; the helper reports the share of non-black pixels and the shim logs the
   bound framebuffers, which tells us what to read instead.
 
-Verified with stand-ins on a Linux dev machine (no GPU there): the socket protocol and fd passing
+**Result on real hardware (RTX 3080, driver 620.70.06):** it works. The helper's Vulkan device UUID
+and the shim's GL device UUID were identical (`afc5d13f...`), the Vulkan image was exportable
+(`exportable=1`, `dedicated-only=0`), the shim imported it, and `bmvr_snapshot_0.ppm` is the game
+picture (main-menu background with the loading bar), upright, 3840x2160 scaled to 1920x1080, 99.7-100%
+non-black pixels in all five snapshots. So a 64-bit process can read what the 32-bit game
+renders through shared GPU memory. Two caveats seen in the snapshot: it contains the MangoHud and
+Steam overlay drawing (it is the window's default framebuffer, i.e. what is on screen, and the game
+itself renders into FBO 9: log line `read fb=9 draw fb=9`), and because the read happens before
+ToGL's own `Present`, it may be the previous frame. Neither matters for the eye targets, which are
+the engine's render targets, not the window. Performance is not measured yet (the test uses
+`glFinish` and a round trip every ~2 s).
+
+Before that result, the same code was checked with stand-ins on a Linux dev machine (no GPU there): the socket protocol and fd passing
 against a mock helper; the exact sequence and arguments of the GL calls against a recording fake
 GL (import, tiling, storage, flipped blit, state restore); helper death mid-session (no hang, no
 crash, clean teardown and re-search); the 64-bit helper compiles and runs up to Vulkan device
-enumeration. **Not verified**: the Vulkan side on a real GPU, the real `glImportMemoryFdEXT`, and
-whether the snapshot contains the game picture. That is what the test is for.
+enumeration. Still **not verified** after 2a: semaphore-based synchronisation and per-frame cost (stage 3).
+Capturing an engine render target instead of the window is stage 2b below.
+
+## Stage 2b: an engine render target through the hand-off (implemented; not run in the real game)
+
+Question it answers: can the shim find the GL object behind a Direct3D render target (without
+ToGL's private structs) and deliver *that* through the stage 2a pipe, instead of the window? The
+eye targets of the later stages are such render targets.
+
+Same transport as 2a (protocol bumped to **v2**: the frame message now carries the target label,
+the GL object name and a flip flag; build shim and helper together). What changed in the shim:
+
+- **Registry.** `CreateTexture` (render-target usage), `CreateRenderTarget` and
+  `IDirect3DTexture9::GetSurfaceLevel` (level 0) are interposed and record label + size per D3D
+  object. `GetSurfaceLevel` is a **new, unconfirmed export**: the earlier probe listing of
+  `libtogl.so` was truncated, so it is not known that the symbol exists. If it does not, surfaces
+  have no labels and the shim says so in the log (hint line) and falls back to selecting by size.
+- **Resolving the GL object.** ToGL binds its framebuffer lazily, at draw time. So when the
+  engine calls `SetRenderTarget(0, X)`, the GL *draw* framebuffer still holds the target being
+  *left*. The shim asks GL what is attached to it (`glGetFramebufferAttachmentParameteriv`: type +
+  name), measures it, and accepts it only if the size equals the registry size of the target being
+  left. That guard also covers "no draw since the last `SetRenderTarget`" and reused pointers.
+  Multisampled targets are refused (a scaling blit out of MSAA is not allowed).
+- **Final content of the frame.** The last accepted leave of the target in the armed frame
+  (the frame before each snapshot) is remembered as (type, GL name, size). At the next `Present`
+  the shim attaches that object to a private read FBO and blits it into the helper's texture. So
+  the picture is the target as it stands at the end of the frame, not a mid-frame state.
+- **Cost.** Only the one armed frame per ~2 s does any GL work in `SetRenderTarget`; everywhere
+  else it is a pointer compare. GL state touched (FBO bindings, texture / renderbuffer binding,
+  scissor) is restored and the shim's own GL errors are drained. Everything is skipped on a
+  thread without a current GL context.
+- **`rt-trace`.** Twice per session (ticks ~360 and ~720, also **without** the helper) one frame of
+  `SetRenderTarget(0)` calls is logged: surface, label, size of the target left, what GL reports
+  for it (framebuffer, texture/renderbuffer name, size, samples) and the next target. This is the
+  discovery tool for the real eye targets: it shows the order of targets in a frame and which ones
+  resolve.
+
+Choosing the source: env `BMVR_TARGET` or `<game folder>/bmvr_target.txt` (`target=...`, `flip=...`):
+
+| Spec | Meaning |
+|---|---|
+| `name:<substring>` (default `name:_rt_fullframefb`) | render target whose engine label contains it, case-insensitive |
+| `size:WxH` | any render target whose GL attachment has exactly that size (works without labels) |
+| `window` | the default framebuffer, i.e. stage 2a |
+
+Y orientation of a ToGL render target is not known, so by default (`flip=alt`) successive
+snapshots alternate the flip and the helper writes it into the name:
+`bmvr_snapshot_<n>_<target>_flip<0|1>.ppm`. One of each pair is upright; that settles the
+default for stage 3.
+
+Run it exactly like 2a (helper first, then the game; **load a map and stay ~15 s**, because
+the first `rt-trace` is at tick ~360). Send: the helper terminal output, the `xfer:` and
+`rt-trace:` lines of `bmvr_linux_log.txt`, and which of `flip0` / `flip1` is upright.
+
+### What is verified and what is not (stage 2b)
+
+Verified on a dev machine without a GPU, using stand-ins (64-bit build of the same shim source, fake
+`libtogl` forwarding targets, a fake GL that models FBO state and **lazy FBO binding**, and a mock
+helper that speaks protocol v2 over a real unix socket with fd passing):
+- default spec captures the right object: the blit's source is the FullFrameFB texture, via the
+  private read FBO, at full size, into the helper's texture; flip alternates; helper receives
+  label / size / GL name / flags;
+- lazy binding (target bound but not drawn): nothing is captured, mismatch counted;
+- MSAA target: refused, no blit; `size:` spec; `window` spec; garbage spec keeps the default;
+  `bmvr_target.txt` parsing; no `GetSurfaceLevel` (hint line, `size:` fallback works);
+- no GL context on the calling thread: does nothing; helper vanishing mid-session: "lost the
+  helper", back to searching, game loop continues; no helper at all: trace still logged;
+- after every `Present` the fake GL's FBO / texture / renderbuffer bindings, scissor and error flag
+  equal what the "engine" left, and no blit runs with scissor enabled;
+- the shim needs no glibc symbol version above the 2.34 `dlopen`/`dlsym` pair already pinned by
+  `.symver` on i386 (a `strtoul` that glibc >= 2.38 would have linked to `__isoc23_strtoul` was
+  replaced for exactly this reason).
+
+**Not verified (needs the real game):** that `libtogl.so` exports `GetSurfaceLevel`; that ToGL really
+binds lazily the way the stand-in assumes (if it binds eagerly, the guard will count mismatches
+and the `rt-trace` block will show it); that `_rt_FullFrameFB` is a texture (not a renderbuffer or
+MSAA) on this build; the orientation; float / A2R10G10B10 targets blitting into the RGBA8
+shared image as expected; that the shim runs on the thread that owns the GL context; and the
+32-bit build itself (this machine has no 32-bit libc: the shim was compiled and tested as 64-bit
+from identical source and `-fsyntax-only` checked, the 32-bit link happens in
+`scripts/build-linux.sh` on yours).
 
 ## Plan (not implemented)
 
 1. ~~Read the milestone-1 log; confirm eye-target candidates and driver extensions.~~ Done.
-2. (Stage 2a above tests the transport.) Then capture the eye render targets (GL texture names via the bound framebuffer after
-   `SetRenderTarget`/draw), hand them to a 64-bit native OpenXR helper through
-   `VK_KHR_external_memory_fd` / `GL_EXT_memory_object_fd`.
-3. Find and port the ~100 game hooks (Itanium ABI: cdecl with `this` first, destructor
+2. ~~Stage 2a: test the transport.~~ Done, verified. ~~Stage 2b: capture an engine render target.~~ Implemented, awaiting a real-game run.
+3. Stage 3: replace `glFinish` + ack with `GL_EXT_semaphore_fd` / `VK_KHR_external_semaphore_fd`;
+   render a *separate* stereo pair into two eye targets (the engine renders one view today) and
+   hand both to a 64-bit native OpenXR helper. Which targets and sizes to use is decided by the
+   `rt-trace` output.
+4. Find and port the ~100 game hooks (Itanium ABI: cdecl with `this` first, destructor
    slot shift in vtables, stripped code -> anchor/RTTI scanning).
-4. Port hands / weapon wheel / HUD drawing off D3D9-on-DXVK.
-5. Introduce a platform layer so shared code stops depending on `windows.h`, MinHook and SEH.
+5. Port hands / weapon wheel / HUD drawing off D3D9-on-DXVK.
+6. Introduce a platform layer so shared code stops depending on `windows.h`, MinHook and SEH.

@@ -1,5 +1,5 @@
 /*
- * Black Mesa VR - native Linux port, milestone 1: "prove the hook surface".
+ * Black Mesa VR - native Linux port, milestone 1 ("prove the hook surface") + stage 2a/2b (GPU hand-off).
  *
  * A 32-bit LD_PRELOAD library for the native Linux Black Mesa (ToGL renderer).
  * It does NOT render anything in VR yet. It checks three things that decide
@@ -165,6 +165,10 @@ static void *real_sym(const char *mangled)
 #define SYM_CREATETEX    "_ZN16IDirect3DDevice913CreateTextureEjjjj10_D3DFORMAT8_D3DPOOLPP17IDirect3DTexture9PPvPc"
 #define SYM_CREATERT     "_ZN16IDirect3DDevice918CreateRenderTargetEjj10_D3DFORMAT20_D3DMULTISAMPLE_TYPEjiPP17IDirect3DSurface9PPvPc"
 #define SYM_RESET        "_ZN16IDirect3DDevice95ResetEP23_D3DPRESENT_PARAMETERS_"
+/* Stage 2b: NOT confirmed to be exported by libtogl.so (the 2026-10 probe listing was truncated). If it is
+ * not, this interposer is simply never called; the Present stats line then shows surfLevel=0 and render
+ * targets can only be selected by size (BMVR_TARGET=size:WxH). */
+#define SYM_GETSURF      "_ZN17IDirect3DTexture915GetSurfaceLevelEjPP17IDirect3DSurface9"
 #define SYM_CREATEDEVICE "_ZN10IDirect3D912CreateDeviceEj11_D3DDEVTYPEPvjP23_D3DPRESENT_PARAMETERS_PP16IDirect3DDevice9"
 
 /* ------------------------------------------------------------ OpenGL probing */
@@ -184,6 +188,7 @@ typedef void *(*PFN_SDL_GL_GetCurrentContext)(void);
 
 static int g_gl_reported;
 static PFN_SDL_GL_GetProcAddress g_getproc; /* set once the GL report succeeded; used by the xfer code */
+static void *(*g_getctx_fn)(void);          /* SDL_GL_GetCurrentContext, set together with g_getproc */
 
 static int str_eq(const char *a, const char *b) { return strcmp(a, b) == 0; }
 
@@ -218,6 +223,7 @@ static void report_gl_once(void)
 
     g_gl_reported = 1;
     g_getproc = getproc;
+    g_getctx_fn = getctx;
     bmvr_log("GL vendor:   %s", glGetString(GL_VENDOR));
     bmvr_log("GL renderer: %s", glGetString(GL_RENDERER));
     bmvr_log("GL version:  %s", glGetString(GL_VERSION));
@@ -257,18 +263,48 @@ static void report_gl_once(void)
     bmvr_log("GL viewport at first Present: %d %d %d %d", vp[0], vp[1], vp[2], vp[3]);
 }
 
-/* ============================================================ stage 2a: GPU hand-off test
- * Optional and passive: nothing happens unless the 64-bit helper (bmvr_xfer_helper) is running
- * and has created "<game folder>/bmvr_xfer.sock". Then, once per XFER_EVERY presents, the frame
- * about to be presented is blitted into a texture backed by the helper's Vulkan memory. The helper
- * writes it to a PPM file. See linux/bmvr_xfer.h for the protocol.
+/* ============================================================ stage 2a/2b: GPU hand-off
+ * Optional and passive: nothing is sent unless the 64-bit helper (bmvr_xfer_helper) is running
+ * and has created "<game folder>/bmvr_xfer.sock". See linux/bmvr_xfer.h for the protocol.
+ *
+ * 2a copied the window's default framebuffer. 2b copies an ENGINE RENDER TARGET (the eye targets
+ * of the later stages are such targets). Source selection ("target spec"), in priority order:
+ * env BMVR_TARGET, then "<game folder>/bmvr_target.txt" (line "target=..." or just the spec):
+ *     name:<substring>   render target whose engine label contains it (case-insensitive).
+ *                        DEFAULT: name:_rt_fullframefb
+ *     size:WxH           any render target whose GL attachment is exactly that size
+ *     window             the default framebuffer, as in stage 2a
+ * and "flip=0|1|alt" (env BMVR_FLIP). Default alt: successive snapshots alternate the Y flip, and
+ * the helper puts the flip into the file name, so one run shows which orientation is upright.
+ *
+ * How the GL texture of a D3D render target is found without knowing ToGL's private structs:
+ *   - CreateTexture / CreateRenderTarget / GetSurfaceLevel are interposed, so every surface the
+ *     engine can bind has a label and a size in a small registry.
+ *   - ToGL binds the GL framebuffer lazily, at draw time. So when the engine calls SetRenderTarget(0, X)
+ *     the GL DRAW framebuffer still holds what the engine drew into BEFORE: the target it is
+ *     leaving. At that moment (before forwarding) we ask GL what is attached to it
+ *     (glGetFramebufferAttachmentParameteriv: type + name), and measure the attachment.
+ *   - The answer is trusted only if the measured size equals the registry size of the target being
+ *     left (guards against "no draw happened since the last SetRenderTarget" and stale pointers).
+ *   - We remember the LAST such leave of the frame (type, name, size). At the next Present the
+ *     helper's shared texture is filled from a private read FBO that attaches that GL object. So the
+ *     snapshot is the target's final content of the frame, not a mid-frame state.
+ * Only the frame before each snapshot is "armed", so the cost elsewhere is a pointer compare.
+ *
+ * "rt-trace": twice per session (and without the helper) one full frame of SetRenderTarget(0)
+ * calls is logged with what GL reports for the target being left. This is the discovery tool for
+ * the real eye targets: it shows the order of render targets in a frame and which ones GL can
+ * resolve.
  *
  * Safety: if anything fails the shim logs "xfer: ..." and goes back to doing nothing; the game is
- * never blocked for longer than the 2 s socket timeout, and GL state is saved/restored around
- * every use. */
+ * never blocked for longer than the 2 s socket timeout; GL state touched here (FBO bindings,
+ * texture/renderbuffer binding, scissor) is saved and restored and GL errors raised by our own
+ * calls are drained so the engine never sees them. Everything runs only on a thread that has a
+ * current GL context. */
 #define XFER_EVERY 120          /* presents between snapshots (~2 s at 60 fps) */
 #define XFER_RETRY 240          /* presents between attempts to find the helper */
 #define XFER_TIMEOUT_SEC 2
+#define TRACE_LINES 96          /* SetRenderTarget lines logged per traced frame */
 
 #define GL_TEXTURE_2D 0x0DE1
 #define GL_TEXTURE_BINDING_2D 0x8069
@@ -285,6 +321,16 @@ static void report_gl_once(void)
 #define GL_DEDICATED_MEMORY_OBJECT_EXT 0x9581
 #define GL_OPTIMAL_TILING_EXT 0x9584
 #define GL_HANDLE_TYPE_OPAQUE_FD_EXT 0x9586
+#define GL_RENDERBUFFER 0x8D41
+#define GL_RENDERBUFFER_BINDING 0x8CA7
+#define GL_RENDERBUFFER_WIDTH 0x8D42
+#define GL_RENDERBUFFER_HEIGHT 0x8D43
+#define GL_RENDERBUFFER_SAMPLES 0x8CAB
+#define GL_TEXTURE_OBJ 0x1702   /* GL_TEXTURE: value of FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE for a texture */
+#define GL_TEXTURE_WIDTH 0x1000
+#define GL_TEXTURE_HEIGHT 0x1001
+#define GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE 0x8CD0
+#define GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME 0x8CD1
 
 typedef void (*PFN_glCreateMemoryObjectsEXT)(int, unsigned *);
 typedef void (*PFN_glDeleteMemoryObjectsEXT)(int, const unsigned *);
@@ -299,6 +345,7 @@ typedef void (*PFN_glGenFramebuffers)(int, unsigned *);
 typedef void (*PFN_glDeleteFramebuffers)(int, const unsigned *);
 typedef void (*PFN_glBindFramebuffer)(unsigned, unsigned);
 typedef void (*PFN_glFramebufferTexture2D)(unsigned, unsigned, unsigned, unsigned, int);
+typedef void (*PFN_glFramebufferRenderbuffer)(unsigned, unsigned, unsigned, unsigned);
 typedef unsigned (*PFN_glCheckFramebufferStatus)(unsigned);
 typedef void (*PFN_glBlitFramebuffer)(int, int, int, int, int, int, int, int, unsigned, unsigned);
 typedef void (*PFN_glFinish)(void);
@@ -306,6 +353,10 @@ typedef unsigned (*PFN_glGetError)(void);
 typedef unsigned char (*PFN_glIsEnabled)(unsigned);
 typedef void (*PFN_glEnable)(unsigned);
 typedef void (*PFN_glDisable)(unsigned);
+typedef void (*PFN_glGetFramebufferAttachmentParameteriv)(unsigned, unsigned, unsigned, int *);
+typedef void (*PFN_glGetTexLevelParameteriv)(unsigned, int, unsigned, int *);
+typedef void (*PFN_glBindRenderbuffer)(unsigned, unsigned);
+typedef void (*PFN_glGetRenderbufferParameteriv)(unsigned, unsigned, int *);
 
 static struct {
     PFN_glCreateMemoryObjectsEXT CreateMemoryObjects;
@@ -321,6 +372,7 @@ static struct {
     PFN_glDeleteFramebuffers DeleteFramebuffers;
     PFN_glBindFramebuffer BindFramebuffer;
     PFN_glFramebufferTexture2D FramebufferTexture2D;
+    PFN_glFramebufferRenderbuffer FramebufferRenderbuffer;
     PFN_glCheckFramebufferStatus CheckFramebufferStatus;
     PFN_glBlitFramebuffer BlitFramebuffer;
     PFN_glFinish Finish;
@@ -329,6 +381,10 @@ static struct {
     PFN_glEnable Enable;
     PFN_glDisable Disable;
     PFN_glGetIntegerv GetIntegerv;
+    PFN_glGetFramebufferAttachmentParameteriv GetFramebufferAttachmentParameteriv;
+    PFN_glGetTexLevelParameteriv GetTexLevelParameteriv;
+    PFN_glBindRenderbuffer BindRenderbuffer;
+    PFN_glGetRenderbufferParameteriv GetRenderbufferParameteriv;
 } xgl;
 
 static int g_x_state;            /* 0 = looking for the helper, 1 = connected, -1 = given up */
@@ -336,8 +392,179 @@ static int g_x_sock = -1;
 static unsigned g_x_tick;
 static unsigned g_x_snapshots;
 static uint32_t g_x_w, g_x_h;
-static unsigned g_x_mem, g_x_tex, g_x_fbo;
+static unsigned g_x_mem, g_x_tex, g_x_fbo;   /* imported memory, its texture, FBO that draws into it */
+static unsigned g_x_rfbo;                    /* private FBO used as the blit SOURCE (attaches the target) */
 
+/* ------------------------------------------------------------ target spec / config */
+enum { SPEC_NAME = 0, SPEC_SIZE = 1, SPEC_WINDOW = 2 };
+static int g_spec_kind = SPEC_NAME;
+static char g_spec_name[40] = "_rt_fullframefb";
+static unsigned g_spec_w, g_spec_h;
+static int g_flip_mode = 2;      /* 0 / 1 = fixed, 2 = alternate per snapshot */
+static int g_cfg_loaded;
+
+static int game_dir(char *out, size_t cap)
+{
+    char exe[400];
+    ssize_t n = readlink("/proc/self/exe", exe, sizeof exe - 1);
+    if (n <= 0) return 0;
+    exe[n] = 0;
+    char *slash = strrchr(exe, '/');
+    if (!slash) return 0;
+    *slash = 0;
+    snprintf(out, cap, "%s", exe);
+    return 1;
+}
+
+/* Case-insensitive substring test; own implementation so no extra glibc symbol version is needed. */
+static int ci_contains(const char *hay, const char *needle)
+{
+    size_t nl = strlen(needle);
+    if (!nl) return 1;
+    for (; *hay; hay++) {
+        size_t i = 0;
+        while (i < nl && hay[i]) {
+            char a = hay[i], b = needle[i];
+            if (a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
+            if (b >= 'A' && b <= 'Z') b = (char)(b - 'A' + 'a');
+            if (a != b) break;
+            i++;
+        }
+        if (i == nl) return 1;
+    }
+    return 0;
+}
+
+static void trim_eol(char *s)
+{
+    size_t n = strlen(s);
+    while (n && (s[n - 1] == '\n' || s[n - 1] == '\r' || s[n - 1] == ' ' || s[n - 1] == '\t')) s[--n] = 0;
+}
+
+/* Decimal parser. Not strtoul: with _GNU_SOURCE a modern glibc links strtoul to __isoc23_strtoul@GLIBC_2.38,
+ * which an older Steam runtime lacks, and the dynamic loader would then silently skip this whole library. */
+static unsigned parse_uint(const char *s, const char **end)
+{
+    unsigned v = 0;
+    while (*s >= '0' && *s <= '9') { if (v < 100000u) v = v * 10u + (unsigned)(*s - '0'); s++; }
+    *end = s;
+    return v;
+}
+
+static void parse_spec(const char *s)
+{
+    while (*s == ' ' || *s == '\t') s++;
+    if (!strncmp(s, "window", 6)) { g_spec_kind = SPEC_WINDOW; return; }
+    if (!strncmp(s, "size:", 5)) {
+        const char *e1 = NULL, *e2 = NULL;
+        unsigned w = parse_uint(s + 5, &e1), h = 0;
+        if (e1 && (*e1 == 'x' || *e1 == 'X')) h = parse_uint(e1 + 1, &e2);
+        if (w && h && w <= 16384 && h <= 16384) { g_spec_kind = SPEC_SIZE; g_spec_w = w; g_spec_h = h; return; }
+        bmvr_log("xfer: bad target spec '%s' (want size:WxH); keeping the previous one", s);
+        return;
+    }
+    if (!strncmp(s, "name:", 5)) s += 5;
+    if (!*s) return;
+    snprintf(g_spec_name, sizeof g_spec_name, "%s", s);
+    g_spec_kind = SPEC_NAME;
+}
+
+static void parse_flip(const char *s)
+{
+    if (!strncmp(s, "alt", 3)) g_flip_mode = 2;
+    else if (s[0] == '0') g_flip_mode = 0;
+    else if (s[0] == '1') g_flip_mode = 1;
+}
+
+static void load_cfg_once(void)
+{
+    if (g_cfg_loaded) return;
+    g_cfg_loaded = 1;
+    char dir[400], path[512], line[200];
+    if (game_dir(dir, sizeof dir)) {
+        snprintf(path, sizeof path, "%s/bmvr_target.txt", dir);
+        FILE *f = fopen(path, "r");
+        int first = 1;
+        while (f && fgets(line, sizeof line, f)) {
+            trim_eol(line);
+            if (!line[0] || line[0] == '#') continue;
+            if (!strncmp(line, "target=", 7)) parse_spec(line + 7);
+            else if (!strncmp(line, "flip=", 5)) parse_flip(line + 5);
+            else if (first) parse_spec(line);
+            first = 0;
+        }
+        if (f) fclose(f);
+    }
+    const char *e = getenv("BMVR_TARGET");
+    if (e && *e) parse_spec(e);
+    e = getenv("BMVR_FLIP");
+    if (e && *e) parse_flip(e);
+    if (g_spec_kind == SPEC_NAME) bmvr_log("xfer: target = render target with label containing '%s', flip=%s", g_spec_name,
+                                           g_flip_mode == 2 ? "alt" : (g_flip_mode ? "1" : "0"));
+    else if (g_spec_kind == SPEC_SIZE) bmvr_log("xfer: target = any render target of GL size %ux%u, flip=%s", g_spec_w, g_spec_h,
+                                                g_flip_mode == 2 ? "alt" : (g_flip_mode ? "1" : "0"));
+    else bmvr_log("xfer: target = window (default framebuffer, stage 2a behaviour)");
+}
+
+/* ------------------------------------------------------------ render target registry */
+/* Keyed by the address of the D3D object (texture or surface). Written from CreateTexture /
+ * CreateRenderTarget / GetSurfaceLevel, read from SetRenderTarget. Fixed size, open addressing,
+ * entries are only ever overwritten (never emptied), so probe chains stay valid. */
+#define REG_SIZE 4096
+#define REG_PROBE 48
+struct reg_ent {
+    void *key;
+    uint32_t w, h;
+    int fmt;
+    unsigned usage;
+    char label[40];
+};
+static struct reg_ent g_reg[REG_SIZE];
+static volatile int g_reg_lock;
+static unsigned g_reg_puts, g_reg_surf_puts, g_getsurf_total;
+
+static void reg_lock(void) { while (__sync_lock_test_and_set(&g_reg_lock, 1)) { /* spin: held for a few stores */ } }
+static void reg_unlock(void) { __sync_lock_release(&g_reg_lock); }
+static unsigned reg_hash(const void *p)
+{
+    uintptr_t v = (uintptr_t)p;
+    v ^= v >> 12;
+    v *= 2654435761u;
+    return (unsigned)(v >> 8) & (REG_SIZE - 1);
+}
+
+static void reg_put(void *key, uint32_t w, uint32_t h, int fmt, unsigned usage, const char *label, int is_surface)
+{
+    if (!key) return;
+    unsigned i = reg_hash(key), slot = i;
+    reg_lock();
+    for (unsigned n = 0; n < REG_PROBE; n++, i = (i + 1) & (REG_SIZE - 1)) {
+        if (!g_reg[i].key || g_reg[i].key == key) { slot = i; break; }
+        if (n == REG_PROBE - 1) slot = reg_hash(key); /* chain full: evict the home slot */
+    }
+    struct reg_ent *e = &g_reg[slot];
+    e->key = key; e->w = w; e->h = h; e->fmt = fmt; e->usage = usage;
+    snprintf(e->label, sizeof e->label, "%s", label ? label : "");
+    g_reg_puts++;
+    if (is_surface) g_reg_surf_puts++;
+    reg_unlock();
+}
+
+static int reg_get(const void *key, struct reg_ent *out)
+{
+    if (!key) return 0;
+    unsigned i = reg_hash(key);
+    int found = 0;
+    reg_lock();
+    for (unsigned n = 0; n < REG_PROBE; n++, i = (i + 1) & (REG_SIZE - 1)) {
+        if (!g_reg[i].key) break;
+        if (g_reg[i].key == key) { *out = g_reg[i]; found = 1; break; }
+    }
+    reg_unlock();
+    return found;
+}
+
+/* ------------------------------------------------------------ GL helpers */
 static int xfer_resolve_gl(void)
 {
     static int tried, ok;
@@ -346,26 +573,46 @@ static int xfer_resolve_gl(void)
     PFN_SDL_GL_GetProcAddress gp = g_getproc;
     if (!gp) { tried = 0; return 0; }
 #define R(field, name) xgl.field = (void *)gp(name); if (!xgl.field) { bmvr_log("xfer: GL entry point %s missing", name); return 0; }
-    R(CreateMemoryObjects, "glCreateMemoryObjectsEXT") R(DeleteMemoryObjects, "glDeleteMemoryObjectsEXT")
-    R(MemoryObjectParameteriv, "glMemoryObjectParameterivEXT") R(ImportMemoryFd, "glImportMemoryFdEXT")
-    R(TexStorageMem2D, "glTexStorageMem2DEXT") R(GenTextures, "glGenTextures") R(DeleteTextures, "glDeleteTextures")
+    R(GenTextures, "glGenTextures") R(DeleteTextures, "glDeleteTextures")
     R(BindTexture, "glBindTexture") R(TexParameteri, "glTexParameteri") R(GenFramebuffers, "glGenFramebuffers")
     R(DeleteFramebuffers, "glDeleteFramebuffers") R(BindFramebuffer, "glBindFramebuffer")
-    R(FramebufferTexture2D, "glFramebufferTexture2D") R(CheckFramebufferStatus, "glCheckFramebufferStatus")
+    R(FramebufferTexture2D, "glFramebufferTexture2D") R(FramebufferRenderbuffer, "glFramebufferRenderbuffer")
+    R(CheckFramebufferStatus, "glCheckFramebufferStatus")
     R(BlitFramebuffer, "glBlitFramebuffer") R(Finish, "glFinish") R(GetError, "glGetError") R(IsEnabled, "glIsEnabled")
     R(Enable, "glEnable") R(Disable, "glDisable") R(GetIntegerv, "glGetIntegerv")
+    R(GetFramebufferAttachmentParameteriv, "glGetFramebufferAttachmentParameteriv")
+    R(GetTexLevelParameteriv, "glGetTexLevelParameteriv") R(BindRenderbuffer, "glBindRenderbuffer")
+    R(GetRenderbufferParameteriv, "glGetRenderbufferParameteriv")
+    /* The memory-object entry points are only needed for the helper hand-off; tracing works without them. */
+    xgl.CreateMemoryObjects = (void *)gp("glCreateMemoryObjectsEXT");
+    xgl.DeleteMemoryObjects = (void *)gp("glDeleteMemoryObjectsEXT");
+    xgl.MemoryObjectParameteriv = (void *)gp("glMemoryObjectParameterivEXT");
+    xgl.ImportMemoryFd = (void *)gp("glImportMemoryFdEXT");
+    xgl.TexStorageMem2D = (void *)gp("glTexStorageMem2DEXT");
 #undef R
     ok = 1;
     return 1;
+}
+
+static int xfer_have_import(void)
+{
+    return xgl.CreateMemoryObjects && xgl.DeleteMemoryObjects && xgl.MemoryObjectParameteriv && xgl.ImportMemoryFd && xgl.TexStorageMem2D;
+}
+
+/* True when the calling thread has a current GL context (SDL's answer) and the entry points are loaded. */
+static int xfer_gl_usable(void)
+{
+    return g_gl_reported && xfer_resolve_gl() && g_getctx_fn && g_getctx_fn();
 }
 
 static void xfer_teardown(void)
 {
     if (g_x_sock >= 0) { close(g_x_sock); g_x_sock = -1; }
     if (xgl.DeleteFramebuffers && g_x_fbo) xgl.DeleteFramebuffers(1, &g_x_fbo);
+    if (xgl.DeleteFramebuffers && g_x_rfbo) xgl.DeleteFramebuffers(1, &g_x_rfbo);
     if (xgl.DeleteTextures && g_x_tex) xgl.DeleteTextures(1, &g_x_tex);
     if (xgl.DeleteMemoryObjects && g_x_mem) xgl.DeleteMemoryObjects(1, &g_x_mem);
-    g_x_fbo = g_x_tex = g_x_mem = 0;
+    g_x_fbo = g_x_rfbo = g_x_tex = g_x_mem = 0;
 }
 
 static void xfer_set_timeout(int fd)
@@ -392,14 +639,9 @@ static int xfer_gl_ok(const char *what)
 static int xfer_connect_and_import(void)
 {
     char path[sizeof(((struct sockaddr_un *)0)->sun_path) + 400];
-    char exe[400];
-    ssize_t n = readlink("/proc/self/exe", exe, sizeof exe - 1);
-    if (n <= 0) return 0;
-    exe[n] = 0;
-    char *slash = strrchr(exe, '/');
-    if (!slash) return 0;
-    *slash = 0;
-    snprintf(path, sizeof path, "%s/%s", exe, BMVR_XFER_SOCKET_NAME);
+    char dir[400];
+    if (!game_dir(dir, sizeof dir)) return 0;
+    snprintf(path, sizeof path, "%s/%s", dir, BMVR_XFER_SOCKET_NAME);
     struct sockaddr_un sa;
     memset(&sa, 0, sizeof sa);
     sa.sun_family = AF_UNIX;
@@ -438,7 +680,8 @@ static int xfer_connect_and_import(void)
     if (c && c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_RIGHTS) memcpy(&fd, CMSG_DATA(c), sizeof fd);
     if (got != (ssize_t)sizeof h || fd < 0 || h.magic != BMVR_XFER_MAGIC_HELLO || h.version != BMVR_XFER_VERSION ||
         !h.width || !h.height || h.width > 8192 || h.height > 8192) {
-        bmvr_log("xfer: bad hello from helper (got %d bytes, fd %d)", (int)got, fd);
+        bmvr_log("xfer: bad hello from helper (got %d bytes, fd %d, version %u, want %u): rebuild shim and helper together",
+                 (int)got, fd, got == (ssize_t)sizeof h ? h.version : 0u, BMVR_XFER_VERSION);
         if (fd >= 0) close(fd);
         close(s);
         return 0;
@@ -446,7 +689,10 @@ static int xfer_connect_and_import(void)
     bmvr_log("xfer: helper connected: shared image %ux%u, memory %llu bytes, fd %d", h.width, h.height,
              (unsigned long long)h.memory_size, fd);
 
-    if (!xfer_resolve_gl()) { close(fd); close(s); g_x_state = -1; return 0; }
+    if (!xfer_resolve_gl() || !xfer_have_import()) {
+        bmvr_log("xfer: GL memory-object entry points missing; hand-off disabled");
+        close(fd); close(s); g_x_state = -1; return 0;
+    }
     while (xgl.GetError()) { /* drain errors left by the game */ }
 
     int old_tex = 0;
@@ -472,6 +718,7 @@ static int xfer_connect_and_import(void)
         xgl.GetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &old_draw);
         xgl.GetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &old_read);
         xgl.GenFramebuffers(1, &g_x_fbo);
+        xgl.GenFramebuffers(1, &g_x_rfbo);
         xgl.BindFramebuffer(GL_DRAW_FRAMEBUFFER, g_x_fbo);
         xgl.FramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g_x_tex, 0);
         unsigned st = xgl.CheckFramebufferStatus(GL_DRAW_FRAMEBUFFER);
@@ -481,7 +728,7 @@ static int xfer_connect_and_import(void)
         ok &= xfer_gl_ok("framebuffer setup");
     }
     if (!ok) {
-        bmvr_log("xfer: import failed; stage 2a disabled for this session");
+        bmvr_log("xfer: import failed; hand-off disabled for this session");
         xfer_teardown();
         close(s);
         g_x_state = -1;
@@ -491,12 +738,160 @@ static int xfer_connect_and_import(void)
     g_x_h = h.height;
     g_x_sock = s;
     g_x_state = 1;
-    bmvr_log("xfer: imported the helper's Vulkan memory as GL texture %u; snapshots every %d presents", g_x_tex, XFER_EVERY);
+    bmvr_log("xfer: imported the helper's Vulkan memory as GL texture %u; snapshot every %d presents", g_x_tex, XFER_EVERY);
     return 1;
 }
 
-/* Blit the frame about to be presented into the shared texture, then tell the helper. */
-static void xfer_snapshot(void)
+/* ------------------------------------------------------------ what is attached to the draw FBO */
+struct glatt {
+    int fbo;            /* GL_DRAW_FRAMEBUFFER_BINDING */
+    int type;           /* GL_TEXTURE_OBJ, GL_RENDERBUFFER, or 0 (none / default framebuffer) */
+    unsigned name;
+    int w, h, samples;
+    int valid;          /* type known, size measured, single-sample */
+};
+
+/* Query the colour attachment 0 of the current DRAW framebuffer. Binds it to READ temporarily and
+ * restores everything it touches. Caches the measurement of the last (type, name) for the rest of
+ * the current Present only: GL recycles object names, so an older measurement can be wrong. */
+static void probe_draw_fbo(struct glatt *a)
+{
+    static struct glatt cache;
+    static unsigned cache_tick;
+    memset(a, 0, sizeof *a);
+    int fbo = 0;
+    xgl.GetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &fbo);
+    a->fbo = fbo;
+    if (!fbo) return;                       /* default framebuffer: not a render target */
+    while (xgl.GetError()) { /* drain */ }
+    int old_read = 0, type = 0, name = 0;
+    xgl.GetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &old_read);
+    xgl.BindFramebuffer(GL_READ_FRAMEBUFFER, (unsigned)fbo);
+    xgl.GetFramebufferAttachmentParameteriv(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE, &type);
+    xgl.GetFramebufferAttachmentParameteriv(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &name);
+    xgl.BindFramebuffer(GL_READ_FRAMEBUFFER, (unsigned)old_read);
+    if (xgl.GetError()) { while (xgl.GetError()) { /* drain */ } return; }
+    if (!name || (type != GL_TEXTURE_OBJ && type != GL_RENDERBUFFER)) return;
+    a->type = type;
+    a->name = (unsigned)name;
+    if (cache.valid && cache_tick == g_x_tick && cache.type == type && cache.name == (unsigned)name) {
+        a->w = cache.w; a->h = cache.h; a->samples = cache.samples; a->valid = 1;
+        return;
+    }
+    int w = 0, h = 0, samples = 0;
+    if (type == GL_TEXTURE_OBJ) {
+        int old = 0;
+        xgl.GetIntegerv(GL_TEXTURE_BINDING_2D, &old);
+        xgl.BindTexture(GL_TEXTURE_2D, (unsigned)name);
+        xgl.GetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &w);
+        xgl.GetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &h);
+        xgl.BindTexture(GL_TEXTURE_2D, (unsigned)old);   /* a multisample/array texture fails the bind: w stays 0 */
+    } else {
+        int old = 0;
+        xgl.GetIntegerv(GL_RENDERBUFFER_BINDING, &old);
+        xgl.BindRenderbuffer(GL_RENDERBUFFER, (unsigned)name);
+        xgl.GetRenderbufferParameteriv(GL_RENDERBUFFER, GL_RENDERBUFFER_WIDTH, &w);
+        xgl.GetRenderbufferParameteriv(GL_RENDERBUFFER, GL_RENDERBUFFER_HEIGHT, &h);
+        xgl.GetRenderbufferParameteriv(GL_RENDERBUFFER, GL_RENDERBUFFER_SAMPLES, &samples);
+        xgl.BindRenderbuffer(GL_RENDERBUFFER, (unsigned)old);
+    }
+    while (xgl.GetError()) { w = h = 0; }
+    a->w = w; a->h = h; a->samples = samples;
+    a->valid = (w > 0 && h > 0 && samples == 0);
+    if (a->valid) { cache = *a; cache_tick = g_x_tick; }
+}
+
+/* ------------------------------------------------------------ SetRenderTarget(0) leave logic */
+static void *volatile g_cur_rt0;         /* what the engine last bound as render target 0 */
+static volatile int g_x_armed;           /* record the target the engine leaves (frame before a snapshot) */
+static volatile int g_trace_left;        /* >0: log SetRenderTarget lines (one traced frame) */
+static int g_trace_active;               /* a traced frame is in progress (ends at the next Present) */
+static unsigned g_trace_frames_done;
+static unsigned g_cap_leaves, g_cap_mismatch, g_cap_unresolved;
+
+static struct {                          /* the last matching target left while armed */
+    int valid;
+    int type;
+    unsigned name, w, h;
+    char label[40];
+} g_cap;
+
+static int spec_matches(int known, const struct reg_ent *e, const struct glatt *a)
+{
+    if (g_spec_kind == SPEC_SIZE) return a->valid && (unsigned)a->w == g_spec_w && (unsigned)a->h == g_spec_h;
+    if (g_spec_kind != SPEC_NAME) return 0;
+    return known && ci_contains(e->label, g_spec_name);
+}
+
+/* Called from the SetRenderTarget interposer BEFORE the real call, for index 0.
+ * `left` is the surface that was bound until now, `next` the one about to be bound. */
+static void rt_leave(void *left, void *next)
+{
+    int tracing = g_trace_left > 0;
+    if (!tracing && !g_x_armed) return;
+    if (!xfer_gl_usable()) return;
+
+    struct reg_ent le, ne;
+    int known = reg_get(left, &le), nknown = reg_get(next, &ne);
+    struct glatt a;
+    if (left) probe_draw_fbo(&a); else memset(&a, 0, sizeof a);
+
+    if (tracing) {
+        g_trace_left--;
+        bmvr_log("rt-trace: left=%p[%s %ux%u] gl fbo=%d %s name=%u %dx%d samples=%d | next=%p[%s %ux%u]",
+                 left, known ? le.label : "?", known ? le.w : 0u, known ? le.h : 0u, a.fbo,
+                 a.type == GL_TEXTURE_OBJ ? "tex" : a.type == GL_RENDERBUFFER ? "rb" : "-", a.name, a.w, a.h, a.samples,
+                 next, nknown ? ne.label : "?", nknown ? ne.w : 0u, nknown ? ne.h : 0u);
+    }
+    if (!g_x_armed || !left || g_spec_kind == SPEC_WINDOW) return;
+
+    g_cap_leaves++;
+    if (!a.valid) { g_cap_unresolved++; return; }
+    if (!spec_matches(known, &le, &a)) return;
+    if (known && ((uint32_t)a.w != le.w || (uint32_t)a.h != le.h)) { g_cap_mismatch++; return; } /* stale / lazy-bind guard */
+    g_cap.valid = 1;
+    g_cap.type = a.type;
+    g_cap.name = a.name;
+    g_cap.w = (unsigned)a.w;
+    g_cap.h = (unsigned)a.h;
+    snprintf(g_cap.label, sizeof g_cap.label, "%s", known && le.label[0] ? le.label : "size");
+}
+
+/* ------------------------------------------------------------ delivering a frame */
+static int xfer_pick_flip(void)
+{
+    if (g_flip_mode == 0 || g_flip_mode == 1) return g_flip_mode;
+    return (int)(g_x_snapshots & 1u);
+}
+
+/* Tell the helper the shared image holds a frame, wait for its ack. Returns 1 on success. */
+static int xfer_send_frame(unsigned sw, unsigned sh, unsigned flags, unsigned gl_name, const char *name)
+{
+    struct bmvr_xfer_frame fr;
+    memset(&fr, 0, sizeof fr);
+    fr.magic = BMVR_XFER_MAGIC_FRAME;
+    fr.tick = g_x_tick;
+    fr.src_w = sw;
+    fr.src_h = sh;
+    fr.flags = flags;
+    fr.gl_name = gl_name;
+    snprintf(fr.name, sizeof fr.name, "%s", name);
+    struct bmvr_xfer_ack ack;
+    if (send(g_x_sock, &fr, sizeof fr, MSG_NOSIGNAL) != (ssize_t)sizeof fr ||
+        recv(g_x_sock, &ack, sizeof ack, MSG_WAITALL) != (ssize_t)sizeof ack || ack.magic != BMVR_XFER_MAGIC_ACK) {
+        bmvr_log("xfer: lost the helper (no ack); back to searching");
+        xfer_teardown();
+        g_x_state = 0;
+        return 0;
+    }
+    if (g_x_snapshots++ < 4)
+        bmvr_log("xfer: snapshot %u delivered (tick %u, '%s' %ux%u -> %ux%u, flip=%u)", g_x_snapshots, g_x_tick, name, sw, sh,
+                 g_x_w, g_x_h, flags & BMVR_XFER_FLAG_FLIPPED);
+    return 1;
+}
+
+/* Stage 2a path: blit the window's default framebuffer (the frame about to be presented). */
+static void xfer_snapshot_window(void)
 {
     int vp[4] = {0, 0, 0, 0}, old_draw = 0, old_read = 0, read_buf = 0;
     xgl.GetIntegerv(GL_VIEWPORT, vp);
@@ -522,21 +917,65 @@ static void xfer_snapshot(void)
     xgl.BindFramebuffer(GL_DRAW_FRAMEBUFFER, (unsigned)old_draw);
     if (scissor) xgl.Enable(GL_SCISSOR_TEST);
     if (!blit_ok) return;
+    xfer_send_frame((unsigned)sw, (unsigned)sh, BMVR_XFER_FLAG_FLIPPED | BMVR_XFER_FLAG_WINDOW, 0, "window");
+}
 
-    struct bmvr_xfer_frame fr;
-    fr.magic = BMVR_XFER_MAGIC_FRAME;
-    fr.tick = g_x_tick;
-    fr.src_w = (uint32_t)sw;
-    fr.src_h = (uint32_t)sh;
-    struct bmvr_xfer_ack ack;
-    if (send(g_x_sock, &fr, sizeof fr, MSG_NOSIGNAL) != (ssize_t)sizeof fr ||
-        recv(g_x_sock, &ack, sizeof ack, MSG_WAITALL) != (ssize_t)sizeof ack || ack.magic != BMVR_XFER_MAGIC_ACK) {
-        bmvr_log("xfer: lost the helper (no ack); back to searching");
-        xfer_teardown();
-        g_x_state = 0;
+/* Stage 2b path: blit the render target recorded by rt_leave(). */
+static void xfer_snapshot_target(void)
+{
+    if (!g_cap.valid) {
+        static unsigned told;
+        if (told++ < 6) {
+            bmvr_log("xfer: no matching render target was left in the armed frame (leaves seen=%u unresolved=%u size-mismatch=%u "
+                     "registry=%u/%u surfaces, GetSurfaceLevel calls=%u) - see the rt-trace lines, adjust bmvr_target.txt",
+                     g_cap_leaves, g_cap_unresolved, g_cap_mismatch, g_reg_puts, g_reg_surf_puts, g_getsurf_total);
+            if (told == 1 && !g_getsurf_total && g_spec_kind == SPEC_NAME)
+                bmvr_log("xfer: hint: IDirect3DTexture9::GetSurfaceLevel was never seen, so surfaces have no labels "
+                         "(libtogl may not export it). Select by size instead: BMVR_TARGET=size:WxH (sizes are in the rt-trace lines).");
+        }
         return;
     }
-    if (g_x_snapshots++ < 3) bmvr_log("xfer: snapshot %u delivered (tick %u, %dx%d -> %ux%u)", g_x_snapshots, g_x_tick, sw, sh, g_x_w, g_x_h);
+    int type = g_cap.type;
+    unsigned name = g_cap.name, sw = g_cap.w, sh = g_cap.h;
+    char label[40];
+    snprintf(label, sizeof label, "%s", g_cap.label);
+    g_cap.valid = 0;
+
+    int old_draw = 0, old_read = 0;
+    xgl.GetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &old_draw);
+    xgl.GetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &old_read);
+    unsigned char scissor = xgl.IsEnabled(GL_SCISSOR_TEST);
+    if (scissor) xgl.Disable(GL_SCISSOR_TEST);
+    while (xgl.GetError()) { /* drain */ }
+
+    xgl.BindFramebuffer(GL_READ_FRAMEBUFFER, g_x_rfbo);
+    if (type == GL_TEXTURE_OBJ) xgl.FramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, name, 0);
+    else xgl.FramebufferRenderbuffer(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, name);
+    unsigned st = xgl.CheckFramebufferStatus(GL_READ_FRAMEBUFFER);
+    int ok = 0, blit_ok = 0;
+    int flip = xfer_pick_flip();
+    if (st == GL_FRAMEBUFFER_COMPLETE && xfer_gl_ok("attach target")) {
+        xgl.BindFramebuffer(GL_DRAW_FRAMEBUFFER, g_x_fbo);
+        xgl.BlitFramebuffer(0, 0, (int)sw, (int)sh, 0, flip ? (int)g_x_h : 0, (int)g_x_w, flip ? 0 : (int)g_x_h,
+                            GL_COLOR_BUFFER_BIT, GL_LINEAR);
+        blit_ok = xfer_gl_ok("glBlitFramebuffer (target)");
+        ok = blit_ok;
+    } else {
+        static unsigned told;
+        if (told++ < 4) bmvr_log("xfer: read FBO on '%s' (%s %u) is not usable (status 0x%x) - object deleted or unsupported format?",
+                                 label, type == GL_TEXTURE_OBJ ? "texture" : "renderbuffer", name, st);
+        while (xgl.GetError()) { /* drain */ }
+    }
+    /* Drop the attachment so the private FBO never keeps (or later aliases) the engine's object. */
+    xgl.BindFramebuffer(GL_READ_FRAMEBUFFER, g_x_rfbo);
+    xgl.FramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
+    if (ok) xgl.Finish(); /* test only (see xfer_snapshot_window) */
+    xgl.BindFramebuffer(GL_READ_FRAMEBUFFER, (unsigned)old_read);
+    xgl.BindFramebuffer(GL_DRAW_FRAMEBUFFER, (unsigned)old_draw);
+    if (scissor) xgl.Enable(GL_SCISSOR_TEST);
+    while (xgl.GetError()) { /* drain whatever the teardown raised */ }
+    if (!ok) return;
+    xfer_send_frame(sw, sh, flip ? BMVR_XFER_FLAG_FLIPPED : 0, name, label);
 }
 
 /* Called once per Present, after report_gl_once(), on the render thread (GL context current). */
@@ -544,16 +983,41 @@ static void xfer_tick(void)
 {
     if (g_x_state < 0 || !g_gl_reported) return;
     g_x_tick++;
+    load_cfg_once();
+    if (!xfer_resolve_gl()) return;
+
+    /* rt-trace: one full frame, at two points of the session (loading screens differ from gameplay). */
+    if (g_trace_active) {  /* the traced frame just ended */
+        bmvr_log("rt-trace: end of traced frame (%d of %d lines unused)", g_trace_left, TRACE_LINES);
+        g_trace_left = 0;
+        g_trace_active = 0;
+        g_trace_frames_done++;
+    } else if (g_trace_frames_done < 2 && g_x_tick % (XFER_EVERY * 3) == XFER_EVERY * 3 - 1) {
+        bmvr_log("rt-trace: begin (tick %u; registry %u entries, %u surfaces)", g_x_tick, g_reg_puts, g_reg_surf_puts);
+        g_trace_left = TRACE_LINES;
+        g_trace_active = 1;
+    }
+
     if (g_x_state == 0) {
         if (g_x_tick % XFER_RETRY != 1) return;
-        if (!xfer_resolve_gl() || !xfer_connect_and_import()) return;
+        if (!xfer_gl_usable() || !xfer_connect_and_import()) return;
         return; /* first snapshot on the next period */
     }
-    if (g_x_tick % XFER_EVERY == 0) xfer_snapshot();
+    if (g_x_tick % XFER_EVERY == 0) {
+        if (xfer_gl_usable()) {
+            if (g_spec_kind == SPEC_WINDOW) xfer_snapshot_window();
+            else xfer_snapshot_target();
+        }
+        g_x_armed = 0;
+    }
+    if (g_x_state == 1 && g_x_tick % XFER_EVERY == XFER_EVERY - 1) {
+        g_cap.valid = 0;
+        g_x_armed = (g_spec_kind != SPEC_WINDOW);   /* record the targets left during the next frame */
+    }
 }
 
 /* ------------------------------------------------------------------ counters */
-static unsigned g_frames, g_tex_calls, g_rt_calls, g_setrt_calls, g_stretch_calls;
+static unsigned g_frames, g_tex_calls, g_rt_calls, g_setrt_calls, g_stretch_calls, g_getsurf_calls;
 static uint64_t g_last_ns;
 
 static uint64_t now_ns(void)
@@ -571,7 +1035,7 @@ __attribute__((constructor)) static void bmvr_init(void)
     if (n < 0) n = 0;
     exe[n] = 0;
     bmvr_log("bmvr_preload loaded, pid=%d exe=%s", getpid(), exe);
-    bmvr_log("milestone 1: observe-only. All calls forwarded to libtogl.so unchanged.");
+    bmvr_log("milestone 1 + stage 2b: all calls are forwarded to libtogl.so unchanged; the shim only reads GL state and, if the helper runs, copies one render target.");
 }
 
 /* =========================================================== interposed API =
@@ -594,9 +1058,11 @@ BMVR_EXPORT HRESULT bmvr_Present(void *self, const void *src, const void *dst, v
     uint64_t t = now_ns();
     if (!g_last_ns) g_last_ns = t;
     if (t - g_last_ns >= 5000000000ull) {
-        bmvr_log("stats: %.1f fps | calls in last window: CreateTexture=%u CreateRenderTarget=%u SetRenderTarget=%u StretchRect=%u",
-             (double)g_frames * 1e9 / (double)(t - g_last_ns), g_tex_calls, g_rt_calls, g_setrt_calls, g_stretch_calls);
-        g_frames = 1; g_tex_calls = g_rt_calls = g_setrt_calls = g_stretch_calls = 0; g_last_ns = t;
+        bmvr_log("stats: %.1f fps | calls in last window: CreateTexture=%u CreateRenderTarget=%u SetRenderTarget=%u StretchRect=%u "
+                 "surfLevel=%u | registry=%u (%u surfaces)",
+             (double)g_frames * 1e9 / (double)(t - g_last_ns), g_tex_calls, g_rt_calls, g_setrt_calls, g_stretch_calls,
+             g_getsurf_calls, g_reg_puts, g_reg_surf_puts);
+        g_frames = 1; g_tex_calls = g_rt_calls = g_setrt_calls = g_stretch_calls = g_getsurf_calls = 0; g_last_ns = t;
     }
     return real ? real(self, src, dst, hwnd, dirty) : -1;
 }
@@ -608,7 +1074,27 @@ BMVR_EXPORT HRESULT bmvr_SetRenderTarget(void *self, unsigned idx, void *surf)
     static PFN_SetRT real;
     if (!real) real = (PFN_SetRT)real_sym(SYM_SETRT);
     g_setrt_calls++;
-    return real ? real(self, idx, surf) : -1;
+    if (idx == 0) rt_leave(g_cur_rt0, surf);   /* stage 2b: GL still shows the target being left */
+    HRESULT hr = real ? real(self, idx, surf) : -1;
+    if (idx == 0 && hr >= 0) g_cur_rt0 = surf;
+    return hr;
+}
+
+typedef HRESULT (*PFN_GetSurfLevel)(void *, unsigned, void **);
+BMVR_EXPORT HRESULT bmvr_GetSurfaceLevel(void *self, unsigned level, void **ppSurf) __asm__(SYM_GETSURF);
+BMVR_EXPORT HRESULT bmvr_GetSurfaceLevel(void *self, unsigned level, void **ppSurf)
+{
+    static PFN_GetSurfLevel real;
+    if (!real) real = (PFN_GetSurfLevel)real_sym(SYM_GETSURF);
+    g_getsurf_calls++;
+    g_getsurf_total++;
+    HRESULT hr = real ? real(self, level, ppSurf) : -1;
+    /* Level 0 of a registered texture: the surface inherits its label and size. */
+    if (hr >= 0 && level == 0 && ppSurf && *ppSurf) {
+        struct reg_ent e;
+        if (reg_get(self, &e)) reg_put(*ppSurf, e.w, e.h, e.fmt, e.usage, e.label, 1);
+    }
+    return hr;
 }
 
 typedef HRESULT (*PFN_Stretch)(void *, void *, const void *, void *, const void *, unsigned);
@@ -634,6 +1120,7 @@ BMVR_EXPORT HRESULT bmvr_CreateTexture(void *self, unsigned w, unsigned h, unsig
     if (!real) real = (PFN_CreateTex)real_sym(SYM_CREATETEX);
     g_tex_calls++;
     HRESULT hr = real ? real(self, w, h, levels, usage, fmt, pool, ppTex, ppShared, label) : -1;
+    if (hr >= 0 && ppTex && *ppTex && (usage & 1u)) reg_put(*ppTex, w, h, fmt, usage, label, 0);  /* stage 2b registry */
     /* Render-target usage is D3DUSAGE_RENDERTARGET (0x1). Log those and any big texture. */
     if (logged < 400 && ((usage & 1u) || w >= 1024 || h >= 1024)) {
         logged++;
@@ -655,6 +1142,7 @@ BMVR_EXPORT HRESULT bmvr_CreateRenderTarget(void *self, unsigned w, unsigned h, 
     if (!real) real = (PFN_CreateRT)real_sym(SYM_CREATERT);
     g_rt_calls++;
     HRESULT hr = real ? real(self, w, h, fmt, ms, msq, lockable, ppSurf, ppShared, label) : -1;
+    if (hr >= 0 && ppSurf && *ppSurf) reg_put(*ppSurf, w, h, fmt, 1u, label, 1);  /* stage 2b registry */
     if (logged < 200) {
         logged++;
         bmvr_log("CreateRenderTarget %ux%u fmt=%d ms=%d -> %p hr=%d label=%s",
