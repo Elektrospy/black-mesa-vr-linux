@@ -4,7 +4,7 @@ Two separate things live here. Keep them apart.
 
 | | Black Mesa **through Proton** (Windows build) | Black Mesa **native Linux build** |
 |---|---|---|
-| Status | Reported working (see `docs/open-work-2026-10.md`: PSVR2, SteamVR on Linux, OpenXR helper) | **Not working. Milestone 1 done (observe-only shim); stage 2a (GPU hand-off) verified in the real game; stage 2b (engine render target through the hand-off) implemented and tested against stand-ins, NOT yet run in the real game; stage 3 (semaphore sync, real eye targets) next.** |
+| Status | Reported working (see `docs/open-work-2026-10.md`: PSVR2, SteamVR on Linux, OpenXR helper) | **Not working. Milestone 1 done (observe-only shim); stage 2a (GPU hand-off) and stage 2b (engine render target through the hand-off) run in the real game; stage 3a (GPU semaphores instead of glFinish, opt-in) implemented and tested against stand-ins and a software Vulkan device, NOT yet run in the real game; real eye targets next.** |
 | Mod | The normal `d3d9.dll` + `OpenXRHelper64.exe` | `linux/` (this port, not a VR mod yet) |
 | Install | `scripts/bmvr-linux.sh` | `scripts/build-linux.sh` |
 
@@ -182,7 +182,7 @@ crash, clean teardown and re-search); the 64-bit helper compiles and runs up to 
 enumeration. Still **not verified** after 2a: semaphore-based synchronisation and per-frame cost (stage 3).
 Capturing an engine render target instead of the window is stage 2b below.
 
-## Stage 2b: an engine render target through the hand-off (implemented; not run in the real game)
+## Stage 2b: an engine render target through the hand-off (run in the real game; results below)
 
 Question it answers: can the shim find the GL object behind a Direct3D render target (without
 ToGL's private structs) and deliver *that* through the stage 2a pipe, instead of the window? The
@@ -193,9 +193,9 @@ the GL object name and a flip flag; build shim and helper together). What change
 
 - **Registry.** `CreateTexture` (render-target usage), `CreateRenderTarget` and
   `IDirect3DTexture9::GetSurfaceLevel` (level 0) are interposed and record label + size per D3D
-  object. `GetSurfaceLevel` is a **new, unconfirmed export**: the earlier probe listing of
-  `libtogl.so` was truncated, so it is not known that the symbol exists. If it does not, surfaces
-  have no labels and the shim says so in the log (hint line) and falls back to selecting by size.
+  object. `GetSurfaceLevel` **is exported and called** (confirmed in the real game, ~130 calls per
+  frame); ToGL hands out a fresh surface object on nearly every call, so the registry is a fixed
+  4096-slot hash that overwrites by pointer (memory is bounded; the statistics line counts *puts*).
 - **Resolving the GL object.** ToGL binds its framebuffer lazily, at draw time. So when the
   engine calls `SetRenderTarget(0, X)`, the GL *draw* framebuffer still holds the target being
   *left*. The shim asks GL what is attached to it (`glGetFramebufferAttachmentParameteriv`: type +
@@ -210,7 +210,7 @@ the GL object name and a flip flag; build shim and helper together). What change
   else it is a pointer compare. GL state touched (FBO bindings, texture / renderbuffer binding,
   scissor) is restored and the shim's own GL errors are drained. Everything is skipped on a
   thread without a current GL context.
-- **`rt-trace`.** Twice per session (ticks ~360 and ~720, also **without** the helper) one frame of
+- **`rt-trace`.** Twice per session (also **without** the helper; stage 3a starts it on the first *busy* frame, see below) one frame of
   `SetRenderTarget(0)` calls is logged: surface, label, size of the target left, what GL reports
   for it (framebuffer, texture/renderbuffer name, size, samples) and the next target. This is the
   discovery tool for the real eye targets: it shows the order of targets in a frame and which ones
@@ -233,6 +233,29 @@ Run it exactly like 2a (helper first, then the game; **load a map and stay ~15 s
 the first `rt-trace` is at tick ~360). Send: the helper terminal output, the `xfer:` and
 `rt-trace:` lines of `bmvr_linux_log.txt`, and which of `flip0` / `flip1` is upright.
 
+### Real-game result (stage 2b)
+
+From the first real run (RTX 3080, native build under the Steam Linux Runtime; the config that came
+back selects `target=InternalRT0`, `flip=0`):
+- `libtogl.so` exports `GetSurfaceLevel`: **confirmed**.
+- A gameplay frame makes about **400** `SetRenderTarget(0)` and about **130** `GetSurfaceLevel`
+  calls (60 fps, vsync). That is the scale any per-frame hook has to live with.
+- `InternalRT0` (the back buffer, 3840x2160) was delivered through the pipe in gameplay.
+  During loading screens no snapshot is possible: the engine draws straight to the back buffer
+  without `SetRenderTarget(0)`, so no target is ever *left* in the armed frame.
+- The `rt-trace` was wasted: it fired at fixed ticks, which were loading-screen frames, so it
+  logged nothing. Fixed in stage 3a (trace on a busy frame, with a per-transition summary).
+- The statistics line said `registry=205736 (... surfaces)`. That was the **cumulative put count**,
+  not a leak; renamed to `registry puts=`.
+- **A real bug the stand-in tests then exposed (fixed in stage 3a):** the registry was one 4096-slot
+  table shared by long-lived entries (render-target textures, the back buffer, registered once) and the
+  short-lived `GetSurfaceLevel` surfaces (~130 fresh objects per frame). Once the churn saturated the
+  table every put evicted a random entry, so a long-lived target lost its label within seconds and was
+  never found again. In the first real run, snapshots worked shortly after loading and the log shows
+  no later delivery, which fits this (the log's per-message cap hides it, so it is a strong suspicion,
+  not proof). It showed up in the tests as a ~1-in-25 flake, then deterministically once the fake
+  allocator produced as many distinct addresses as the real one.
+
 ### What is verified and what is not (stage 2b)
 
 Verified on a dev machine without a GPU, using stand-ins (64-bit build of the same shim source, fake
@@ -252,7 +275,7 @@ helper that speaks protocol v2 over a real unix socket with fd passing):
   `.symver` on i386 (a `strtoul` that glibc >= 2.38 would have linked to `__isoc23_strtoul` was
   replaced for exactly this reason).
 
-**Not verified (needs the real game):** that `libtogl.so` exports `GetSurfaceLevel`; that ToGL really
+**Not verified when this was written (the first real run settled some, see "Real-game result": `GetSurfaceLevel` is exported, `InternalRT0` captures in gameplay, the 32-bit build links on the dev machine):** that ToGL really
 binds lazily the way the stand-in assumes (if it binds eagerly, the guard will count mismatches
 and the `rt-trace` block will show it); that `_rt_FullFrameFB` is a texture (not a renderbuffer or
 MSAA) on this build; the orientation; float / A2R10G10B10 targets blitting into the RGBA8
@@ -261,12 +284,71 @@ shared image as expected; that the shim runs on the thread that owns the GL cont
 from identical source and `-fsyntax-only` checked, the 32-bit link happens in
 `scripts/build-linux.sh` on yours).
 
+## Stage 3a: GPU semaphores instead of glFinish (implemented; opt-in; not run in the real game)
+
+Until now every snapshot cost a full `glFinish` (the shim waits for the *whole* GPU queue of the
+game) plus a socket round trip. That is fine for pictures, not for a per-frame hand-off. Stage 3a
+orders the two APIs on the GPU instead:
+
+    GL (shim):   wait(vk_done) [not before the first frame] -> blit -> signal(gl_ready) -> glFlush
+    helper:      wait(gl_ready) -> copy the image -> signal(vk_done)
+
+- **Protocol v3** (`bmvr_xfer.h`). If the helper offers it (`hello.caps` has
+  `BMVR_XFER_CAP_SEMAPHORES`) the hello carries three fds: the image memory and two
+  `VK_KHR_external_semaphore_fd` opaque-fd binary semaphores (fresh pair per game connection). The
+  shim imports them with `GL_EXT_semaphore_fd`. Frames carry `BMVR_XFER_FLAG_SEMAPHORE`; the ack
+  then means "queue submission done" (so the helper's signal is *pending*, which is what makes the
+  game's next GPU wait legal), not "readback finished".
+- **Opt-in**: `sync=sem` in `<game folder>/bmvr_target.txt` or `BMVR_SYNC=sem`. Default stays
+  `sync=finish`, the verified path. The shim falls back to glFinish + ack, and says why in the log,
+  when the helper offers no semaphores, GL lacks the entry points, or the driver rejects the import.
+- **Measuring**: every delivered snapshot logs `GL side N us` (time in the game's render thread) and
+  `helper round trip N us`, with running averages. Run once per mode and compare.
+- **Helper self-test**: `bmvr_xfer_helper --selftest-sync` (also run by `scripts/build-linux.sh`)
+  checks that the GPU can export *and import* opaque-fd semaphores and runs 50 frame cycles with the
+  helper playing the GL side through the re-imported fds. It needs no game.
+- **Risk, which is why it is opt-in**: a GPU wait on a semaphore whose signal never arrives does not
+  time out. If the helper is killed after it acked but before its GPU work ran, or the game dies
+  between signalling and sending, the other side can wait forever. The helper detects its half
+  (5 s fence timeout, then exits with an explanation); the game's GL side cannot. Restart the game.
+
+Also in this stage: **the registry is now two tables** (pinned: render-target textures and
+`CreateRenderTarget` surfaces, displaced only by other pinned entries, oldest first; transient: the
+`GetSurfaceLevel` surfaces, an overwrite-at-will cache). `tests/linux` has a regression test (long run,
+tens of thousands of distinct surface addresses): with the old single table it fails 10 checks,
+including `InternalRT0` stopping after 2 snapshots; with the pinned table it passes.
+
+From the real-game log: `rt-trace` now starts on the first frame after a *busy*
+frame (>= 50 `SetRenderTarget(0)` calls), covers up to 1500 events, prints the ordered sequence (first 150
+runs) and a complete per-transition summary with counts; the statistics label was corrected.
+
+### What is verified and what is not (stage 3a)
+
+Verified (`tests/linux/run-tests.sh`: the real 32-bit shim, a fake `libtogl` with lazy FBO binding, a
+mock GL that records every call, a mock helper with real unix-socket fd passing; plus the real helper
+on Mesa's software Vulkan driver with the Khronos validation layer):
+- default path unchanged: one glFinish per snapshot, no semaphore calls, GL bindings preserved;
+- `sync=sem`: both semaphores imported as OPAQUE_FD, per frame exactly `[wait] blit signal flush`, no
+  glFinish, no wait before the first frame, each wait only after the helper acked the previous frame,
+  barrier = the shared texture in layout GENERAL;
+- every fallback (no semaphores offered, entry points missing, import rejected), protocol v2 vs v3
+  mismatch, helper dying mid-session (semaphores deleted, game continues);
+- renderbuffer and texture targets and the window source, in both sync modes;
+- trace triggers on the first gameplay frame after loading frames;
+- real helper: v3 hello, snapshot files named by target (unsafe characters sanitised), a semaphore frame
+  it never offered is rejected without crashing it, selftest passes with the validation layer silent.
+
+**Not verified (needs the real GPU):** that the driver really exports/imports the semaphores by fd (the
+software driver cannot, so the fd path of the self-test was *not* exercised there), that
+`GL_EXT_semaphore_fd` waits/signals order correctly against Vulkan on NVIDIA, image correctness and
+tearing under `sync=sem`, and the actual cost difference.
+
 ## Plan (not implemented)
 
 1. ~~Read the milestone-1 log; confirm eye-target candidates and driver extensions.~~ Done.
-2. ~~Stage 2a: test the transport.~~ Done, verified. ~~Stage 2b: capture an engine render target.~~ Implemented, awaiting a real-game run.
-3. Stage 3: replace `glFinish` + ack with `GL_EXT_semaphore_fd` / `VK_KHR_external_semaphore_fd`;
-   render a *separate* stereo pair into two eye targets (the engine renders one view today) and
+2. ~~Stage 2a: test the transport.~~ Done, verified. ~~Stage 2b: capture an engine render target.~~ Done, verified in the real game (`InternalRT0`).
+3. Stage 3a: ~~replace `glFinish` + ack with `GL_EXT_semaphore_fd` / `VK_KHR_external_semaphore_fd`~~ implemented (opt-in), awaiting a real-GPU run.
+   Then: render a *separate* stereo pair into two eye targets (the engine renders one view today) and
    hand both to a 64-bit native OpenXR helper. Which targets and sizes to use is decided by the
    `rt-trace` output.
 4. Find and port the ~100 game hooks (Itanium ABI: cdecl with `this` first, destructor

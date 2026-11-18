@@ -102,6 +102,19 @@ else
   echo "         Install them (Arch/CachyOS: sudo pacman -S vulkan-headers; Debian/Ubuntu: libvulkan-dev) and re-run." >&2
 fi
 
+# Stage 3a: can this GPU/driver share semaphores with OpenGL at all? The helper checks, then runs the exact
+# frame cycle of the game (signal, wait, copy, signal) with itself playing the GL side. Bounded by a timeout;
+# a failure only means sync=sem will not work here (glFinish + ack, the default, is unaffected).
+if [[ -n "$HELPER" ]]; then
+  echo "Helper self-test (stage 3a, GPU semaphore sync):"
+  if out="$(timeout 40 "$HELPER" --selftest-sync 2>&1)"; then
+    printf '%s\n' "$out" | grep -E "opaque-fd semaphore|selftest:" | sed 's/^\[helper\] /  /'
+  else
+    printf '%s\n' "$out" | tail -6 | sed 's/^/    /'
+    echo "  The self-test did not pass. This only affects the optional sync=sem mode." >&2
+  fi
+fi
+
 # Portability: the game may run inside an OLDER glibc (Steam Linux Runtime). A preload that needs
 # newer symbol versions is silently skipped by the dynamic loader. List what this build needs.
 maxver="$(objdump -T "$SO" | grep -oE 'GLIBC_[0-9.]+' | sort -uV | tail -1)"
@@ -173,7 +186,7 @@ exec "${BMVR_REAL_BMS:-$D/bms.sh}" "$@"
 INNER
   chmod +x "$GAME/bmvr-run.sh" "$GAME/bmvr-bms.sh"
   echo "Copied to $GAME/bin/bmvr_preload32.so and wrote bmvr-run.sh + bmvr-bms.sh (bms.sh untouched)"
-  if [[ -n "$HELPER" ]]; then cp -f "$HELPER" "$GAME/bmvr_xfer_helper" && chmod +x "$GAME/bmvr_xfer_helper" && echo "Installed $GAME/bmvr_xfer_helper (64-bit, stage 2a)"; fi
+  if [[ -n "$HELPER" ]]; then cp -f "$HELPER" "$GAME/bmvr_xfer_helper" && chmod +x "$GAME/bmvr_xfer_helper" && echo "Installed $GAME/bmvr_xfer_helper (64-bit, stages 2a-3a)"; fi
 
   # End-to-end self-test in a folder WITH A SPACE: fake game dir, fake bms.sh, same argument shape Steam uses.
   T="$(mktemp -d)"
@@ -204,7 +217,7 @@ Start the game, load a map for a few seconds, quit, then look for:
   $GAME/bmvr_run_marker.txt     written by the host wrapper (proves the launch option is applied)
   $GAME/bmvr_inner_marker.txt   written inside the container (proves bms.sh was swapped and LD_PRELOAD set)
 
-Stages 2a/2b (GPU hand-off test, optional): BEFORE starting the game, in a terminal:
+Stages 2a-3a (GPU hand-off test, optional): BEFORE starting the game, in a terminal:
   "$GAME/bmvr_xfer_helper"
 Leave it running, start the game, load a MAP (gameplay, not just the menu) and stay in it ~15 s.
 The helper then writes, in the game folder, pictures of an engine render target copied through
@@ -217,6 +230,16 @@ thing to send even if no snapshot appears (it also works without the helper).
 Choose another source (default is the render target whose label contains _rt_FullFrameFB) with a
 file "$GAME/bmvr_target.txt":   target=name:<part of label>   or   target=size:WxH   or   target=window
 and optionally   flip=0|1|alt.
+
+Stage 3a: GPU synchronisation. By default the shim stalls the GPU with glFinish and waits for the helper
+(verified). To try GPU semaphores instead (no stall), add this line to "$GAME/bmvr_target.txt":
+    sync=sem
+It is used only if the helper offers semaphores (the self-test above must have said PASS and exported/imported
+the fds) and OpenGL has GL_EXT_semaphore_fd; otherwise the log says why it fell back. The log then shows, per
+snapshot, "GL side N us" (time spent in the game's render thread) and "helper round trip N us"; run once
+with sync=finish and once with sync=sem and send both logs. Caution: if the helper process is killed while
+the game is mid-frame, the game's GPU can wait forever on a semaphore (restart the game). That is why it is
+opt-in. \"\$GAME/bmvr_xfer_helper\" --no-semaphores forces the old behaviour from the helper side.
 
 The shim only observes. Remove the launch option to go back to normal.
 No log file appears? Run tools/linux/bmvr-diagnose-linux.sh (ideally while the game is running).

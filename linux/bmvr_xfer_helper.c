@@ -1,5 +1,5 @@
 /*
- * Black Mesa VR - native Linux port, stage 2a/2b: 64-bit helper for the GPU hand-off test.
+ * Black Mesa VR - native Linux port, stages 2a/2b/3a: 64-bit helper for the GPU hand-off test.
  *
  * What it does:
  *   1. Creates a Vulkan image whose memory can be exported (VK_KHR_external_memory_fd).
@@ -18,7 +18,8 @@
  * Vulkan is loaded with dlopen (no libvulkan dev package needed); only the Vulkan HEADERS are
  * needed to build (vulkan-headers; scripts/build-linux.sh falls back to the copy in research/).
  *
- * Usage:  bmvr_xfer_helper [game folder] [--size WxH] [--gpu N] [--snapshots N]
+ * Usage:  bmvr_xfer_helper [game folder] [--size WxH] [--gpu N] [--snapshots N] [--no-semaphores]
+        bmvr_xfer_helper --selftest-sync [--gpu N]      (no game needed: checks semaphore sync on this GPU)
  *         (game folder defaults to the folder this program lives in)
  */
 #define _GNU_SOURCE
@@ -54,7 +55,8 @@ static PFN_vkGetDeviceProcAddr pfnGetDeviceProcAddr;
     X(vkDestroyInstance) X(vkEnumeratePhysicalDevices) X(vkGetPhysicalDeviceProperties) \
     X(vkGetPhysicalDeviceProperties2) X(vkGetPhysicalDeviceMemoryProperties) \
     X(vkGetPhysicalDeviceQueueFamilyProperties) X(vkEnumerateDeviceExtensionProperties) \
-    X(vkGetPhysicalDeviceImageFormatProperties2) X(vkCreateDevice) X(vkGetDeviceProcAddr)
+    X(vkGetPhysicalDeviceImageFormatProperties2) X(vkCreateDevice) X(vkGetDeviceProcAddr) \
+    X(vkGetPhysicalDeviceExternalSemaphoreProperties)
 
 #define VK_DEVICE_FUNCS(X) \
     X(vkDestroyDevice) X(vkGetDeviceQueue) X(vkCreateImage) X(vkDestroyImage) \
@@ -64,7 +66,7 @@ static PFN_vkGetDeviceProcAddr pfnGetDeviceProcAddr;
     X(vkDestroyCommandPool) X(vkAllocateCommandBuffers) X(vkBeginCommandBuffer) \
     X(vkEndCommandBuffer) X(vkResetCommandBuffer) X(vkCmdPipelineBarrier) X(vkCmdCopyImageToBuffer) \
     X(vkQueueSubmit) X(vkCreateFence) X(vkDestroyFence) X(vkWaitForFences) X(vkResetFences) \
-    X(vkDeviceWaitIdle)
+    X(vkDeviceWaitIdle) X(vkCreateSemaphore) X(vkDestroySemaphore)
 
 #define DECL(name) static PFN_##name name;
 VK_INSTANCE_FUNCS(DECL)
@@ -86,6 +88,14 @@ static void *g_buf_map;
 static VkCommandPool g_pool;
 static VkCommandBuffer g_cmd;
 static VkFence g_fence;
+/* Stage 3a: GPU semaphores shared with the game's GL context (VK_KHR_external_semaphore_fd). */
+static PFN_vkGetSemaphoreFdKHR pfnGetSemFd;
+static PFN_vkImportSemaphoreFdKHR pfnImportSemFd;
+static int g_sem_ok;                       /* this GPU/driver can export + import opaque-fd semaphores */
+static int g_no_sem;                       /* --no-semaphores */
+static VkSemaphore g_sem_gl_ready;         /* GL signals, Vulkan waits   (frame is in the image) */
+static VkSemaphore g_sem_vk_done;          /* Vulkan signals, GL waits   (helper finished reading it) */
+static int g_sem_active;                   /* semaphores exist for the current client */
 static uint32_t g_w = 1920, g_h = 1080;
 
 static int find_memory_type(const VkPhysicalDeviceMemoryProperties *mp, uint32_t bits, VkMemoryPropertyFlags want)
@@ -168,8 +178,21 @@ static void vulkan_init(int want_gpu)
     vkEnumerateDeviceExtensionProperties(g_phys, NULL, &ne, exts);
     int has_fd = 0;
     for (uint32_t i = 0; i < ne; i++) if (!strcmp(exts[i].extensionName, "VK_KHR_external_memory_fd")) has_fd = 1;
+    int has_semfd = 0;
+    for (uint32_t i = 0; i < ne; i++) if (!strcmp(exts[i].extensionName, "VK_KHR_external_semaphore_fd")) has_semfd = 1;
     free(exts);
     if (!has_fd) DIE("VK_KHR_external_memory_fd not supported by this GPU/driver");
+
+    /* Can binary semaphores be exported AND imported as opaque fds? (needed for GL_EXT_semaphore_fd) */
+    VkPhysicalDeviceExternalSemaphoreInfo esi = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_SEMAPHORE_INFO,
+                                                  .handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT };
+    VkExternalSemaphoreProperties esp = { .sType = VK_STRUCTURE_TYPE_EXTERNAL_SEMAPHORE_PROPERTIES };
+    vkGetPhysicalDeviceExternalSemaphoreProperties(g_phys, &esi, &esp);
+    int sem_exp = !!(esp.externalSemaphoreFeatures & VK_EXTERNAL_SEMAPHORE_FEATURE_EXPORTABLE_BIT);
+    int sem_imp = !!(esp.externalSemaphoreFeatures & VK_EXTERNAL_SEMAPHORE_FEATURE_IMPORTABLE_BIT);
+    g_sem_ok = has_semfd && sem_exp && sem_imp && !g_no_sem;
+    LOG("opaque-fd semaphore: extension=%d exportable=%d importable=%d -> %s", has_semfd, sem_exp, sem_imp,
+        g_no_sem ? "disabled by --no-semaphores" : (g_sem_ok ? "semaphore sync available" : "NOT available (the game will use glFinish + ack)"));
 
     uint32_t nq = 0;
     vkGetPhysicalDeviceQueueFamilyProperties(g_phys, &nq, NULL);
@@ -185,14 +208,19 @@ static void vulkan_init(int want_gpu)
     float prio = 1.0f;
     VkDeviceQueueCreateInfo qci = { .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex = g_qfam,
                                     .queueCount = 1, .pQueuePriorities = &prio };
-    const char *dext[] = { "VK_KHR_external_memory_fd" };
+    const char *dext[] = { "VK_KHR_external_memory_fd", "VK_KHR_external_semaphore_fd" };
     VkDeviceCreateInfo dci = { .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .queueCreateInfoCount = 1, .pQueueCreateInfos = &qci,
-                               .enabledExtensionCount = 1, .ppEnabledExtensionNames = dext };
+                               .enabledExtensionCount = g_sem_ok ? 2u : 1u, .ppEnabledExtensionNames = dext };
     VKCHECK(vkCreateDevice(g_phys, &dci, NULL, &g_dev));
 #define LOADD(name) name = (PFN_##name)pfnGetDeviceProcAddr(g_dev, #name); if (!name) DIE("missing " #name);
     VK_DEVICE_FUNCS(LOADD)
 #undef LOADD
     vkGetDeviceQueue(g_dev, g_qfam, 0, &g_queue);
+    if (g_sem_ok) {
+        pfnGetSemFd = (PFN_vkGetSemaphoreFdKHR)pfnGetDeviceProcAddr(g_dev, "vkGetSemaphoreFdKHR");
+        pfnImportSemFd = (PFN_vkImportSemaphoreFdKHR)pfnGetDeviceProcAddr(g_dev, "vkImportSemaphoreFdKHR");
+        if (!pfnGetSemFd || !pfnImportSemFd) { LOG("vkGetSemaphoreFdKHR / vkImportSemaphoreFdKHR missing: semaphores disabled"); g_sem_ok = 0; }
+    }
 }
 
 /* The shared image: exportable memory, dedicated allocation, optimal tiling. */
@@ -276,7 +304,8 @@ static void create_readback(void)
 }
 
 /* Copy the shared image into g_buf_map (RGBA8, top row first). */
-static void read_back_image(void)
+/* Record the image -> host buffer copy into g_cmd (barrier from "the other API wrote it" included). */
+static void record_readback_cmd(void)
 {
     VKCHECK(vkResetCommandBuffer(g_cmd, 0));
     VkCommandBufferBeginInfo bb = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -296,10 +325,120 @@ static void read_back_image(void)
         .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .buffer = g_buf, .size = VK_WHOLE_SIZE };
     vkCmdPipelineBarrier(g_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 0, NULL, 1, &bm, 0, NULL);
     VKCHECK(vkEndCommandBuffer(g_cmd));
+}
+
+/* Legacy (glFinish + ack) frame: copy and wait on the CPU. */
+static void read_back_image(void)
+{
+    record_readback_cmd();
     VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &g_cmd };
     VKCHECK(vkQueueSubmit(g_queue, 1, &si, g_fence));
     VKCHECK(vkWaitForFences(g_dev, 1, &g_fence, VK_TRUE, UINT64_MAX));
     VKCHECK(vkResetFences(g_dev, 1, &g_fence));
+}
+
+/* ---------------------------------------------------- stage 3a: semaphore-synchronised frames */
+/* Wait on a fence, but never forever: if the game's GL side never signalled gl_ready (the game died
+ * between the signal and the message) this queue is stuck behind a wait that cannot complete, and
+ * the only cure is a fresh helper. Say so instead of hanging silently. */
+static void wait_fence_or_die(const char *what)
+{
+    VkResult r = vkWaitForFences(g_dev, 1, &g_fence, VK_TRUE, 5000000000ull);
+    if (r == VK_TIMEOUT) DIE("%s: no completion after 5 s. The game's GL side never signalled the semaphore (the game died or the "
+                             "GL_EXT_semaphore_fd path is broken on this driver). Restart this helper; start the game with sync=finish.", what);
+    VKCHECK(r);
+    VKCHECK(vkResetFences(g_dev, 1, &g_fence));
+}
+
+/* Submit one frame: wait gl_ready; optionally copy the image to the host buffer; signal vk_done.
+ * Returns after vkQueueSubmit (the GPU may still be working): that is what the ack promises. */
+static void submit_sem_frame(int save)
+{
+    VkPipelineStageFlags ws = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    if (save) record_readback_cmd();
+    VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .waitSemaphoreCount = 1, .pWaitSemaphores = &g_sem_gl_ready, .pWaitDstStageMask = &ws,
+        .commandBufferCount = save ? 1u : 0u, .pCommandBuffers = save ? &g_cmd : NULL,
+        .signalSemaphoreCount = 1, .pSignalSemaphores = &g_sem_vk_done };
+    VKCHECK(vkQueueSubmit(g_queue, 1, &si, save ? g_fence : VK_NULL_HANDLE));
+}
+
+static void create_sync_semaphores(int exportable)
+{
+    VkExportSemaphoreCreateInfo ex = { .sType = VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO,
+                                       .handleTypes = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT };
+    VkSemaphoreCreateInfo sci = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, .pNext = exportable ? &ex : NULL };
+    VKCHECK(vkCreateSemaphore(g_dev, &sci, NULL, &g_sem_gl_ready));
+    VKCHECK(vkCreateSemaphore(g_dev, &sci, NULL, &g_sem_vk_done));
+    g_sem_active = 1;
+}
+
+static void destroy_sync_semaphores(void)
+{
+    if (!g_sem_active) return;
+    vkDeviceWaitIdle(g_dev);
+    vkDestroySemaphore(g_dev, g_sem_gl_ready, NULL);
+    vkDestroySemaphore(g_dev, g_sem_vk_done, NULL);
+    g_sem_gl_ready = g_sem_vk_done = VK_NULL_HANDLE;
+    g_sem_active = 0;
+}
+
+static int export_semaphore_fd(VkSemaphore sem)
+{
+    VkSemaphoreGetFdInfoKHR gi = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR, .semaphore = sem,
+                                  .handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT };
+    int fd = -1;
+    VKCHECK(pfnGetSemFd(g_dev, &gi, &fd));
+    return fd;
+}
+
+/* Test-side helpers: an empty submit that only signals / only waits (stands in for the GL side). */
+static void test_signal(VkSemaphore sem)
+{
+    VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .signalSemaphoreCount = 1, .pSignalSemaphores = &sem };
+    VKCHECK(vkQueueSubmit(g_queue, 1, &si, VK_NULL_HANDLE));
+}
+static void test_wait(VkSemaphore sem, const char *what)
+{
+    VkPipelineStageFlags ws = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .waitSemaphoreCount = 1, .pWaitSemaphores = &sem, .pWaitDstStageMask = &ws };
+    VKCHECK(vkQueueSubmit(g_queue, 1, &si, g_fence));
+    wait_fence_or_die(what);
+}
+
+/* --selftest-sync: the exact frame cycle of the game, with this process playing the GL side. If the
+ * device can export/import semaphores, the "GL side" works through IMPORTED copies of the exported
+ * fds, so the fd-sharing itself is exercised too. */
+static int selftest_sync(void)
+{
+    int via_fds = g_sem_ok;
+    LOG("selftest: %s", via_fds ? "semaphores are exported as fds and re-imported (the GL side is simulated through the imports)"
+                                : "this device cannot share semaphores by fd; testing the submit logic with local semaphores only");
+    create_sync_semaphores(via_fds);
+    VkSemaphore gl_sig = g_sem_gl_ready, gl_wait = g_sem_vk_done;   /* what the simulated GL side uses */
+    if (via_fds) {
+        VkSemaphoreCreateInfo sci = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
+        VKCHECK(vkCreateSemaphore(g_dev, &sci, NULL, &gl_sig));
+        VKCHECK(vkCreateSemaphore(g_dev, &sci, NULL, &gl_wait));
+        VkImportSemaphoreFdInfoKHR i1 = { .sType = VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_FD_INFO_KHR, .semaphore = gl_sig,
+            .handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT, .fd = export_semaphore_fd(g_sem_gl_ready) };
+        VkImportSemaphoreFdInfoKHR i2 = { .sType = VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_FD_INFO_KHR, .semaphore = gl_wait,
+            .handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT, .fd = export_semaphore_fd(g_sem_vk_done) };
+        VKCHECK(pfnImportSemFd(g_dev, &i1));
+        VKCHECK(pfnImportSemFd(g_dev, &i2));
+    }
+    const int cycles = 50;
+    for (int i = 0; i < cycles; i++) {
+        test_signal(gl_sig);                        /* GL: blit done, signal(gl_ready) */
+        submit_sem_frame(i == 0);                   /* helper: wait(gl_ready) -> copy -> signal(vk_done) */
+        if (i == 0) wait_fence_or_die("selftest frame 0 (copy)");
+        test_wait(gl_wait, "selftest: GL-side wait(vk_done)");   /* GL: next frame's wait(vk_done) */
+    }
+    vkDeviceWaitIdle(g_dev);
+    if (via_fds) { vkDestroySemaphore(g_dev, gl_sig, NULL); vkDestroySemaphore(g_dev, gl_wait, NULL); }
+    destroy_sync_semaphores();
+    LOG("selftest: PASS (%d signal/wait cycles; fd export+import %s)", cycles, via_fds ? "verified" : "NOT tested on this device");
+    return 0;
 }
 
 /* Write g_buf_map as a binary PPM; also report how much of it is non-black. */
@@ -329,19 +468,19 @@ static void write_ppm(const char *path, uint32_t tick)
 }
 
 /* ------------------------------------------------------------------ socket */
-static int send_hello_with_fd(int client, int memfd)
+static int send_hello_with_fds(int client, const int *fds, int nfds, uint32_t caps)
 {
     struct bmvr_xfer_hello h = { .magic = BMVR_XFER_MAGIC_HELLO, .version = BMVR_XFER_VERSION, .width = g_w, .height = g_h,
-        .gl_internal_format = 0x8058 /* GL_RGBA8 */, .dedicated = 1, .optimal_tiling = 1, .memory_size = g_image_mem_size };
+        .gl_internal_format = 0x8058 /* GL_RGBA8 */, .dedicated = 1, .optimal_tiling = 1, .caps = caps, .memory_size = g_image_mem_size };
     struct iovec iov = { .iov_base = &h, .iov_len = sizeof h };
-    char ctl[CMSG_SPACE(sizeof(int))];
+    char ctl[CMSG_SPACE(3 * sizeof(int))];
     memset(ctl, 0, sizeof ctl);
-    struct msghdr m = { .msg_iov = &iov, .msg_iovlen = 1, .msg_control = ctl, .msg_controllen = sizeof ctl };
+    struct msghdr m = { .msg_iov = &iov, .msg_iovlen = 1, .msg_control = ctl, .msg_controllen = CMSG_SPACE((size_t)nfds * sizeof(int)) };
     struct cmsghdr *c = CMSG_FIRSTHDR(&m);
     c->cmsg_level = SOL_SOCKET;
     c->cmsg_type = SCM_RIGHTS;
-    c->cmsg_len = CMSG_LEN(sizeof(int));
-    memcpy(CMSG_DATA(c), &memfd, sizeof(int));
+    c->cmsg_len = CMSG_LEN((size_t)nfds * sizeof(int));
+    memcpy(CMSG_DATA(c), fds, (size_t)nfds * sizeof(int));
     return sendmsg(client, &m, MSG_NOSIGNAL) == (ssize_t)sizeof h ? 0 : -1;
 }
 
@@ -355,6 +494,23 @@ static int recv_all(int fd, void *buf, size_t len)
         got += (size_t)n;
     }
     return 0;
+}
+
+/* Write bmvr_snapshot_<n>_<what>_flip<f>.ppm from the readback buffer and say what it is. */
+static void save_snapshot(const char *gamedir, struct bmvr_xfer_frame *fr, int n)
+{
+    char what[sizeof fr->name + 1], path[1024 + 128];
+    fr->name[sizeof fr->name - 1] = 0;                 /* never trust the peer's terminator */
+    size_t k = 0;
+    for (const char *q = fr->name; *q && k < sizeof what - 1; q++)   /* file-name safe */
+        what[k++] = ((*q >= 'a' && *q <= 'z') || (*q >= 'A' && *q <= 'Z') || (*q >= '0' && *q <= '9') || *q == '_' || *q == '-') ? *q : '_';
+    what[k] = 0;
+    if (!what[0]) strcpy(what, "unnamed");
+    snprintf(path, sizeof path, "%s/bmvr_snapshot_%d_%s_flip%d.ppm", gamedir, n, what, (fr->flags & BMVR_XFER_FLAG_FLIPPED) ? 1 : 0);
+    write_ppm(path, fr->tick);
+    LOG("  source '%s' (%s) was %ux%u, GL object %u, y-flipped by the shim: %s; scaled into the shared image; synced by %s",
+        fr->name, (fr->flags & BMVR_XFER_FLAG_WINDOW) ? "window" : "render target", fr->src_w, fr->src_h, fr->gl_name,
+        (fr->flags & BMVR_XFER_FLAG_FLIPPED) ? "yes" : "no", (fr->flags & BMVR_XFER_FLAG_SEMAPHORE) ? "GPU semaphores" : "glFinish + ack");
 }
 
 static void serve(const char *gamedir, int max_snaps)
@@ -371,6 +527,8 @@ static void serve(const char *gamedir, int max_snaps)
         DIE("cannot listen on %s: %s", sock_path, strerror(errno));
     LOG("listening on %s", sock_path);
     LOG("now start Black Mesa from Steam (with the bmvr-run.sh launch option). Ctrl-C stops the helper.");
+    LOG("synchronisation offered to the game: %s", g_sem_ok ? "GPU semaphores (the game opts in with sync=sem in bmvr_target.txt), otherwise glFinish + ack"
+                                                            : "glFinish + ack only");
 
     int snaps = 0;
     while (!g_stop) {
@@ -378,34 +536,43 @@ static void serve(const char *gamedir, int max_snaps)
         if (cl < 0) { if (errno == EINTR) continue; break; }
         VkMemoryGetFdInfoKHR gi = { .sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR, .memory = g_image_mem,
                                    .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT };
-        int memfd = -1;
-        VKCHECK(vkGetMemoryFdKHR(g_dev, &gi, &memfd));   /* a fresh fd per client; the receiver owns it */
-        if (send_hello_with_fd(cl, memfd) < 0) { LOG("could not send the memory fd to the game"); close(memfd); close(cl); continue; }
-        close(memfd); /* our copy; the game holds its own */
-        LOG("game connected; shared image sent (%ux%u)", g_w, g_h);
+        int fds[3] = { -1, -1, -1 }, nfds = 1;
+        VKCHECK(vkGetMemoryFdKHR(g_dev, &gi, &fds[0]));   /* a fresh fd per client; the receiver owns it */
+        if (g_sem_ok) {
+            /* Fresh semaphores per client: a previous game may have left one of them signalled. */
+            destroy_sync_semaphores();
+            create_sync_semaphores(1);
+            fds[1] = export_semaphore_fd(g_sem_gl_ready);
+            fds[2] = export_semaphore_fd(g_sem_vk_done);
+            nfds = 3;
+        }
+        int hello_ok = send_hello_with_fds(cl, fds, nfds, g_sem_ok ? BMVR_XFER_CAP_SEMAPHORES : 0) == 0;
+        for (int i = 0; i < nfds; i++) close(fds[i]);     /* our copies; the game holds its own */
+        if (!hello_ok) { LOG("could not send the memory fd to the game"); close(cl); continue; }
+        LOG("game connected; shared image sent (%ux%u)%s", g_w, g_h, g_sem_ok ? ", with two GPU semaphores" : "");
 
         for (;;) {
             struct bmvr_xfer_frame fr;
             if (recv_all(cl, &fr, sizeof fr) < 0) break;
             if (fr.magic != BMVR_XFER_MAGIC_FRAME) { LOG("bad frame message, dropping the game connection"); break; }
-            if (snaps < max_snaps) {
-                read_back_image();
-                char what[sizeof fr.name + 1], path[1024 + 128];
-                fr.name[sizeof fr.name - 1] = 0;                 /* never trust the peer's terminator */
-                size_t k = 0;
-                for (const char *q = fr.name; *q && k < sizeof what - 1; q++)   /* file-name safe */
-                    what[k++] = ((*q >= 'a' && *q <= 'z') || (*q >= 'A' && *q <= 'Z') || (*q >= '0' && *q <= '9') || *q == '_' || *q == '-') ? *q : '_';
-                what[k] = 0;
-                if (!what[0]) strcpy(what, "unnamed");
-                snprintf(path, sizeof path, "%s/bmvr_snapshot_%d_%s_flip%d.ppm", gamedir, snaps, what, (fr.flags & BMVR_XFER_FLAG_FLIPPED) ? 1 : 0);
-                write_ppm(path, fr.tick);
-                LOG("  source '%s' (%s) was %ux%u, GL object %u, y-flipped by the shim: %s; scaled into the shared image",
-                    fr.name, (fr.flags & BMVR_XFER_FLAG_WINDOW) ? "window" : "render target", fr.src_w, fr.src_h, fr.gl_name,
-                    (fr.flags & BMVR_XFER_FLAG_FLIPPED) ? "yes" : "no");
-                snaps++;
-            }
+            int use_sem = (fr.flags & BMVR_XFER_FLAG_SEMAPHORE) != 0;
+            if (use_sem && !g_sem_active) { LOG("frame wants semaphore sync but none were offered; dropping the game connection"); break; }
+            int save = snaps < max_snaps;
             struct bmvr_xfer_ack ack = { .magic = BMVR_XFER_MAGIC_ACK, .status = 0 };
-            if (send(cl, &ack, sizeof ack, MSG_NOSIGNAL) != (ssize_t)sizeof ack) break;
+            if (use_sem) {
+                submit_sem_frame(save);                  /* wait(gl_ready) [-> copy] -> signal(vk_done), no CPU wait */
+                if (send(cl, &ack, sizeof ack, MSG_NOSIGNAL) != (ssize_t)sizeof ack) break;   /* "submitted" */
+                if (save) {
+                    wait_fence_or_die("frame copy");
+                    save_snapshot(gamedir, &fr, snaps++);
+                }
+            } else {
+                if (save) {
+                    read_back_image();
+                    save_snapshot(gamedir, &fr, snaps++);
+                }
+                if (send(cl, &ack, sizeof ack, MSG_NOSIGNAL) != (ssize_t)sizeof ack) break;
+            }
             if (snaps == max_snaps) { LOG("wrote %d snapshot(s); further frames are acknowledged but not saved", snaps); snaps++; }
         }
         close(cl);
@@ -418,7 +585,7 @@ static void serve(const char *gamedir, int max_snaps)
 int main(int argc, char **argv)
 {
     char gamedir[900] = "";
-    int want_gpu = -1, max_snaps = 5;
+    int want_gpu = -1, max_snaps = 5, selftest = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--size") && i + 1 < argc) {
             if (sscanf(argv[++i], "%ux%u", &g_w, &g_h) != 2 || !g_w || !g_h || g_w > 8192 || g_h > 8192) DIE("bad --size, use e.g. 1920x1080");
@@ -426,10 +593,14 @@ int main(int argc, char **argv)
             want_gpu = atoi(argv[++i]);
         } else if (!strcmp(argv[i], "--snapshots") && i + 1 < argc) {
             max_snaps = atoi(argv[++i]);
+        } else if (!strcmp(argv[i], "--no-semaphores")) {
+            g_no_sem = 1;
+        } else if (!strcmp(argv[i], "--selftest-sync")) {
+            selftest = 1;
         } else if (argv[i][0] != '-' && !gamedir[0]) {
             snprintf(gamedir, sizeof gamedir, "%s", argv[i]);
         } else {
-            fprintf(stderr, "usage: %s [game folder] [--size WxH] [--gpu N] [--snapshots N]\n", argv[0]);
+            fprintf(stderr, "usage: %s [game folder] [--size WxH] [--gpu N] [--snapshots N] [--no-semaphores] | --selftest-sync\n", argv[0]);
             return 2;
         }
     }
@@ -445,11 +616,13 @@ int main(int argc, char **argv)
     sigaction(SIGTERM, &sa, NULL);
     signal(SIGPIPE, SIG_IGN);
 
-    LOG("game folder: %s", gamedir);
+    if (!selftest) LOG("game folder: %s", gamedir);
     vulkan_init(want_gpu);
     create_shared_image();
     create_readback();
+    if (selftest) return selftest_sync();
     serve(gamedir, max_snaps);
+    destroy_sync_semaphores();
     vkDeviceWaitIdle(g_dev);
     return 0;
 }
