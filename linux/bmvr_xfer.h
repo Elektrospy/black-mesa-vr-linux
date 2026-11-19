@@ -1,5 +1,5 @@
 /*
- * Black Mesa VR - native Linux port, stages 2a/2b/3a: GPU hand-off.
+ * Black Mesa VR - native Linux port, stages 2a/2b/3a/3d: GPU hand-off.
  * Wire protocol between the 32-bit shim (bmvr_preload.c, inside the game) and the
  * 64-bit helper (bmvr_xfer_helper.c). Included by both: fixed-width types only, so the
  * structs have the same layout in a 32-bit and a 64-bit build (checked below).
@@ -15,6 +15,15 @@
  * Default sync (stages 2a/2b, verified): the shim does a full glFinish and waits for the helper's
  * ack, so a frame is never overwritten while the helper reads it. Stage 3a adds GPU semaphores
  * (below) as an opt-in that falls back to this when anything is missing.
+ *
+ * Version 4 (stage 3d): TWO EYES. A pair is the unit of publication (never one eye at a time, so the two eyes of
+ * a pair always come from the same game frame). The hello says how many images the helper offers (eye_count, 1 or 2)
+ * and carries one memory fd per image, then the two semaphore fds. The frame message describes both eyes; ONE
+ * semaphore pair covers the pair:
+ *     GL:     wait(vk_done) [not before the first pair] -> blit eye 0 -> blit eye 1 -> signal(gl_ready) -> flush
+ *     helper: wait(gl_ready) -> read both images -> signal(vk_done)
+ * The shim uses eye 1 only when it was asked to (target2 in bmvr_target.txt) AND the helper offers two images; a
+ * frame with eye_count == 1 on a two-image session only touches image 0. Design: docs/LINUX_STEREO_HANDOFF.md.
  *
  * Version 3 (stage 3a): GPU semaphores. When the helper offers them (hello.caps has
  * BMVR_XFER_CAP_SEMAPHORES) the hello carries THREE fds: the image memory, then two
@@ -35,7 +44,7 @@
 #include <stdint.h>
 
 #define BMVR_XFER_SOCKET_NAME "bmvr_xfer.sock"
-#define BMVR_XFER_VERSION 3u
+#define BMVR_XFER_VERSION 4u
 #define BMVR_XFER_MAGIC_HELLO 0x31564d42u /* "BMV1" */
 #define BMVR_XFER_MAGIC_FRAME 0x31524642u /* "BFR1" */
 #define BMVR_XFER_MAGIC_ACK   0x314b4341u /* "ACK1" */
@@ -50,7 +59,9 @@ struct bmvr_xfer_hello {
     uint32_t dedicated;         /* 1: memory was allocated as a dedicated allocation */
     uint32_t optimal_tiling;    /* 1: image uses VK_IMAGE_TILING_OPTIMAL */
     uint32_t caps;              /* BMVR_XFER_CAP_* */
-    uint64_t memory_size;       /* VkMemoryAllocateInfo::allocationSize */
+    uint32_t eye_count;         /* v4: shared images offered, 1 or 2 (one memory fd each, same size/format); then the semaphore fds */
+    uint32_t reserved;          /* keeps memory_size at offset 40 in both 32- and 64-bit builds */
+    uint64_t memory_size;       /* VkMemoryAllocateInfo::allocationSize (of each image) */
 };
 
 #define BMVR_XFER_FLAG_FLIPPED 1u  /* the blit inverted Y (GL bottom-up -> top-down) */
@@ -64,6 +75,13 @@ struct bmvr_xfer_frame {
     uint32_t flags;             /* BMVR_XFER_FLAG_* */
     uint32_t gl_name;           /* GL texture/renderbuffer name of the source (0 for the window); diagnostics only */
     char     name[24];          /* engine render-target label, NUL-terminated ("window" for the window) */
+    /* v4: the second eye of the pair. Valid only when eye_count == 2; eye 0 is described by the fields above, and
+     * BMVR_XFER_FLAG_SEMAPHORE in `flags` applies to the whole pair. */
+    uint32_t eye_count;         /* 1 or 2: images written for this frame (image 0 first) */
+    uint32_t eye1_src_w, eye1_src_h;
+    uint32_t eye1_flags;        /* BMVR_XFER_FLAG_FLIPPED / _WINDOW (SEMAPHORE is taken from `flags`) */
+    uint32_t eye1_gl_name;
+    char     eye1_name[24];
 };
 
 struct bmvr_xfer_ack {
@@ -71,8 +89,8 @@ struct bmvr_xfer_ack {
     uint32_t status;            /* 0 = ok. With BMVR_XFER_FLAG_SEMAPHORE: the helper's queue submission is done */
 };
 
-_Static_assert(sizeof(struct bmvr_xfer_hello) == 40, "bmvr_xfer_hello layout differs between 32/64-bit");
-_Static_assert(sizeof(struct bmvr_xfer_frame) == 48, "bmvr_xfer_frame layout");
+_Static_assert(sizeof(struct bmvr_xfer_hello) == 48, "bmvr_xfer_hello layout differs between 32/64-bit");
+_Static_assert(sizeof(struct bmvr_xfer_frame) == 92, "bmvr_xfer_frame layout");
 _Static_assert(sizeof(struct bmvr_xfer_ack) == 8, "bmvr_xfer_ack layout");
 
 #endif

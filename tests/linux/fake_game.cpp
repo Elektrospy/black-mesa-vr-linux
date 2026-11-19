@@ -3,18 +3,23 @@
 #include "decls.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 int main(int argc, char **argv) {
-  int loading = argc > 1 ? atoi(argv[1]) : 300, play = argc > 2 ? atoi(argv[2]) : 500, switches = 60;
+  int loading = argc > 1 ? atoi(argv[1]) : 300, play = argc > 2 ? atoi(argv[2]) : 500, tail = argc > 3 ? atoi(argv[3]) : 0, switches = 60;
   IDirect3D9 *d3d = Direct3DCreate9(32); IDirect3DDevice9 *dev = 0; _D3DPRESENT_PARAMETERS_ pp{1};
   d3d->CreateDevice(0, D0, 0, 0x40, &pp, &dev);
   IDirect3DSurface9 *back = 0; dev->CreateRenderTarget(3840, 2160, F0, M0, 0, 0, &back, 0, (char*)"InternalRT0");
   struct { const char *n; int w, h; } rts[] = { {"_rt_fullframefb",3840,2160}, {"_rt_hud",3840,2160}, {"_rt_gbnormal",3840,2160}, {"_rt_smallfb0",960,540}, {"_rt_csmshadowbuffer",4096,4096} };
   IDirect3DTexture9 *tx[5]; for (int i = 0; i < 5; i++) dev->CreateTexture((unsigned)rts[i].w, (unsigned)rts[i].h, 1, 1, F0, P0, &tx[i], 0, (char*)rts[i].n);
+  // FAKE_SKIP_RT=<label> FAKE_SKIP_AFTER=<frame>: from that frame on the engine no longer renders that target (tests that a pair is never half-delivered)
+  const char *skip_rt = getenv("FAKE_SKIP_RT"); int skip_after = getenv("FAKE_SKIP_AFTER") ? atoi(getenv("FAKE_SKIP_AFTER")) : 0, skip_idx = -1;
+  for (int i = 0; i < 5; i++) if (skip_rt && !strcmp(skip_rt, rts[i].n)) skip_idx = i;
   int violations = 0;
-  for (int f = 0; f < loading + play; f++) {
-    if (f >= loading) {
+  for (int f = 0; f < loading + play + tail; f++) {
+    if (f >= loading && f < loading + play) {   // the tail is a second loading screen: Present only
       for (int k = 0; k < switches; k++) {
+        if (skip_idx >= 0 && f >= skip_after && k % 5 == skip_idx) continue;
         IDirect3DSurface9 *s = 0; tx[k % 5]->GetSurfaceLevel(0, &s);
         dev->SetRenderTarget(0, s); dev->DrawPrimitive(PT0, 0, 1);
       }
@@ -26,6 +31,6 @@ int main(int argc, char **argv) {
     if (!mock_state_ok(dr, 8, 9, 10, 1)) violations++;
     if (f % 4 == 0) usleep(200);
   }
-  printf("GAME done: frames=%d gl_state_violations=%d\n", loading + play, violations);
+  printf("GAME done: frames=%d gl_state_violations=%d\n", loading + play + tail, violations);
   return violations ? 1 : 0;
 }

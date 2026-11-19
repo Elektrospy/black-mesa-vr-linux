@@ -364,6 +364,8 @@ typedef void (*PFN_glGetFramebufferAttachmentParameteriv)(unsigned, unsigned, un
 typedef void (*PFN_glGetTexLevelParameteriv)(unsigned, int, unsigned, int *);
 typedef void (*PFN_glBindRenderbuffer)(unsigned, unsigned);
 typedef void (*PFN_glGetRenderbufferParameteriv)(unsigned, unsigned, int *);
+typedef unsigned char (*PFN_glIsTexture)(unsigned);
+typedef unsigned char (*PFN_glIsRenderbuffer)(unsigned);
 
 static struct {
     PFN_glCreateMemoryObjectsEXT CreateMemoryObjects;
@@ -398,6 +400,8 @@ static struct {
     PFN_glGetTexLevelParameteriv GetTexLevelParameteriv;
     PFN_glBindRenderbuffer BindRenderbuffer;
     PFN_glGetRenderbufferParameteriv GetRenderbufferParameteriv;
+    PFN_glIsTexture IsTexture;                  /* optional: used to check that a remembered object still exists */
+    PFN_glIsRenderbuffer IsRenderbuffer;        /* optional */
 } xgl;
 
 static int g_x_state;            /* 0 = looking for the helper, 1 = connected, -1 = given up */
@@ -405,7 +409,9 @@ static int g_x_sock = -1;
 static unsigned g_x_tick;
 static unsigned g_x_snapshots;
 static uint32_t g_x_w, g_x_h;
-static unsigned g_x_mem, g_x_tex, g_x_fbo;   /* imported memory, its texture, FBO that draws into it */
+#define XFER_EYES 2                          /* stage 3d: shared images per connection (eye 0 = the single image of earlier stages) */
+static unsigned g_x_mem[XFER_EYES], g_x_tex[XFER_EYES], g_x_fbo[XFER_EYES];   /* per eye: imported memory, its texture, FBO that draws into it */
+static unsigned g_x_neyes = 1;               /* eyes in use on this connection (1, or 2 when target2 is set and the helper offers two images) */
 static unsigned g_x_rfbo;                    /* private FBO used as the blit SOURCE (attaches the target) */
 /* Stage 3a: GPU semaphores instead of glFinish. */
 static int g_sync_want;                      /* config: 0 = glFinish + ack (default, verified), 1 = GPU semaphores */
@@ -419,10 +425,12 @@ static uint64_t now_ns(void);
 
 /* ------------------------------------------------------------ target spec / config */
 enum { SPEC_NAME = 0, SPEC_SIZE = 1, SPEC_WINDOW = 2 };
-static int g_spec_kind = SPEC_NAME;
-static char g_spec_name[40] = "_rt_fullframefb";
-static unsigned g_spec_w, g_spec_h;
+struct tspec { int kind; char name[40]; unsigned w, h; };
+/* [0] = eye 0 = the target of the earlier stages; [1] = eye 1 (stage 3d), in use only when "target2=" / BMVR_TARGET2 is set. */
+static struct tspec g_spec[XFER_EYES] = { { SPEC_NAME, "_rt_fullframefb", 0, 0 }, { SPEC_NAME, "", 0, 0 } };
+static int g_spec2_on;           /* target2 configured */
 static int g_flip_mode = 2;      /* 0 / 1 = fixed, 2 = alternate per snapshot */
+static int g_flip2_mode = -1;    /* eye 1: -1 = same as eye 0, else as g_flip_mode */
 static int g_cfg_loaded;
 
 static int game_dir(char *out, size_t cap)
@@ -473,22 +481,33 @@ static unsigned parse_uint(const char *s, const char **end)
     return v;
 }
 
-static void parse_spec(const char *s)
+static void parse_spec(struct tspec *sp, const char *s)
 {
     while (*s == ' ' || *s == '\t') s++;
-    if (!strncmp(s, "window", 6)) { g_spec_kind = SPEC_WINDOW; return; }
+    if (!strncmp(s, "window", 6)) { sp->kind = SPEC_WINDOW; return; }
     if (!strncmp(s, "size:", 5)) {
         const char *e1 = NULL, *e2 = NULL;
         unsigned w = parse_uint(s + 5, &e1), h = 0;
         if (e1 && (*e1 == 'x' || *e1 == 'X')) h = parse_uint(e1 + 1, &e2);
-        if (w && h && w <= 16384 && h <= 16384) { g_spec_kind = SPEC_SIZE; g_spec_w = w; g_spec_h = h; return; }
+        if (w && h && w <= 16384 && h <= 16384) { sp->kind = SPEC_SIZE; sp->w = w; sp->h = h; return; }
         bmvr_log("xfer: bad target spec '%s' (want size:WxH); keeping the previous one", s);
         return;
     }
     if (!strncmp(s, "name:", 5)) s += 5;
     if (!*s) return;
-    snprintf(g_spec_name, sizeof g_spec_name, "%s", s);
-    g_spec_kind = SPEC_NAME;
+    snprintf(sp->name, sizeof sp->name, "%s", s);
+    sp->kind = SPEC_NAME;
+}
+
+/* target2 = the second eye. Only a render target (by label or size) makes sense: eye 0 may be the window only when
+ * there is no second eye. */
+static void parse_spec2(const char *s)
+{
+    struct tspec t = g_spec[1];
+    parse_spec(&t, s);
+    if (t.kind == SPEC_WINDOW) { bmvr_log("xfer: target2=window is not supported (eye 1 must be a render target); ignored"); return; }
+    g_spec[1] = t;
+    g_spec2_on = (t.kind == SPEC_SIZE) || (t.kind == SPEC_NAME && t.name[0]);
 }
 
 static void parse_sync(const char *s)
@@ -498,12 +517,15 @@ static void parse_sync(const char *s)
     else bmvr_log("xfer: bad sync value '%s' (want sem or finish); keeping %s", s, g_sync_want ? "sem" : "finish");
 }
 
-static void parse_flip(const char *s)
+static int flip_value(const char *s, int keep)
 {
-    if (!strncmp(s, "alt", 3)) g_flip_mode = 2;
-    else if (s[0] == '0') g_flip_mode = 0;
-    else if (s[0] == '1') g_flip_mode = 1;
+    if (!strncmp(s, "alt", 3)) return 2;
+    if (s[0] == '0') return 0;
+    if (s[0] == '1') return 1;
+    return keep;
 }
+static void parse_flip(const char *s) { g_flip_mode = flip_value(s, g_flip_mode); }
+static void parse_flip2(const char *s) { g_flip2_mode = flip_value(s, g_flip2_mode); }
 
 static void load_cfg_once(void)
 {
@@ -517,26 +539,43 @@ static void load_cfg_once(void)
         while (f && fgets(line, sizeof line, f)) {
             trim_eol(line);
             if (!line[0] || line[0] == '#') continue;
-            if (!strncmp(line, "target=", 7)) parse_spec(line + 7);
+            if (!strncmp(line, "target=", 7)) parse_spec(&g_spec[0], line + 7);
+            else if (!strncmp(line, "target2=", 8)) parse_spec2(line + 8);
             else if (!strncmp(line, "flip=", 5)) parse_flip(line + 5);
+            else if (!strncmp(line, "flip2=", 6)) parse_flip2(line + 6);
             else if (!strncmp(line, "sync=", 5)) parse_sync(line + 5);
-            else if (first) parse_spec(line);
+            else if (first) parse_spec(&g_spec[0], line);
             first = 0;
         }
         if (f) fclose(f);
     }
     const char *e = getenv("BMVR_TARGET");
-    if (e && *e) parse_spec(e);
+    if (e && *e) parse_spec(&g_spec[0], e);
+    e = getenv("BMVR_TARGET2");
+    if (e && *e) parse_spec2(e);
     e = getenv("BMVR_FLIP");
     if (e && *e) parse_flip(e);
+    e = getenv("BMVR_FLIP2");
+    if (e && *e) parse_flip2(e);
     e = getenv("BMVR_SYNC");
     if (e && *e) parse_sync(e);
     bmvr_log("xfer: sync mode requested: %s", g_sync_want ? "GPU semaphores (falls back to glFinish + ack if unavailable)" : "glFinish + ack");
-    if (g_spec_kind == SPEC_NAME) bmvr_log("xfer: target = render target with label containing '%s', flip=%s", g_spec_name,
-                                           g_flip_mode == 2 ? "alt" : (g_flip_mode ? "1" : "0"));
-    else if (g_spec_kind == SPEC_SIZE) bmvr_log("xfer: target = any render target of GL size %ux%u, flip=%s", g_spec_w, g_spec_h,
-                                                g_flip_mode == 2 ? "alt" : (g_flip_mode ? "1" : "0"));
+    if (g_spec[0].kind == SPEC_NAME) bmvr_log("xfer: target = render target with label containing '%s', flip=%s", g_spec[0].name,
+                                              g_flip_mode == 2 ? "alt" : (g_flip_mode ? "1" : "0"));
+    else if (g_spec[0].kind == SPEC_SIZE) bmvr_log("xfer: target = any render target of GL size %ux%u, flip=%s", g_spec[0].w, g_spec[0].h,
+                                                   g_flip_mode == 2 ? "alt" : (g_flip_mode ? "1" : "0"));
     else bmvr_log("xfer: target = window (default framebuffer, stage 2a behaviour)");
+    if (g_spec2_on && g_spec[0].kind == SPEC_WINDOW) {
+        bmvr_log("xfer: target2 ignored: eye 0 is the window, a pair needs two render targets");
+        g_spec2_on = 0;
+    }
+    if (g_spec2_on) {
+        int f2 = g_flip2_mode < 0 ? g_flip_mode : g_flip2_mode;
+        if (g_spec[1].kind == SPEC_NAME) bmvr_log("xfer: target2 (eye 1) = render target with label containing '%s', flip=%s", g_spec[1].name,
+                                                  f2 == 2 ? "alt" : (f2 ? "1" : "0"));
+        else bmvr_log("xfer: target2 (eye 1) = any render target of GL size %ux%u, flip=%s", g_spec[1].w, g_spec[1].h,
+                      f2 == 2 ? "alt" : (f2 ? "1" : "0"));
+    }
 }
 
 /* ------------------------------------------------------------ render target registry */
@@ -681,6 +720,8 @@ static int xfer_resolve_gl(void)
     xgl.MemoryObjectParameteriv = (void *)gp("glMemoryObjectParameterivEXT");
     xgl.ImportMemoryFd = (void *)gp("glImportMemoryFdEXT");
     xgl.TexStorageMem2D = (void *)gp("glTexStorageMem2DEXT");
+    xgl.IsTexture = (void *)gp("glIsTexture");
+    xgl.IsRenderbuffer = (void *)gp("glIsRenderbuffer");
     xgl.GenSemaphores = (void *)gp("glGenSemaphoresEXT");
     xgl.DeleteSemaphores = (void *)gp("glDeleteSemaphoresEXT");
     xgl.ImportSemaphoreFd = (void *)gp("glImportSemaphoreFdEXT");
@@ -710,15 +751,20 @@ static int xfer_gl_usable(void)
 static void xfer_teardown(void)
 {
     if (g_x_sock >= 0) { close(g_x_sock); g_x_sock = -1; }
-    if (xgl.DeleteFramebuffers && g_x_fbo) xgl.DeleteFramebuffers(1, &g_x_fbo);
+    for (int e = 0; e < XFER_EYES; e++) {
+        if (xgl.DeleteFramebuffers && g_x_fbo[e]) xgl.DeleteFramebuffers(1, &g_x_fbo[e]);
+        if (xgl.DeleteTextures && g_x_tex[e]) xgl.DeleteTextures(1, &g_x_tex[e]);
+    }
     if (xgl.DeleteFramebuffers && g_x_rfbo) xgl.DeleteFramebuffers(1, &g_x_rfbo);
-    if (xgl.DeleteTextures && g_x_tex) xgl.DeleteTextures(1, &g_x_tex);
     if (xgl.DeleteSemaphores && g_x_sem_gl_ready) xgl.DeleteSemaphores(1, &g_x_sem_gl_ready);
     if (xgl.DeleteSemaphores && g_x_sem_vk_done) xgl.DeleteSemaphores(1, &g_x_sem_vk_done);
-    if (xgl.DeleteMemoryObjects && g_x_mem) xgl.DeleteMemoryObjects(1, &g_x_mem);
+    for (int e = 0; e < XFER_EYES; e++)
+        if (xgl.DeleteMemoryObjects && g_x_mem[e]) xgl.DeleteMemoryObjects(1, &g_x_mem[e]);
     g_x_sem_gl_ready = g_x_sem_vk_done = 0;
     g_x_sem_on = g_x_sem_inflight = 0;
-    g_x_fbo = g_x_rfbo = g_x_tex = g_x_mem = 0;
+    for (int e = 0; e < XFER_EYES; e++) g_x_fbo[e] = g_x_tex[e] = g_x_mem[e] = 0;
+    g_x_rfbo = 0;
+    g_x_neyes = 1;
 }
 
 static void xfer_set_timeout(int fd)
@@ -772,7 +818,7 @@ static int xfer_connect_and_import(void)
     struct iovec iov;
     iov.iov_base = &h;
     iov.iov_len = sizeof h;
-    char ctl[CMSG_SPACE(3 * sizeof(int))];
+    char ctl[CMSG_SPACE(4 * sizeof(int))];    /* v4: up to 2 memory fds + 2 semaphore fds */
     memset(ctl, 0, sizeof ctl);
     struct msghdr m;
     memset(&m, 0, sizeof m);
@@ -781,25 +827,34 @@ static int xfer_connect_and_import(void)
     m.msg_control = ctl;
     m.msg_controllen = sizeof ctl;
     ssize_t got = recvmsg(s, &m, 0);
-    int fds[3] = { -1, -1, -1 }, nfds = 0;
+    int fds[4] = { -1, -1, -1, -1 }, nfds = 0;
     struct cmsghdr *c = CMSG_FIRSTHDR(&m);
     if (c && c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_RIGHTS) {
         nfds = (int)((c->cmsg_len - CMSG_LEN(0)) / sizeof(int));
-        if (nfds > 3) nfds = 3;
+        if (nfds > 4) nfds = 4;
         memcpy(fds, CMSG_DATA(c), (size_t)nfds * sizeof(int));
     }
     int fd = fds[0];
     int want_sem_fds = (got == (ssize_t)sizeof h && (h.caps & BMVR_XFER_CAP_SEMAPHORES)) ? 2 : 0;
+    int offered = got == (ssize_t)sizeof h ? (int)h.eye_count : 0;
     if (got != (ssize_t)sizeof h || fd < 0 || h.magic != BMVR_XFER_MAGIC_HELLO || h.version != BMVR_XFER_VERSION ||
-        !h.width || !h.height || h.width > 8192 || h.height > 8192 || nfds != 1 + want_sem_fds) {
+        !h.width || !h.height || h.width > 8192 || h.height > 8192 || offered < 1 || offered > XFER_EYES ||
+        nfds != offered + want_sem_fds) {
         bmvr_log("xfer: bad hello from helper (got %d bytes, %d fd(s), version %u, want %u): rebuild shim and helper together",
                  (int)got, nfds, got == (ssize_t)sizeof h ? h.version : 0u, BMVR_XFER_VERSION);
         for (int i = 0; i < nfds; i++) close(fds[i]);
         close(s);
         return 0;
     }
-    bmvr_log("xfer: helper connected: shared image %ux%u, memory %llu bytes, fd %d", h.width, h.height,
-             (unsigned long long)h.memory_size, fd);
+    /* Eye 1 is used only when asked for (target2) and offered; an unused second memory fd is closed. */
+    int neyes = (offered >= 2 && g_spec2_on && g_spec[0].kind != SPEC_WINDOW) ? 2 : 1;
+    bmvr_log("xfer: helper connected: shared image %ux%u, memory %llu bytes, fd %d%s", h.width, h.height,
+             (unsigned long long)h.memory_size, fd, offered > 1 ? " (+1 more image, eye 1)" : "");
+    if (g_spec2_on && offered < 2)
+        bmvr_log("xfer: target2 is configured but the helper serves one eye; delivering eye 0 only (start the helper with --eyes 2)");
+    else if (offered >= 2 && !g_spec2_on)
+        bmvr_log("xfer: the helper offers two eyes but no target2 is configured; delivering eye 0 only");
+    for (int e = neyes; e < offered; e++) { close(fds[e]); fds[e] = -1; }
 
     if (!xfer_resolve_gl() || !xfer_have_import()) {
         bmvr_log("xfer: GL memory-object entry points missing; hand-off disabled");
@@ -812,37 +867,45 @@ static int xfer_connect_and_import(void)
     xgl.GetIntegerv(GL_TEXTURE_BINDING_2D, &old_tex);
 
     int one = 1, ok = 1;
-    xgl.CreateMemoryObjects(1, &g_x_mem);
-    ok &= xfer_gl_ok("glCreateMemoryObjectsEXT");
-    if (h.dedicated) { xgl.MemoryObjectParameteriv(g_x_mem, GL_DEDICATED_MEMORY_OBJECT_EXT, &one); ok &= xfer_gl_ok("dedicated flag"); }
-    xgl.ImportMemoryFd(g_x_mem, h.memory_size, GL_HANDLE_TYPE_OPAQUE_FD_EXT, fd); /* on success GL owns the fd */
-    int imp = xfer_gl_ok("glImportMemoryFdEXT");
-    ok &= imp;
-    if (!imp) close(fd);
-    xgl.GenTextures(1, &g_x_tex);
-    xgl.BindTexture(GL_TEXTURE_2D, g_x_tex);
-    if (h.optimal_tiling) xgl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_TILING_EXT, (int)GL_OPTIMAL_TILING_EXT);
-    xgl.TexStorageMem2D(GL_TEXTURE_2D, 1, h.gl_internal_format, (int)h.width, (int)h.height, g_x_mem, 0);
-    ok &= xfer_gl_ok("glTexStorageMem2DEXT");
-    xgl.BindTexture(GL_TEXTURE_2D, (unsigned)old_tex);
+    for (int e = 0; e < neyes; e++) {
+        if (!ok) { close(fds[e]); fds[e] = -1; continue; }      /* an earlier eye failed: this fd was not consumed */
+        xgl.CreateMemoryObjects(1, &g_x_mem[e]);
+        ok &= xfer_gl_ok("glCreateMemoryObjectsEXT");
+        if (h.dedicated) { xgl.MemoryObjectParameteriv(g_x_mem[e], GL_DEDICATED_MEMORY_OBJECT_EXT, &one); ok &= xfer_gl_ok("dedicated flag"); }
+        xgl.ImportMemoryFd(g_x_mem[e], h.memory_size, GL_HANDLE_TYPE_OPAQUE_FD_EXT, fds[e]); /* on success GL owns the fd */
+        int imp = xfer_gl_ok("glImportMemoryFdEXT");
+        ok &= imp;
+        if (!imp) close(fds[e]);
+        fds[e] = -1;
+        xgl.GenTextures(1, &g_x_tex[e]);
+        xgl.BindTexture(GL_TEXTURE_2D, g_x_tex[e]);
+        if (h.optimal_tiling) xgl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_TILING_EXT, (int)GL_OPTIMAL_TILING_EXT);
+        xgl.TexStorageMem2D(GL_TEXTURE_2D, 1, h.gl_internal_format, (int)h.width, (int)h.height, g_x_mem[e], 0);
+        ok &= xfer_gl_ok("glTexStorageMem2DEXT");
+        xgl.BindTexture(GL_TEXTURE_2D, (unsigned)old_tex);
+    }
 
     if (ok) {
         int old_draw = 0, old_read = 0;
         xgl.GetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &old_draw);
         xgl.GetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &old_read);
-        xgl.GenFramebuffers(1, &g_x_fbo);
         xgl.GenFramebuffers(1, &g_x_rfbo);
-        xgl.BindFramebuffer(GL_DRAW_FRAMEBUFFER, g_x_fbo);
-        xgl.FramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g_x_tex, 0);
-        unsigned st = xgl.CheckFramebufferStatus(GL_DRAW_FRAMEBUFFER);
+        for (int e = 0; e < neyes; e++) {
+            xgl.GenFramebuffers(1, &g_x_fbo[e]);
+            xgl.BindFramebuffer(GL_DRAW_FRAMEBUFFER, g_x_fbo[e]);
+            xgl.FramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g_x_tex[e], 0);
+            unsigned st = xgl.CheckFramebufferStatus(GL_DRAW_FRAMEBUFFER);
+            if (st != GL_FRAMEBUFFER_COMPLETE) { bmvr_log("xfer: framebuffer on the imported texture%s is incomplete (0x%x)", e ? " of eye 1" : "", st); ok = 0; }
+        }
         xgl.BindFramebuffer(GL_DRAW_FRAMEBUFFER, (unsigned)old_draw);
         xgl.BindFramebuffer(GL_READ_FRAMEBUFFER, (unsigned)old_read);
-        if (st != GL_FRAMEBUFFER_COMPLETE) { bmvr_log("xfer: framebuffer on the imported texture is incomplete (0x%x)", st); ok = 0; }
         ok &= xfer_gl_ok("framebuffer setup");
     }
+    /* The semaphore fds follow the memory fds in the hello. */
+    int sem_fd_gl = want_sem_fds ? fds[offered] : -1, sem_fd_vk = want_sem_fds ? fds[offered + 1] : -1;
     if (!ok) {
         bmvr_log("xfer: import failed; hand-off disabled for this session");
-        if (want_sem_fds) { close(fds[1]); close(fds[2]); }
+        if (want_sem_fds) { close(sem_fd_gl); close(sem_fd_vk); }
         xfer_teardown();
         close(s);
         g_x_state = -1;
@@ -857,12 +920,12 @@ static int xfer_connect_and_import(void)
             while (xgl.GetError()) { /* drain */ }
             xgl.GenSemaphores(1, &g_x_sem_gl_ready);
             xgl.GenSemaphores(1, &g_x_sem_vk_done);
-            xgl.ImportSemaphoreFd(g_x_sem_gl_ready, GL_HANDLE_TYPE_OPAQUE_FD_EXT, fds[1]);
+            xgl.ImportSemaphoreFd(g_x_sem_gl_ready, GL_HANDLE_TYPE_OPAQUE_FD_EXT, sem_fd_gl);
             int ok1 = xfer_gl_ok("glImportSemaphoreFdEXT (gl_ready)");
-            if (!ok1) close(fds[1]);
-            xgl.ImportSemaphoreFd(g_x_sem_vk_done, GL_HANDLE_TYPE_OPAQUE_FD_EXT, fds[2]);
+            if (!ok1) close(sem_fd_gl);
+            xgl.ImportSemaphoreFd(g_x_sem_vk_done, GL_HANDLE_TYPE_OPAQUE_FD_EXT, sem_fd_vk);
             int ok2 = xfer_gl_ok("glImportSemaphoreFdEXT (vk_done)");
-            if (!ok2) close(fds[2]);
+            if (!ok2) close(sem_fd_vk);
             if (ok1 && ok2) { g_x_sem_on = 1; g_x_sem_inflight = 0; }
             else {
                 why = "the driver rejected the semaphore import";
@@ -871,8 +934,8 @@ static int xfer_connect_and_import(void)
                 g_x_sem_gl_ready = g_x_sem_vk_done = 0;
             }
         } else {
-            close(fds[1]);
-            close(fds[2]);
+            close(sem_fd_gl);
+            close(sem_fd_vk);
         }
         if (g_x_sem_on) bmvr_log("xfer: sync = GPU semaphores (GL semaphores %u/%u imported); no glFinish, no CPU stall per frame", g_x_sem_gl_ready, g_x_sem_vk_done);
         else bmvr_log("xfer: sync = glFinish + ack (semaphores offered by the helper but %s)", why);
@@ -881,9 +944,12 @@ static int xfer_connect_and_import(void)
     }
     g_x_w = h.width;
     g_x_h = h.height;
+    g_x_neyes = (unsigned)neyes;
     g_x_sock = s;
     g_x_state = 1;
-    bmvr_log("xfer: imported the helper's Vulkan memory as GL texture %u; snapshot every %d presents", g_x_tex, XFER_EVERY);
+    if (neyes == 2) bmvr_log("xfer: imported the helper's Vulkan memory as GL textures %u (eye 0) and %u (eye 1); pairs delivered every %d presents",
+                             g_x_tex[0], g_x_tex[1], XFER_EVERY);
+    else bmvr_log("xfer: imported the helper's Vulkan memory as GL texture %u; snapshot every %d presents", g_x_tex[0], XFER_EVERY);
     return 1;
 }
 
@@ -895,6 +961,31 @@ struct glatt {
     int w, h, samples;
     int valid;          /* type known, size measured, single-sample */
 };
+
+/* Size and sample count of a GL texture / renderbuffer by name. Restores the binding it uses; w and h stay 0
+ * when the object does not exist, is not 2D or the query fails. */
+static void measure_gl_object(int type, unsigned name, int *pw, int *ph, int *psamples)
+{
+    int w = 0, h = 0, samples = 0;
+    if (type == GL_TEXTURE_OBJ) {
+        int old = 0;
+        xgl.GetIntegerv(GL_TEXTURE_BINDING_2D, &old);
+        xgl.BindTexture(GL_TEXTURE_2D, name);
+        xgl.GetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &w);
+        xgl.GetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &h);
+        xgl.BindTexture(GL_TEXTURE_2D, (unsigned)old);   /* a multisample/array texture fails the bind: w stays 0 */
+    } else {
+        int old = 0;
+        xgl.GetIntegerv(GL_RENDERBUFFER_BINDING, &old);
+        xgl.BindRenderbuffer(GL_RENDERBUFFER, name);
+        xgl.GetRenderbufferParameteriv(GL_RENDERBUFFER, GL_RENDERBUFFER_WIDTH, &w);
+        xgl.GetRenderbufferParameteriv(GL_RENDERBUFFER, GL_RENDERBUFFER_HEIGHT, &h);
+        xgl.GetRenderbufferParameteriv(GL_RENDERBUFFER, GL_RENDERBUFFER_SAMPLES, &samples);
+        xgl.BindRenderbuffer(GL_RENDERBUFFER, (unsigned)old);
+    }
+    while (xgl.GetError()) { w = h = 0; }
+    *pw = w; *ph = h; *psamples = samples;
+}
 
 /* Query the colour attachment 0 of the current DRAW framebuffer. Binds it to READ temporarily and
  * restores everything it touches. Caches the measurement of the last (type, name) for the rest of
@@ -924,23 +1015,7 @@ static void probe_draw_fbo(struct glatt *a)
         return;
     }
     int w = 0, h = 0, samples = 0;
-    if (type == GL_TEXTURE_OBJ) {
-        int old = 0;
-        xgl.GetIntegerv(GL_TEXTURE_BINDING_2D, &old);
-        xgl.BindTexture(GL_TEXTURE_2D, (unsigned)name);
-        xgl.GetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &w);
-        xgl.GetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &h);
-        xgl.BindTexture(GL_TEXTURE_2D, (unsigned)old);   /* a multisample/array texture fails the bind: w stays 0 */
-    } else {
-        int old = 0;
-        xgl.GetIntegerv(GL_RENDERBUFFER_BINDING, &old);
-        xgl.BindRenderbuffer(GL_RENDERBUFFER, (unsigned)name);
-        xgl.GetRenderbufferParameteriv(GL_RENDERBUFFER, GL_RENDERBUFFER_WIDTH, &w);
-        xgl.GetRenderbufferParameteriv(GL_RENDERBUFFER, GL_RENDERBUFFER_HEIGHT, &h);
-        xgl.GetRenderbufferParameteriv(GL_RENDERBUFFER, GL_RENDERBUFFER_SAMPLES, &samples);
-        xgl.BindRenderbuffer(GL_RENDERBUFFER, (unsigned)old);
-    }
-    while (xgl.GetError()) { w = h = 0; }
+    measure_gl_object(type, (unsigned)name, &w, &h, &samples);
     a->w = w; a->h = h; a->samples = samples;
     a->valid = (w > 0 && h > 0 && samples == 0);
     if (a->valid) { cache = *a; cache_tick = g_x_tick; }
@@ -995,18 +1070,26 @@ static void trace_summary(void)
     g_trace_tab_overflow = 0;
 }
 
-static struct {                          /* the last matching target left while armed */
+struct captarget {
     int valid;
     int type;
     unsigned name, w, h;
     char label[40];
-} g_cap;
+};
+static struct captarget g_cap[XFER_EYES];          /* per eye: the last matching target left while armed */
 
-static int spec_matches(int known, const struct reg_ent *e, const struct glatt *a)
+/* The last target that was delivered. A loading screen / menu frame makes no SetRenderTarget(0) call (the engine
+ * draws straight into the back buffer), so nothing is "left" and nothing is recorded; the last delivered object is
+ * then re-checked and used instead. Not set by the window source. */
+static struct captarget g_last_good[XFER_EYES];
+static unsigned g_loading_fallbacks;
+
+static int spec_matches(int eye, int known, const struct reg_ent *e, const struct glatt *a)
 {
-    if (g_spec_kind == SPEC_SIZE) return a->valid && (unsigned)a->w == g_spec_w && (unsigned)a->h == g_spec_h;
-    if (g_spec_kind != SPEC_NAME) return 0;
-    return known && ci_contains(e->label, g_spec_name);
+    const struct tspec *sp = &g_spec[eye];
+    if (sp->kind == SPEC_SIZE) return a->valid && (unsigned)a->w == sp->w && (unsigned)a->h == sp->h;
+    if (sp->kind != SPEC_NAME) return 0;
+    return known && ci_contains(e->label, sp->name);
 }
 
 /* Called from the SetRenderTarget interposer BEFORE the real call, for index 0.
@@ -1034,25 +1117,28 @@ static void rt_leave(void *left, void *next)
         if (g_trace_run && !strcmp(key, g_trace_key)) g_trace_run++;
         else { trace_flush(); memcpy(g_trace_key, key, sizeof g_trace_key); g_trace_run = 1; }
     }
-    if (!g_x_armed || !left || g_spec_kind == SPEC_WINDOW) return;
+    if (!g_x_armed || !left || g_spec[0].kind == SPEC_WINDOW) return;
 
     g_cap_leaves++;
     if (!a.valid) { g_cap_unresolved++; return; }
-    if (!spec_matches(known, &le, &a)) return;
-    if (known && ((uint32_t)a.w != le.w || (uint32_t)a.h != le.h)) { g_cap_mismatch++; return; } /* stale / lazy-bind guard */
-    g_cap.valid = 1;
-    g_cap.type = a.type;
-    g_cap.name = a.name;
-    g_cap.w = (unsigned)a.w;
-    g_cap.h = (unsigned)a.h;
-    snprintf(g_cap.label, sizeof g_cap.label, "%s", known && le.label[0] ? le.label : "size");
+    for (unsigned e = 0; e < g_x_neyes; e++) {   /* one leave can serve both eyes (same object for both) */
+        if (!spec_matches((int)e, known, &le, &a)) continue;
+        if (known && ((uint32_t)a.w != le.w || (uint32_t)a.h != le.h)) { g_cap_mismatch++; continue; } /* stale / lazy-bind guard */
+        g_cap[e].valid = 1;
+        g_cap[e].type = a.type;
+        g_cap[e].name = a.name;
+        g_cap[e].w = (unsigned)a.w;
+        g_cap[e].h = (unsigned)a.h;
+        snprintf(g_cap[e].label, sizeof g_cap[e].label, "%s", known && le.label[0] ? le.label : "size");
+    }
 }
 
 /* ------------------------------------------------------------ delivering a frame */
-static int xfer_pick_flip(void)
+static int xfer_pick_flip(int eye)
 {
-    if (g_flip_mode == 0 || g_flip_mode == 1) return g_flip_mode;
-    return (int)(g_x_snapshots & 1u);
+    int mode = (eye && g_flip2_mode >= 0) ? g_flip2_mode : g_flip_mode;
+    if (mode == 0 || mode == 1) return mode;
+    return (int)(g_x_snapshots & 1u);   /* "alt": both eyes of a pair use the same orientation */
 }
 
 /* Before writing the shared image: with semaphores, make the GPU wait until the helper finished reading the
@@ -1060,8 +1146,8 @@ static int xfer_pick_flip(void)
 static void xfer_sync_before_blit(void)
 {
     if (!g_x_sem_on || !g_x_sem_inflight) return;
-    unsigned layout = GL_LAYOUT_GENERAL_EXT;
-    xgl.WaitSemaphore(g_x_sem_vk_done, 0, NULL, 1, &g_x_tex, &layout);
+    unsigned layout[XFER_EYES] = { GL_LAYOUT_GENERAL_EXT, GL_LAYOUT_GENERAL_EXT };
+    xgl.WaitSemaphore(g_x_sem_vk_done, 0, NULL, g_x_neyes, g_x_tex, layout);   /* one wait covers both eyes' images */
     g_x_sem_inflight = 0;
     if (!xfer_gl_ok("glWaitSemaphoreEXT")) { g_x_sem_on = 0; bmvr_log("xfer: GL semaphore wait failed; using glFinish + ack from now on"); }
 }
@@ -1071,8 +1157,8 @@ static void xfer_sync_before_blit(void)
 static unsigned xfer_sync_publish(void)
 {
     if (g_x_sem_on) {
-        unsigned layout = GL_LAYOUT_GENERAL_EXT;
-        xgl.SignalSemaphore(g_x_sem_gl_ready, 0, NULL, 1, &g_x_tex, &layout);
+        unsigned layout[XFER_EYES] = { GL_LAYOUT_GENERAL_EXT, GL_LAYOUT_GENERAL_EXT };
+        xgl.SignalSemaphore(g_x_sem_gl_ready, 0, NULL, g_x_neyes, g_x_tex, layout);   /* ONE signal per pair */
         xgl.Flush();
         if (xfer_gl_ok("glSignalSemaphoreEXT")) return BMVR_XFER_FLAG_SEMAPHORE;
         g_x_sem_on = 0;
@@ -1082,9 +1168,18 @@ static unsigned xfer_sync_publish(void)
     return 0;
 }
 
-/* Tell the helper the shared image holds a frame, wait for its ack. Returns 1 on success. */
-static int xfer_send_frame(unsigned sw, unsigned sh, unsigned flags, unsigned gl_name, const char *name)
+/* What was written into the shared image of one eye. */
+struct eyeinfo {
+    unsigned w, h, flags, gl_name;
+    char name[40];
+};
+
+/* Tell the helper the shared image(s) hold a frame, wait for its ack. Returns 1 on success.
+ * `semflag` (BMVR_XFER_FLAG_SEMAPHORE or 0) applies to the whole pair; ei[0] is always valid, ei[1] when neyes == 2. */
+static int xfer_send_frame(unsigned neyes, const struct eyeinfo *ei, unsigned semflag)
 {
+    unsigned sw = ei[0].w, sh = ei[0].h, flags = ei[0].flags | semflag;
+    const char *name = ei[0].name;
     struct bmvr_xfer_frame fr;
     memset(&fr, 0, sizeof fr);
     fr.magic = BMVR_XFER_MAGIC_FRAME;
@@ -1092,8 +1187,16 @@ static int xfer_send_frame(unsigned sw, unsigned sh, unsigned flags, unsigned gl
     fr.src_w = sw;
     fr.src_h = sh;
     fr.flags = flags;
-    fr.gl_name = gl_name;
-    snprintf(fr.name, sizeof fr.name, "%s", name);
+    fr.gl_name = ei[0].gl_name;
+    snprintf(fr.name, sizeof fr.name, "%.23s", name);
+    fr.eye_count = neyes;
+    if (neyes == 2) {
+        fr.eye1_src_w = ei[1].w;
+        fr.eye1_src_h = ei[1].h;
+        fr.eye1_flags = ei[1].flags;
+        fr.eye1_gl_name = ei[1].gl_name;
+        snprintf(fr.eye1_name, sizeof fr.eye1_name, "%.23s", ei[1].name);
+    }
     uint64_t t1 = now_ns();
     struct bmvr_xfer_ack ack;
     if (send(g_x_sock, &fr, sizeof fr, MSG_NOSIGNAL) != (ssize_t)sizeof fr ||
@@ -1110,10 +1213,13 @@ static int xfer_send_frame(unsigned sw, unsigned sh, unsigned flags, unsigned gl
     g_x_cost_gl_us += gl_us;
     g_x_cost_rtt_us += rtt_us;
     g_x_cost_n++;
-    if (g_x_snapshots++ < 6)
-        bmvr_log("xfer: snapshot %u delivered (tick %u, '%s' %ux%u -> %ux%u, flip=%u, sync=%s, GL side %llu us, helper round trip %llu us)",
+    if (g_x_snapshots++ < 6) {
+        char eye1[96] = "";
+        if (neyes == 2) snprintf(eye1, sizeof eye1, "; eye 1 '%s' %ux%u flip=%u", ei[1].name, ei[1].w, ei[1].h, ei[1].flags & BMVR_XFER_FLAG_FLIPPED);
+        bmvr_log("xfer: snapshot %u delivered (tick %u, '%s' %ux%u -> %ux%u, flip=%u, sync=%s, GL side %llu us, helper round trip %llu us%s)",
                  g_x_snapshots, g_x_tick, name, sw, sh, g_x_w, g_x_h, flags & BMVR_XFER_FLAG_FLIPPED,
-                 (flags & BMVR_XFER_FLAG_SEMAPHORE) ? "semaphores" : "glFinish+ack", gl_us, rtt_us);
+                 (flags & BMVR_XFER_FLAG_SEMAPHORE) ? "semaphores" : "glFinish+ack", gl_us, rtt_us, eye1);
+    }
     if (g_x_cost_n % 10 == 0 && g_x_cost_n <= 50)
         bmvr_log("xfer: average over %u snapshots (sync=%s): GL side %llu us, helper round trip %llu us",
                  g_x_cost_n, (flags & BMVR_XFER_FLAG_SEMAPHORE) ? "semaphores" : "glFinish+ack",
@@ -1139,7 +1245,7 @@ static void xfer_snapshot_window(void)
     if (scissor) xgl.Disable(GL_SCISSOR_TEST);
     while (xgl.GetError()) { /* drain */ }
     xgl.BindFramebuffer(GL_READ_FRAMEBUFFER, 0);
-    xgl.BindFramebuffer(GL_DRAW_FRAMEBUFFER, g_x_fbo);
+    xgl.BindFramebuffer(GL_DRAW_FRAMEBUFFER, g_x_fbo[0]);
     xfer_sync_before_blit();
     /* Destination Y range is flipped: GL rows start at the bottom, the Vulkan image's row 0 is the top. */
     xgl.BlitFramebuffer(0, 0, sw, sh, 0, (int)g_x_h, (int)g_x_w, 0, GL_COLOR_BUFFER_BIT, GL_LINEAR);
@@ -1149,29 +1255,70 @@ static void xfer_snapshot_window(void)
     xgl.BindFramebuffer(GL_DRAW_FRAMEBUFFER, (unsigned)old_draw);
     if (scissor) xgl.Enable(GL_SCISSOR_TEST);
     if (!blit_ok) return;
-    xfer_send_frame((unsigned)sw, (unsigned)sh, BMVR_XFER_FLAG_FLIPPED | BMVR_XFER_FLAG_WINDOW | semflag, 0, "window");
+    struct eyeinfo ei[XFER_EYES];
+    memset(ei, 0, sizeof ei);
+    ei[0].w = (unsigned)sw; ei[0].h = (unsigned)sh; ei[0].flags = BMVR_XFER_FLAG_FLIPPED | BMVR_XFER_FLAG_WINDOW;
+    snprintf(ei[0].name, sizeof ei[0].name, "%s", "window");
+    xfer_send_frame(1, ei, semflag);
 }
 
-/* Stage 2b path: blit the render target recorded by rt_leave(). */
+/* Loading screen / menu: the armed frame never switched render targets, so nothing was "left" for this eye. Reuse the
+ * last delivered object of the eye if it still exists with the same size and is single-sample. Returns 1 when g_cap[e]
+ * was filled from it. */
+static int cap_use_fallback(unsigned e)
+{
+    if (g_cap[e].valid || g_setrt0_prev != 0 || !g_last_good[e].valid) return 0;
+    struct captarget *lg = &g_last_good[e];
+    int exists = 1, w = 0, h = 0, samples = 0;
+    if (lg->type == GL_TEXTURE_OBJ && xgl.IsTexture) exists = xgl.IsTexture(lg->name) != 0;
+    if (lg->type == GL_RENDERBUFFER && xgl.IsRenderbuffer) exists = xgl.IsRenderbuffer(lg->name) != 0;
+    if (exists) measure_gl_object(lg->type, lg->name, &w, &h, &samples);
+    if (exists && w == (int)lg->w && h == (int)lg->h && samples == 0) {
+        g_cap[e] = *lg;
+        if (g_loading_fallbacks++ < 3)
+            bmvr_log("xfer: loading/menu frame (0 SetRenderTarget(0) calls): delivering the last known object of '%s' (%s %u, %ux%u)%s",
+                     g_cap[e].label, g_cap[e].type == GL_TEXTURE_OBJ ? "texture" : "renderbuffer", g_cap[e].name, g_cap[e].w, g_cap[e].h,
+                     e ? " [eye 1]" : "");
+        return 1;
+    }
+    lg->valid = 0;   /* gone or resized: forget it, wait for the next gameplay frame */
+    bmvr_log("xfer: the last known object of the target%s no longer exists or changed size; waiting for a gameplay frame", e ? " (eye 1)" : "");
+    return 0;
+}
+
+/* Stage 2b / 3d path: blit the render target(s) recorded by rt_leave(). With two eyes the pair is delivered only when
+ * BOTH eyes were captured in the same armed frame (a half pair would mix two game frames), with one wait before the
+ * first blit and one signal after the second. */
 static void xfer_snapshot_target(void)
 {
-    if (!g_cap.valid) {
-        static unsigned told;
-        if (told++ < 6) {
-            bmvr_log("xfer: no matching render target was left in the armed frame (leaves seen=%u unresolved=%u size-mismatch=%u "
-                     "registry puts=%u/%u, GetSurfaceLevel calls=%u) - see the rt-trace lines, adjust bmvr_target.txt",
-                     g_cap_leaves, g_cap_unresolved, g_cap_mismatch, g_reg_puts, g_reg_surf_puts, g_getsurf_total);
-            if (told == 1 && !g_getsurf_total && g_spec_kind == SPEC_NAME)
-                bmvr_log("xfer: hint: IDirect3DTexture9::GetSurfaceLevel was never seen, so surfaces have no labels "
-                         "(libtogl may not export it). Select by size instead: BMVR_TARGET=size:WxH (sizes are in the rt-trace lines).");
+    const unsigned neyes = g_x_neyes;
+    int from_fallback[XFER_EYES] = { 0, 0 };
+    for (unsigned e = 0; e < neyes; e++) from_fallback[e] = cap_use_fallback(e);
+
+    unsigned missing = 0;
+    for (unsigned e = 0; e < neyes; e++) if (!g_cap[e].valid) missing |= 1u << e;
+    if (missing) {
+        static unsigned told, told1;
+        if (!g_setrt0_prev) return;   /* a loading frame before any gameplay frame: nothing to deliver yet, nothing wrong */
+        if (missing & 1u) {
+            if (told++ < 6) {
+                bmvr_log("xfer: no matching render target was left in the armed frame (SetRenderTarget(0) calls=%u, leaves seen=%u unresolved=%u size-mismatch=%u "
+                         "registry puts=%u/%u, GetSurfaceLevel calls=%u) - see the rt-trace lines, adjust bmvr_target.txt",
+                         g_setrt0_prev, g_cap_leaves, g_cap_unresolved, g_cap_mismatch, g_reg_puts, g_reg_surf_puts, g_getsurf_total);
+                if (told == 1 && !g_getsurf_total && g_spec[0].kind == SPEC_NAME)
+                    bmvr_log("xfer: hint: IDirect3DTexture9::GetSurfaceLevel was never seen, so surfaces have no labels "
+                             "(libtogl may not export it). Select by size instead: BMVR_TARGET=size:WxH (sizes are in the rt-trace lines).");
+            }
+        } else if (told1++ < 6) {
+            bmvr_log("xfer: no matching render target for eye 1 (target2) was left in the armed frame (SetRenderTarget(0) calls=%u, leaves seen=%u "
+                     "unresolved=%u size-mismatch=%u); the pair is not delivered - see the rt-trace lines, adjust target2 in bmvr_target.txt",
+                     g_setrt0_prev, g_cap_leaves, g_cap_unresolved, g_cap_mismatch);
         }
+        for (unsigned e = 0; e < neyes; e++) g_cap[e].valid = 0;   /* drop a half pair */
         return;
     }
-    int type = g_cap.type;
-    unsigned name = g_cap.name, sw = g_cap.w, sh = g_cap.h;
-    char label[40];
-    snprintf(label, sizeof label, "%s", g_cap.label);
-    g_cap.valid = 0;
+    struct captarget cap[XFER_EYES];
+    for (unsigned e = 0; e < neyes; e++) { cap[e] = g_cap[e]; g_cap[e].valid = 0; }
 
     int old_draw = 0, old_read = 0;
     xgl.GetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &old_draw);
@@ -1180,35 +1327,64 @@ static void xfer_snapshot_target(void)
     if (scissor) xgl.Disable(GL_SCISSOR_TEST);
     while (xgl.GetError()) { /* drain */ }
 
-    xgl.BindFramebuffer(GL_READ_FRAMEBUFFER, g_x_rfbo);
-    if (type == GL_TEXTURE_OBJ) xgl.FramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, name, 0);
-    else xgl.FramebufferRenderbuffer(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, name);
-    unsigned st = xgl.CheckFramebufferStatus(GL_READ_FRAMEBUFFER);
-    int ok = 0, blit_ok = 0;
-    int flip = xfer_pick_flip();
-    if (st == GL_FRAMEBUFFER_COMPLETE && xfer_gl_ok("attach target")) {
-        xgl.BindFramebuffer(GL_DRAW_FRAMEBUFFER, g_x_fbo);
-        xfer_sync_before_blit();
-        xgl.BlitFramebuffer(0, 0, (int)sw, (int)sh, 0, flip ? (int)g_x_h : 0, (int)g_x_w, flip ? 0 : (int)g_x_h,
-                            GL_COLOR_BUFFER_BIT, GL_LINEAR);
-        blit_ok = xfer_gl_ok("glBlitFramebuffer (target)");
-        ok = blit_ok;
-    } else {
-        static unsigned told;
-        if (told++ < 4) bmvr_log("xfer: read FBO on '%s' (%s %u) is not usable (status 0x%x) - object deleted or unsupported format?",
-                                 label, type == GL_TEXTURE_OBJ ? "texture" : "renderbuffer", name, st);
-        while (xgl.GetError()) { /* drain */ }
+    int ok = 1, synced = 0;
+    struct eyeinfo ei[XFER_EYES];
+    memset(ei, 0, sizeof ei);
+    for (unsigned e = 0; e < neyes && ok; e++) {
+        int flip = xfer_pick_flip((int)e);
+        xgl.BindFramebuffer(GL_READ_FRAMEBUFFER, g_x_rfbo);
+        if (cap[e].type == GL_TEXTURE_OBJ) xgl.FramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, cap[e].name, 0);
+        else xgl.FramebufferRenderbuffer(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, cap[e].name);
+        unsigned st = xgl.CheckFramebufferStatus(GL_READ_FRAMEBUFFER);
+        if (st == GL_FRAMEBUFFER_COMPLETE && xfer_gl_ok("attach target")) {
+            xgl.BindFramebuffer(GL_DRAW_FRAMEBUFFER, g_x_fbo[e]);
+            if (!synced) { xfer_sync_before_blit(); synced = 1; }   /* ONE wait before the first blit of the pair */
+            xgl.BlitFramebuffer(0, 0, (int)cap[e].w, (int)cap[e].h, 0, flip ? (int)g_x_h : 0, (int)g_x_w, flip ? 0 : (int)g_x_h,
+                                GL_COLOR_BUFFER_BIT, GL_LINEAR);
+            ok = xfer_gl_ok("glBlitFramebuffer (target)");
+        } else {
+            static unsigned told;
+            if (told++ < 4) bmvr_log("xfer: read FBO on '%s' (%s %u) is not usable (status 0x%x) - object deleted or unsupported format?",
+                                     cap[e].label, cap[e].type == GL_TEXTURE_OBJ ? "texture" : "renderbuffer", cap[e].name, st);
+            while (xgl.GetError()) { /* drain */ }
+            ok = 0;
+        }
+        /* Drop the attachment so the private FBO never keeps (or later aliases) the engine's object. */
+        xgl.BindFramebuffer(GL_READ_FRAMEBUFFER, g_x_rfbo);
+        xgl.FramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
+        ei[e].w = cap[e].w; ei[e].h = cap[e].h; ei[e].gl_name = cap[e].name;
+        ei[e].flags = flip ? BMVR_XFER_FLAG_FLIPPED : 0;
+        snprintf(ei[e].name, sizeof ei[e].name, "%s", cap[e].label);
     }
-    /* Drop the attachment so the private FBO never keeps (or later aliases) the engine's object. */
-    xgl.BindFramebuffer(GL_READ_FRAMEBUFFER, g_x_rfbo);
-    xgl.FramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
-    unsigned semflag = ok ? xfer_sync_publish() : 0u;
+    unsigned semflag = ok ? xfer_sync_publish() : 0u;   /* ONE signal (or one glFinish) for the whole pair */
     xgl.BindFramebuffer(GL_READ_FRAMEBUFFER, (unsigned)old_read);
     xgl.BindFramebuffer(GL_DRAW_FRAMEBUFFER, (unsigned)old_draw);
     if (scissor) xgl.Enable(GL_SCISSOR_TEST);
     while (xgl.GetError()) { /* drain whatever the teardown raised */ }
     if (!ok) return;
-    xfer_send_frame(sw, sh, (flip ? BMVR_XFER_FLAG_FLIPPED : 0) | semflag, name, label);
+    if (xfer_send_frame(neyes, ei, semflag)) {
+        for (unsigned e = 0; e < neyes; e++) {
+            if (from_fallback[e]) continue;
+            g_last_good[e] = cap[e];
+            g_last_good[e].valid = 1;
+        }
+    }
+}
+
+/* Is the helper still connected? The kernel closes the socket when the helper process dies, so a non-blocking
+ * peek tells us BEFORE the GPU is asked to wait on a semaphore the dead helper will never signal (a GL wait has
+ * no timeout; the game would hang). Called once per snapshot, not per Present. */
+static int xfer_peer_alive(void)
+{
+    char c;
+    ssize_t n = recv(g_x_sock, &c, 1, MSG_PEEK | MSG_DONTWAIT);
+    if (n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) {
+        bmvr_log("xfer: the helper's socket is closed (helper exited); not waiting on its GPU semaphore; back to searching");
+        xfer_teardown();
+        g_x_state = 0;
+        return 0;
+    }
+    return 1;
 }
 
 /* Called once per Present, after report_gl_once(), on the render thread (GL context current). */
@@ -1249,16 +1425,17 @@ static void xfer_tick(void)
         return; /* first snapshot on the next period */
     }
     if (g_x_tick % XFER_EVERY == 0) {
-        if (xfer_gl_usable()) {
+        if (xfer_gl_usable() && xfer_peer_alive()) {
             g_x_t0 = now_ns();
-            if (g_spec_kind == SPEC_WINDOW) xfer_snapshot_window();
+            if (g_spec[0].kind == SPEC_WINDOW) xfer_snapshot_window();
             else xfer_snapshot_target();
         }
         g_x_armed = 0;
     }
     if (g_x_state == 1 && g_x_tick % XFER_EVERY == XFER_EVERY - 1) {
-        g_cap.valid = 0;
-        g_x_armed = (g_spec_kind != SPEC_WINDOW);   /* record the targets left during the next frame */
+        for (unsigned e = 0; e < XFER_EYES; e++) g_cap[e].valid = 0;
+        g_cap_leaves = g_cap_mismatch = g_cap_unresolved = 0;   /* the miss line must describe THIS frame */
+        g_x_armed = (g_spec[0].kind != SPEC_WINDOW);   /* record the targets left during the next frame */
     }
 }
 
@@ -1281,7 +1458,7 @@ __attribute__((constructor)) static void bmvr_init(void)
     if (n < 0) n = 0;
     exe[n] = 0;
     bmvr_log("bmvr_preload loaded, pid=%d exe=%s", getpid(), exe);
-    bmvr_log("milestone 1 + stages 2b/3a: all calls are forwarded to libtogl.so unchanged; the shim only reads GL state and, if the helper runs, copies one render target (sync: glFinish+ack, or GPU semaphores with sync=sem).");
+    bmvr_log("milestone 1 + stages 2b/3a/3b: all calls are forwarded to libtogl.so unchanged; the shim only reads GL state and, if the helper runs, copies one render target (sync: glFinish+ack, or GPU semaphores with sync=sem).");
 }
 
 /* =========================================================== interposed API =

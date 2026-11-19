@@ -52,7 +52,7 @@ if [[ "${1:-}" == "--uninstall" ]]; then
   [[ -f "$U/bms_linux" ]] || { echo "Not a native Black Mesa folder (no bms_linux): $U" >&2; exit 1; }
   for f in bin/bmvr_preload32.so bmvr_preload32.so bmvr-run.sh bmvr-bms.sh \
            bmvr_run_marker.txt bmvr_inner_marker.txt bmvr_linux_log.txt \
-           bmvr_xfer_helper bmvr_xfer.sock bmvr_target.txt; do
+           bmvr_xfer_helper bmvr_xfer.sock bmvr_xfer.lock bmvr_target.txt; do
     [[ -e "$U/$f" ]] && { rm -f -- "$U/$f"; echo "Removed $U/$f"; }
   done
   rm -f -- "$U"/bmvr_snapshot_*.ppm
@@ -229,7 +229,7 @@ targets of one frame in order, with what OpenGL reports for each. That block is 
 thing to send even if no snapshot appears (it also works without the helper).
 Choose another source (default is the render target whose label contains _rt_FullFrameFB) with a
 file "$GAME/bmvr_target.txt":   target=name:<part of label>   or   target=size:WxH   or   target=window
-and optionally   flip=0|1|alt.
+and optionally   flip=0|1|alt.   Two eyes (stage 3d, start the helper with --eyes 2):   target2=name:<label>|size:WxH   flip2=0|1|alt.
 
 Stage 3a: GPU synchronisation. By default the shim stalls the GPU with glFinish and waits for the helper
 (verified). To try GPU semaphores instead (no stall), add this line to "$GAME/bmvr_target.txt":
@@ -240,6 +240,10 @@ snapshot, "GL side N us" (time spent in the game's render thread) and "helper ro
 with sync=finish and once with sync=sem and send both logs. Caution: if the helper process is killed while
 the game is mid-frame, the game's GPU can wait forever on a semaphore (restart the game). That is why it is
 opt-in. \"\$GAME/bmvr_xfer_helper\" --no-semaphores forces the old behaviour from the helper side.
+
+Kill test (game running, no helper running): ./test_kill_loop.sh -n 10   (needs sync=sem in bmvr_target.txt to be meaningful;
+add --eyes 2 for the two-eye case).
+Only one helper can serve a game folder; a second one exits with an error (stage 3c).
 
 The shim only observes. Remove the launch option to go back to normal.
 No log file appears? Run tools/linux/bmvr-diagnose-linux.sh (ideally while the game is running).

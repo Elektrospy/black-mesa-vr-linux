@@ -4,7 +4,7 @@ Two separate things live here. Keep them apart.
 
 | | Black Mesa **through Proton** (Windows build) | Black Mesa **native Linux build** |
 |---|---|---|
-| Status | Reported working (see `docs/open-work-2026-10.md`: PSVR2, SteamVR on Linux, OpenXR helper) | **Not working. Milestone 1 done (observe-only shim); stage 2a (GPU hand-off) and stage 2b (engine render target through the hand-off) run in the real game; stage 3a (GPU semaphores instead of glFinish, opt-in) implemented and tested against stand-ins and a software Vulkan device, NOT yet run in the real game; real eye targets next.** |
+| Status | Reported working (see `docs/open-work-2026-10.md`: PSVR2, SteamVR on Linux, OpenXR helper) | **Not working. Milestone 1 done (observe-only shim); stage 2a (GPU hand-off) and stage 2b (engine render target through the hand-off) run in the real game; stage 3a (GPU semaphores instead of glFinish, opt-in) run in the real game and works; stage 3b (loading-frame fallback, helper-death check before the GPU wait): the helper-death guard is verified in the real game by the kill loop (10/10 `kill -9` cycles, `sync=sem`, no hang), the loading-frame fallback is still stand-in only; stage 3c (one helper per game folder) added, tested without Vulkan; two-eye hand-off (stage 3d, protocol v4) is implemented and passes the stand-in tests (T14-T19), not yet run on a GPU or in the game.** |
 | Mod | The normal `d3d9.dll` + `OpenXRHelper64.exe` | `linux/` (this port, not a VR mod yet) |
 | Install | `scripts/bmvr-linux.sh` | `scripts/build-linux.sh` |
 
@@ -284,7 +284,7 @@ shared image as expected; that the shim runs on the thread that owns the GL cont
 from identical source and `-fsyntax-only` checked, the 32-bit link happens in
 `scripts/build-linux.sh` on yours).
 
-## Stage 3a: GPU semaphores instead of glFinish (implemented; opt-in; not run in the real game)
+## Stage 3a: GPU semaphores instead of glFinish (opt-in; run in the real game, see "Real-game result (stage 3a)")
 
 Until now every snapshot cost a full `glFinish` (the shim waits for the *whole* GPU queue of the
 game) plus a socket round trip. That is fine for pictures, not for a per-frame hand-off. Stage 3a
@@ -343,12 +343,127 @@ software driver cannot, so the fd path of the self-test was *not* exercised ther
 `GL_EXT_semaphore_fd` waits/signals order correctly against Vulkan on NVIDIA, image correctness and
 tearing under `sync=sem`, and the actual cost difference.
 
+### Real-game result (stage 3a)
+
+Two runs, RTX 3080, driver 620.70.06, same map path, helper started first (`sync=finish` and `sync=sem`):
+- The driver exports **and** imports the opaque-fd semaphores (`opaque-fd semaphore: extension=1 exportable=1
+  importable=1`), the shim imported both (`GL semaphores 1/2 imported`), and `sync=sem` delivered every armed
+  gameplay frame (5 PPM snapshots + 1 more in the log) with `synced by GPU semaphores`.
+- Cost per delivered snapshot, time in the game's render thread: `sync=finish` 2.0-4.4 ms (average 3.05 ms over 10),
+  `sync=sem` 79-112 us. The `sync=finish` helper round trip (about 1.07 s) is dominated by the helper writing a PPM
+  file (the one unsaved snapshot took 24 us), so it is not comparable to the `sync=sem` round trip (45-89 us, where the
+  ack only means "submitted"); compare the render-thread number.
+- The five `sync=sem` snapshots were inspected: upright with `flip=0` (the default is right), consistent consecutive
+  gameplay frames (tram ride, then a guard on a catwalk, plus the main menu), no Steam/MangoHud overlay, no tearing
+  or stale-frame artefacts visible at half size. Single-scanline tearing was not checked pixel by pixel.
+- The "no matching render target was left in the armed frame" lines in both logs were **not** a matching problem: they
+  fall on loading frames (the stats window around them shows `SetRenderTarget=0`), and the line printed counters that
+  were never reset, so the same `leaves seen=127 ... size-mismatch=25` repeated from an older frame. Fixed in 3b.
+- Not verified at the time of 3a: a helper killed at the worst moment on the real GPU. Verified later, see "Stage 3b real-game kill loop" below.
+
+## Stage 3b: loading frames and a hung-GPU guard (stand-in tests only)
+
+Two fixes from the stage 3a real-game logs, plus a diagnostic fix:
+
+- **Loading / menu frames.** The engine draws straight into the back buffer there (no `SetRenderTarget(0)` call), so
+  nothing is "left" and no snapshot used to be delivered. If the armed frame made 0 `SetRenderTarget(0)` calls, the shim
+  now re-checks the last delivered object (`glIsTexture` / `glIsRenderbuffer` if available, then its size, single-sample)
+  and delivers that. The log says `loading/menu frame ... delivering the last known object of 'X'`. If the object is gone
+  or resized it is forgotten and the shim waits for a gameplay frame. A loading frame before any gameplay frame is silent.
+  Assumption to confirm in the real game: the back buffer's GL object (`InternalRT0`, FBO 9, texture 1 in the 3a log) holds
+  the loading-screen picture at the end of those frames.
+- **Helper death before the GPU wait.** A GL wait on a semaphore has no timeout, so a helper that acked and then died would
+  hang the game at the next frame's `glWaitSemaphoreEXT`. Before each snapshot the shim now peeks the helper socket
+  (`MSG_PEEK | MSG_DONTWAIT`); a closed socket tears everything down and goes back to searching, without issuing the wait.
+  This also removes the up-to-2 s receive timeout in `sync=finish` when the helper is gone. Not covered: a helper that is
+  alive but whose GPU work never finishes (its own 5 s fence timeout handles that side).
+- **Diagnostics.** The armed-frame counters are reset when a frame is armed, and the "no matching render target" line now
+  prints the frame's `SetRenderTarget(0)` count.
+
+Tests (`tests/linux`, 32-bit shim + stand-ins, all pass; the new cases fail on the stage 3a shim):
+`T12` helper exits right after acking a frame: socket check fires, no `glWaitSemaphoreEXT` / blit / signal afterwards,
+semaphores deleted, game clean; `T13` loading screens before and after gameplay: fallback delivers snapshots during the
+second loading screen, stays quiet before gameplay and when no fallback applies. `T10`'s stats-label check now reads the
+shim binary (the stats line needs 5 s of wall time, the fake game takes well under 1 s). Needs `gcc -m32` (on Ubuntu:
+`gcc-multilib g++-multilib`).
+
+## Stage 3b real-game kill loop (verified 2026-11-19)
+
+`./test_kill_loop.sh` (repo root; bash script, runs from fish/zsh/bash because of its shebang, do **not** paste or
+`source` it in fish) starts a helper, waits for `xfer: helper connected` in `bmvr_linux_log.txt`, waits 0-5 s at random,
+`kill -9`s the helper and waits for the shim to log `lost the helper` / `helper's socket is closed` / `back to searching`.
+The next cycle's connect line proves the shim reconnected. It stops at the first failed cycle and prints the last log lines.
+
+- Real run, Black Mesa native, RTX 3080, `bmvr_target.txt` = `target=InternalRT0`, `flip=0`, `sync=sem`: **10/10 cycles
+  passed** (the run was interrupted by hand after cycle 10; the script's default is 30). No GPU hang, no crash, the shim noticed
+  every dead helper and reconnected to the next one. This closes the "helper killed at the worst moment" item of stage 3a.
+  Ten random kill moments is a sample, not a proof; run the default 30 once in a map for more confidence.
+- The first attempt failed with "shim never connected to the new helper": an earlier helper was still running and the game
+  was still connected to it. The helper used to `unlink()` and re-`bind()` the socket path unconditionally, so a second helper
+  took the path over silently and listened for ever. The test now refuses to start while a helper runs (`pgrep -f`; `pgrep -x`
+  cannot be used, the process name is 16 characters and the kernel keeps 15), and 3c fixes the cause.
+- The shim retries the connection every `XFER_RETRY` = 240 presents (about 4 s at 60 fps, much longer on a slow loading
+  screen), so the script waits up to 45 s for a reconnect.
+
+## Stage 3c: one helper per game folder
+
+`bmvr_xfer_helper` takes an exclusive, non-blocking `flock()` on `<game folder>/bmvr_xfer.lock` **before** it touches the GPU
+and exits with an error naming the holder's pid when another helper already serves that folder. The kernel drops the lock
+when the process dies, including `kill -9`, so there is no stale-lock cleanup (the kill loop depends on this). Code:
+`linux/bmvr_single_instance.h` (header-only so the test uses the very same function). `--selftest-sync` does not lock.
+Helpers started from different game folders do not interfere. An old helper binary (before 3c) does not take the lock, so
+after upgrading make sure no old helper is running.
+
+Tests: `tests/linux/lock_test.c`, run by `tests/linux/run-tests.sh` before the stand-in suite (no Vulkan, no GPU): second
+holder refused and the holder pid reported, lock free again immediately after `kill -9`, unwritable folder gives a clear
+error. **Not run against the real helper yet**: the code was added to `linux/bmvr_xfer_helper.c` but that file needs the
+Vulkan headers, which were not available where it was written. Build it with `scripts/build-linux.sh` and check:
+start one helper, start a second one in another terminal; the second must print `ERROR: another bmvr_xfer_helper already
+serves this game folder ... (pid N)` and exit 1, and the first must keep running.
+
+## Stage 3d: two-eye hand-off (protocol v4; implemented, stand-in tested)
+
+Design and reasoning: `docs/LINUX_STEREO_HANDOFF.md`. Short version: a **pair** of eye images is the unit of publication
+(one frame message, one wait before the first blit, one signal after the second, one ack), so the two eyes of a pair
+always come from the same game frame.
+
+- `bmvr_xfer.h` **v4**: hello 40 -> 48 bytes (`eye_count`, `reserved`), one memory fd per image then the two semaphore fds;
+  frame 48 -> 92 bytes (`eye_count`, `eye1_src_w/h`, `eye1_flags`, `eye1_gl_name`, `eye1_name`). Shim and helper must be
+  rebuilt together (a v3 peer is rejected with both versions in the log).
+- Helper: `--eyes 1|2` (default 1). Two images + two readback buffers, ONE semaphore pair; snapshots of a pair are
+  `bmvr_snapshot_<n>_eye0_<what>_flip<f>.ppm` / `..._eye1_...`; single-eye names are unchanged.
+- Shim: `target2=name:<label>` or `target2=size:WxH`, `flip2=0|1|alt` (default: same as `flip`) in `bmvr_target.txt`, or
+  env `BMVR_TARGET2` / `BMVR_FLIP2`. Eye 1 is used only when `target2` is set AND the helper offers two images
+  (`--eyes 2`); otherwise the shim says why in the log and delivers eye 0 only, exactly as before. `target2` is ignored when
+  eye 0 is `window`. A pair is delivered only when BOTH eyes were captured in the same armed frame; otherwise nothing is
+  sent (log line `no matching render target for eye 1 ...`). The loading/menu fallback of 3b works per eye.
+- The engine still renders ONE view, so on the real game a pair is two *existing* render targets (or the same one twice).
+  That proves the transport, not stereo. A real left/right picture needs the game-hook port (plan item 4).
+
+**Tested** (stand-ins, `tests/linux`): T14 pair ordering `WAIT BLIT BLIT SIGNAL FLUSH frame ack`, one signal per pair, both
+textures in the barrier lists, distinct blits; T14b `BLIT BLIT FINISH`; T14c eye 1 by size with its own flip; T15 no half pair
+when eye 1 disappears; T16 negotiation (helper offers 2/no target2, target2/helper offers 1, window); T17 helper death
+after a pair; T18 v3 peer and `eye_count` 3 rejected; T19 loading frames with two eyes. T1-T13 (single eye) still pass
+unchanged. These ran as a host-native (64-bit) build (`BMVR_TEST_NATIVE=1`), because the machine they were written on has no
+32-bit toolchain; **run the normal `tests/linux/run-tests.sh` (32-bit) once on your machine**: it is the authoritative run.
+**Not tested**: the real helper with two images on a GPU (compiles warning-free against the Vulkan headers; the optional
+real-helper section of `run-tests.sh` now also sends two pairs, needs a Vulkan device), and nothing of this in the real game.
+
+Trying it in the real game (the same steps as the kill loop, plus):
+1. Rebuild with `scripts/build-linux.sh` (shim and helper together), stop any old helper.
+2. `bmvr_target.txt`: `target=InternalRT0`, `flip=0`, `sync=sem`, and for the first test the SAME object for both eyes:
+   `target2=InternalRT0` (proves two images + semaphores with known-good content). Later point `target2` at a different
+   target from the rt-trace output.
+3. `bmvr_xfer_helper --eyes 2`, start the game: the log shows `imported ... GL textures N (eye 0) and M (eye 1)`; the helper writes
+   `bmvr_snapshot_<n>_eye0_...` and `..._eye1_...`.
+4. `./test_kill_loop.sh -n 10 --eyes 2`: a cycle fails loudly if the shim used one eye only.
+
 ## Plan (not implemented)
 
 1. ~~Read the milestone-1 log; confirm eye-target candidates and driver extensions.~~ Done.
 2. ~~Stage 2a: test the transport.~~ Done, verified. ~~Stage 2b: capture an engine render target.~~ Done, verified in the real game (`InternalRT0`).
-3. Stage 3a: ~~replace `glFinish` + ack with `GL_EXT_semaphore_fd` / `VK_KHR_external_semaphore_fd`~~ implemented (opt-in), awaiting a real-GPU run.
-   Then: render a *separate* stereo pair into two eye targets (the engine renders one view today) and
+3. Stage 3a: ~~replace `glFinish` + ack with `GL_EXT_semaphore_fd` / `VK_KHR_external_semaphore_fd`~~ done, verified in the real game (opt-in). Stage 3b: loading-frame fallback + helper-death guard (helper-death verified by the kill loop; loading fallback awaiting a real run). Stage 3c: one helper per game folder (flock).
+   Then (design in `docs/LINUX_STEREO_HANDOFF.md`): render a *separate* stereo pair into two eye targets (the engine renders one view today) and
    hand both to a 64-bit native OpenXR helper. Which targets and sizes to use is decided by the
    `rt-trace` output.
 4. Find and port the ~100 game hooks (Itanium ABI: cdecl with `this` first, destructor

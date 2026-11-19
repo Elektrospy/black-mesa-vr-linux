@@ -68,6 +68,8 @@ static void g_blit(int a, int b, int c, int d, int e, int f, int g, int h, unsig
       r->color_type == 0x1702 ? "tex" : r->color_type == 0x8D41 ? "rb" : "default", r->color_name, bound_draw, a, b, c, d, e, f, g, h, scissor);
     if (scissor) err = 0x502;
 }
+static unsigned char g_isTex(unsigned id) { return id < MAXO && tex[id].w > 0; }
+static unsigned char g_isRb(unsigned id) { return id < MAXO && rb[id].w > 0; }
 static void g_finish(void) { T("GL FINISH"); }
 static void g_flush(void) { T("GL FLUSH"); }
 static unsigned char g_isEnabled(unsigned c) { return c == 0x0C11 ? (unsigned char)scissor : 0; }
@@ -86,8 +88,8 @@ static void g_importSem(unsigned s, unsigned ht, int fd)
     if (getenv("MOCK_SEM_IMPORT_FAIL")) { err = 0x502; return; }   /* on failure the caller keeps the fd */
     close(fd);
 }
-static void g_waitSem(unsigned s, unsigned nb, const unsigned *b, unsigned nt, const unsigned *t, const unsigned *l) { (void)nb; (void)b; T("GL WaitSemaphore sem=%u tex=%u layout=0x%x (nt=%u)", s, nt ? t[0] : 0, nt ? l[0] : 0, nt); }
-static void g_sigSem(unsigned s, unsigned nb, const unsigned *b, unsigned nt, const unsigned *t, const unsigned *l) { (void)nb; (void)b; T("GL SignalSemaphore sem=%u tex=%u layout=0x%x (nt=%u)", s, nt ? t[0] : 0, nt ? l[0] : 0, nt); }
+static void g_waitSem(unsigned s, unsigned nb, const unsigned *b, unsigned nt, const unsigned *t, const unsigned *l) { (void)nb; (void)b; T("GL WaitSemaphore sem=%u tex=%u layout=0x%x (nt=%u)%s", s, nt ? t[0] : 0, nt ? l[0] : 0, nt, ""); if (nt > 1) T("GL   barrier textures: %u %u", t[0], t[1]); }
+static void g_sigSem(unsigned s, unsigned nb, const unsigned *b, unsigned nt, const unsigned *t, const unsigned *l) { (void)nb; (void)b; T("GL SignalSemaphore sem=%u tex=%u layout=0x%x (nt=%u)%s", s, nt ? t[0] : 0, nt ? l[0] : 0, nt, ""); if (nt > 1) T("GL   barrier textures: %u %u", t[0], t[1]); }
 
 /* ---- API used by the fake libtogl and the fake game (the "engine" side of GL) ---- */
 unsigned mock_make_texture(int w, int h) { unsigned i = next_id++; tex[i].w = w; tex[i].h = h; return i; }
@@ -108,7 +110,7 @@ static struct ent tab[] = {
  {"glBlitFramebuffer", g_blit, 0}, {"glFinish", g_finish, 0}, {"glFlush", g_flush, 0}, {"glGetError", g_getError, 0},
  {"glIsEnabled", g_isEnabled, 0}, {"glEnable", g_enable, 0}, {"glDisable", g_disable, 0},
  {"glGetFramebufferAttachmentParameteriv", g_getFbAtt, 0}, {"glGetTexLevelParameteriv", g_getTexLevel, 0},
- {"glBindRenderbuffer", g_bindRenderbuffer, 0}, {"glGetRenderbufferParameteriv", g_getRbParam, 0},
+ {"glIsTexture", g_isTex, 0}, {"glIsRenderbuffer", g_isRb, 0}, {"glBindRenderbuffer", g_bindRenderbuffer, 0}, {"glGetRenderbufferParameteriv", g_getRbParam, 0},
  {"glCreateMemoryObjectsEXT", g_createMem, 0}, {"glDeleteMemoryObjectsEXT", g_del, 0}, {"glMemoryObjectParameterivEXT", g_memParam, 0},
  {"glImportMemoryFdEXT", g_importMem, 0}, {"glTexStorageMem2DEXT", g_texStorageMem, 0},
  {"glGenSemaphoresEXT", g_genSem, 1}, {"glDeleteSemaphoresEXT", g_delSem, 1}, {"glImportSemaphoreFdEXT", g_importSem, 1},
