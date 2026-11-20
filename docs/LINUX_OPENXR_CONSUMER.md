@@ -1,9 +1,12 @@
 # Linux port: native OpenXR consumer (stage 4a)
 
-Status: **milestone X0 (the probe) is implemented, compiled and run against Monado 21.0.0 in a CPU-only sandbox** (simulated
-HMD, null compositor, Mesa lavapipe). Details and limits: "X0 results" below. **Not checked: SteamVR, any real GPU, any real
-headset.** X1-X4 (frames, the pair ring, the pose channel) do not exist yet. Runtime-specific claims that X0 has not settled are
-still marked *(verify)*.
+Status: **milestone X0 (the probe) is implemented, compiled, and PASSES on two runtimes**: Monado 21.0.0 in a CPU-only sandbox
+(simulated HMD, null compositor, Mesa lavapipe) and SteamVR/OpenXR 2.19.4 on a real machine (NVIDIA RTX 3080, reported by the
+author, one run). Details and limits: "X0 results" below. **Milestone X1 (`--selftest-xr`, the frame loop with a generated
+pattern) is implemented, compiled (clean with `-Wall -Wextra`, also under `gcc -fanalyzer`) and PASSES on SteamVR 2.19.4 + RTX 3080
+(author's run: 895 quad and 898 projection frames submitted, about 90 fps; the author reports seeing a blue "L" and a red "R" in
+the headset)**; see "X1 results". Not run on Monado, and the Monado test script has not been executed. X2-X4 (socket sink,
+the pair ring, the pose channel) do not exist yet. Runtime-specific claims that X0 has not settled are still marked *(verify)*.
 
 Prerequisites: `docs/LINUX_PORT.md` (stages 2a-3d), `docs/LINUX_STEREO_HANDOFF.md` (protocol v4, pair atomicity),
 `docs/openxr-eye-publish.md` (the Windows pipeline and the defects this design must not repeat).
@@ -47,7 +50,7 @@ Resulting structure (C11, 64-bit, same style as the helper):
 
 ```
 linux/bmvr_xfer_helper.c      transport + --sink snapshot (today's behaviour, kept: it is what the tests use); --xr-probe entry
-linux/bmvr_xr_sink.c  (new)   OpenXR instance/session/swapchain (X0: exists, probe only); frame loop thread + pair ring (X1+: not yet)
+linux/bmvr_xr_sink.c  (new)   OpenXR instance/session/swapchain (X0: probe); --selftest-xr frame loop (X1: single thread, written, not yet run); pair ring + XR thread (X2+: not yet)
 linux/bmvr_xr_sink.h  (new)   X0: bmvr_xr_probe(); the transport-facing interface below arrives with X2
 third_party/openxr/           ALREADY vendored (Khronos headers 1.1.60, Apache-2.0 OR MIT); the loader is dlopen'd, like the Vulkan loader
 ```
@@ -174,8 +177,8 @@ runtime-initialized / ... / headset presentation verified). A status is written 
 
 | | Deliverable | Needs | Pass criteria |
 |---|---|---|---|
-| X0 | `bmvr_xr_sink` skeleton, `--xr-probe`: instance, system, view config, swapchain formats, session create/destroy, no game, no frames | Monado **and** SteamVR | Logs runtime name/version/extensions/formats on both; confirms or corrects every *(verify)* above; helper exits cleanly. **Status: implemented; Monado 21.0.0 (sandbox) PASS; SteamVR not run** |
-| X1 | `--selftest-xr`: frame loop with a generated pattern (left tinted one way, right the other, frame counter), quad then projection | Monado sim/qwerty first, then a headset | Correct eye order; steady `xrWaitFrame` cadence; rate lines sane; no per-frame disk writes |
+| X0 | `bmvr_xr_sink` skeleton, `--xr-probe`: instance, system, view config, swapchain formats, session create/destroy, no game, no frames | Monado **and** SteamVR | Logs runtime name/version/extensions/formats on both; confirms or corrects every *(verify)* above; helper exits cleanly. **Status: implemented; Monado 21.0.0 (sandbox) PASS; SteamVR 2.19.4 + RTX 3080 PASS (author's run)** |
+| X1 | `--selftest-xr`: frame loop with a generated pattern (left tinted one way, right the other, frame counter), quad then projection | Monado sim/qwerty first, then a headset | Correct eye order; steady `xrWaitFrame` cadence; rate lines sane; no per-frame disk writes. **Status: implemented; SteamVR 2.19.4 + RTX 3080 PASS, "L" blue / "R" red seen in the headset (author's run); Monado not run** (see "X1 results") |
 | X2 | Socket sink: pair -> ring -> swapchain, quad layer, eye 0 | game + runtime | Game picture visible in the headset on each runtime; `test_kill_loop.sh -n 10`, then 30, passes with `--sink xr` (helper killed at random points: game unaffected, helper-less period shows nothing or last image, reconnect restores the picture) |
 | X3 | Projection layer with a pinned pose; `target2=name:_rt_gblightdiff` | as X2 | Left and right visibly different content, correct sides, no eye ever shows a different tick than the other |
 | X4 | Protocol v5 pose channel, mock-tested (`mock_game` replays poses; new case T20+) | none (stand-ins) | Pair slots carry their own `pose_id`; stale id handled; v4 peer rejected with both versions named. Real use waits for the hook port |
@@ -199,26 +202,100 @@ as the Vulkan device, 2026-11-20). They settle the corresponding *(verify)* mark
 
 | Question from this design | Observed | Holds for SteamVR / real hardware? |
 |---|---|---|
-| Does the runtime offer `XR_KHR_vulkan_enable2`? | yes (also `XR_KHR_vulkan_enable`, `XR_KHR_composition_layer_depth`) | unknown for SteamVR |
-| Does the runtime-owned device flow work (requirements -> `xrCreateVulkanInstanceKHR` -> `xrGetVulkanGraphicsDevice2KHR` -> `xrCreateVulkanDeviceKHR` -> `xrCreateSession`)? | yes; Vulkan 1.1 instance accepted (Monado reports its upper bound as 1023.1023 = no limit) | unknown |
-| Is `R8G8B8A8_SRGB` offered, and does a swapchain in it with `TRANSFER_DST` usage work (the raw-copy assumption)? | yes: offered (also `R8G8B8A8_UNORM`, both BGRA, `R16G16B16A16_SFLOAT`), 3 images | **the biggest remaining unknown for SteamVR** |
-| Can the helper's exportable images live on the runtime's device? | yes on lavapipe (opaque-fd image export reported exportable) | must be re-checked on the real GPU |
-| Is the swapchain limited to the view's `maxImageRect`? | no: a 3840x2160 swapchain was created although the simulated HMD reports max 1024x1024 per view | runtime-specific; do not rely on it |
-| Does the session reach `READY` without frames? | yes (`IDLE` -> `READY`) | unknown |
+| Does the runtime offer `XR_KHR_vulkan_enable2`? | yes (also `XR_KHR_vulkan_enable`, `XR_KHR_composition_layer_depth`) | **SteamVR 2.19.4: yes** (43 extensions, incl. `XR_KHR_vulkan_enable`, `XR_KHR_composition_layer_depth`, `XR_MND_headless`) |
+| Does the runtime-owned device flow work (requirements -> `xrCreateVulkanInstanceKHR` -> `xrGetVulkanGraphicsDevice2KHR` -> `xrCreateVulkanDeviceKHR` -> `xrCreateSession`)? | yes; Vulkan 1.1 instance accepted (Monado reports its upper bound as 1023.1023 = no limit) | **SteamVR: yes**; it accepts Vulkan 1.0 .. 1.2 (a finite window, unlike Monado) and a 1.1 instance worked |
+| Is `R8G8B8A8_SRGB` offered, and does a swapchain in it with `TRANSFER_DST` usage work (the raw-copy assumption)? | yes: offered (also `R8G8B8A8_UNORM`, both BGRA, `R16G16B16A16_SFLOAT`), 3 images | **SteamVR: `R8G8B8A8_SRGB` offered and a 3036x3036 swapchain with `TRANSFER_DST\|SAMPLED` worked (3 images). `R8G8B8A8_UNORM` is NOT offered by SteamVR**, so the sRGB swapchain with a raw copy is the only RGBA8 route there (also offered: `B8G8R8A8_SRGB`, `R16G16B16A16_SFLOAT`, `A2B10G10R10_UNORM_PACK32`, depth formats) |
+| Can the helper's exportable images live on the runtime's device? | yes on lavapipe (opaque-fd image export reported exportable) | **RTX 3080: yes**, image export reported exportable (opaque-fd, optimal tiling) |
+| Is the swapchain limited to the view's `maxImageRect`? | no: a 3840x2160 swapchain was created although the simulated HMD reports max 1024x1024 per view | runtime-specific; do not rely on it. SteamVR: not tested (the probe used its recommended 3036x3036; max is 8192x8192) |
+| Does the session reach `READY` without frames? | yes (`IDLE` -> `READY`) | **SteamVR: yes** (`IDLE` -> `READY`) |
 | What does "runtime installed, service not running" look like? | `xrEnumerateInstanceExtensionProperties` still works, `xrCreateInstance` fails with `XR_ERROR_RUNTIME_FAILURE` (-2): reported as UNAVAILABLE with a hint | SteamVR will differ |
+| Recommended eye size | the simulated HMD reports 128x128 | **SteamVR: 3036x3036 per eye** (left == right), max 8192x8192, recommended sample count 1 |
+| Opaque-fd **semaphores** (`sync=sem`) on the runtime's device | not observable (lavapipe has none) | **RTX 3080: exportable and importable; `VK_KHR_external_semaphore_fd` and `VK_KHR_external_memory_fd` present** |
+| Queue family for the runtime-created device | n/a | **family 0 with 16 queues** (the design's one queue + one mutex fits) |
+| Runtime-chosen GPU, device UUID | lavapipe | **"NVIDIA GeForce RTX 3080" (Vulkan 1.4), UUID `afc5d13f9cb1b726f1b996abdf9a7c59`** (printed, not yet compared with the game's GL UUID) |
 | Monado quirk | `monado-service` exits at startup if its stdin cannot be polled (`/dev/null`): the test gives it an open FIFO | n/a |
 
-Not observable in this setup (and therefore still open): opaque-fd **semaphores** (lavapipe has no
-`VK_KHR_external_semaphore_fd`, the probe reports it as a note, so `sync=sem` is untested here), the real recommended view
-size (the simulated HMD reports 128x128), the device UUID comparison with the game's GL context (printed, not compared yet),
-the queue-sharing rule, and everything about frames.
+SteamVR column: one run on one machine (author's report, Linux, RTX 3080, system name `SteamVR/OpenXR : cv`, vendor 10462),
+exit PASS, 2026-11-20. Needed one fix first: SteamVR was running but not the *active* OpenXR runtime (probe exit 2,
+`failed to determine active runtime file path`); the Developer-tab button "Set SteamVR as OpenXR runtime" did not exist on that
+install, and symlinking `steamxr_linux64.json` to `~/.config/openxr/1/active_runtime.json` fixed it (see `LINUX_PORT.md`).
+
+Still open after both runtimes: the device UUID comparison with the game's GL context (printed, not compared yet), the
+queue-sharing rule, and everything about frames (X1 onward).
+
+## X1: `--selftest-xr`
+
+```
+bmvr_xfer_helper --selftest-xr [--xr-layer quad|projection|both] [--xr-seconds N] [--xr-wait MS] [--xr-size WxH]
+```
+
+Needs no game folder and no helper lock. SteamVR running and set as the active runtime (or `monado-service`), headset connected
+(and for SteamVR on, so the session becomes visible). Defaults: `both` layers, 10 s each, wait up to 10 s for `READY`, the
+runtime's recommended eye size. Exit codes as for the probe: 0 PASS, 1 FAILED, 2 UNAVAILABLE. Ctrl-C ends it cleanly.
+
+What it does: opens the session exactly like the probe (same device flags), creates one `R8G8B8A8_SRGB` swapchain per eye
+(first with `COLOR_ATTACHMENT` usage on top of `TRANSFER_DST|SAMPLED`, falling back to the flags X0 verified), uploads one pattern
+image per eye **once** (`R8G8B8A8_UNORM`, like the helper's shared images), then loops `xrWaitFrame -> xrBeginFrame -> [acquire,
+wait, GPU copies, release] -> xrEndFrame`. Per frame it only records GPU copies: pattern -> swapchain image (`vkCmdCopyImage`, the
+design's raw copy, no shader) and 17 small tiles (a 16-bit frame counter and a moving marker) from a tiny buffer. One thread, one
+queue, 4 command buffers with fences in flight. No per-frame disk writes, no per-frame log lines.
+
+What you should see in the headset: **left eye BLUE with a white "L", right eye RED with a white "R"**, white border, grid lines,
+at the top 16 squares counting frames in binary (white = 1) and at the bottom a yellow square moving left to right.
+Quad phase: eye 0 (the "L" picture) on a head-locked 1.6 m quad, 2 m ahead, same picture in both eyes. Projection phase: both
+eyes as a head-locked stereo projection layer (VIEW space, the runtime's own eye poses and FOVs from `xrLocateViews`; pinned poses
+and a 90 degree FOV if the runtime gives none, logged once). A wrong eye order shows as red-left/blue-right; a dropped eye as one
+eye black or showing the other colour; a split pair would show different counter values per eye (should not happen: both eyes are
+drawn from the same frame number in one command buffer).
+
+Output while it runs: session state changes, then one line per 5 s per phase:
+`selftest[quad]: 90.0 fps (display period 11.11 ms), frame interval min/avg/max .../.../... ms, rendered N/N, late N, wait avg .. ms, cpu avg .. ms`
+("late" = interval above 1.5 x the predicted display period; "rendered" = frames where `shouldRender` was true). The summary lists
+`frames submitted` (required: at least one rendered frame per phase) and `cadence` (informational: average within +-15 % of the
+period, maximum below 2.5 x the period).
+
+What it does NOT check, and what is *(verify)* until a run on each runtime says otherwise:
+
+- The picture itself (eye order, colours, counter): visual, by you. The program says so in its last lines.
+- The hand-back layout: images are put in `COLOR_ATTACHMENT_OPTIMAL` before `xrReleaseSwapchainImage` and come in as `UNDEFINED`
+  (contents are fully overwritten). The Vulkan binding's layout rule is from memory of the spec; a validation layer or a
+  runtime complaint would show here *(verify)*.
+- Whether `COLOR_ATTACHMENT` usage on the swapchain is accepted (the summary line says which flags were used).
+- Queue use: one thread submits, the runtime may use the same queue inside `xr*` calls *(verify)*.
+- Anything about the game, the pair ring (X2), poses (X4) or latency.
+- Teardown after Ctrl-C or a runtime-ended session: handled in code (GPU idle first, then swapchains, space, session). The one SteamVR run
+  went to the end and exited through `xrRequestExitSession`; the Ctrl-C path has not been observed.
+
+`tests/linux/test_xr_selftest.sh` (Monado headless) is written but was not executed.
+
+## X1 results
+
+One run on SteamVR/OpenXR 2.19.4, NVIDIA RTX 3080, Linux (author's report, 2026-11-20), `--selftest-xr` with defaults (quad 10 s,
+then projection 10 s), exit PASS. Headset: the author saw a blue square with an "L" and a red one with an "R". Not separately
+confirmed: that blue was in the left eye and red in the right, the counter counting, the marker moving, the quad being identical
+in both eyes.
+
+| Question | Observed (SteamVR, one run) |
+|---|---|
+| Does the runtime accept the swapchain with `TRANSFER_DST\|SAMPLED\|COLOR_ATTACHMENT`? | yes, 2 swapchains of 3036x3036, 3 images each (no fallback to the X0 flags needed) |
+| Does the raw copy (UNORM pattern -> SRGB swapchain, `vkCmdCopyImage`, no shader) show the right picture? | the author saw the expected blue "L" / red "R"; no colour or channel problem reported |
+| Does handing the images back in `COLOR_ATTACHMENT_OPTIMAL` after transfer writes work? | it showed a picture and the runtime raised no error; no Vulkan validation layer was active, so spec conformance is not proven |
+| Does one thread / one queue / 4 command buffers with fences work? | yes: no stall, GPU copy plus submit CPU time 0.05 ms per frame (quad) and 0.10 ms (projection, 2 eyes) |
+| `xrWaitFrame` cadence | display period 11.11 ms (90 Hz); 895 quad frames averaged 11.18 ms (88.9 / 89.9 fps per 5 s window), 898 projection frames 11.15 ms; all frames had `shouldRender` true |
+| Frame-interval outliers | one 70.7 ms interval in the first window of the quad phase and one 45.7 ms interval in the first window of the projection phase (the second windows were clean, max 13.4 / 13.2 ms). Cause not investigated; the program's `cadence` item is informational (max above 2.5 x period) and reported `note` for both |
+| Session lifecycle | `IDLE` -> `READY` -> (begin) -> `SYNCHRONIZED` -> `VISIBLE` -> `FOCUSED` (reached during the projection phase) ; on exit request `VISIBLE` -> `SYNCHRONIZED` -> `STOPPING` -> `IDLE` -> `EXITING`; clean end |
+| `xrLocateViews` in VIEW space for the projection layer | no "pinned poses" message was logged, so the runtime returned valid views |
+| Log volume | 2 phases x 2 rate lines plus state changes; no per-frame lines (disk writes: none by construction, not measured) |
+
+Still open after X1: the eye assignment and counter/marker checks above (a quick look with one eye closed settles the first),
+the two startup interval spikes, Monado, a validation-layer run, the Ctrl-C path, and everything involving the game (X2 onward).
 
 ## Risks and open questions
 
 1. **Queue synchronization with the runtime** (one queue, two threads, runtime submits on it too): exact rule to confirm in X0,
    and the mutex scope to measure in X2.
-2. **Swapchain format availability**: holds on Monado 21.0.0 (X0, sandbox); SteamVR still unchecked, and it is the biggest
-   single "might not hold".
+2. **Swapchain format availability**: holds on Monado 21.0.0 (X0, sandbox) and on SteamVR 2.19.4 (X0, author's run: sRGB offered,
+   UNORM not offered, so the sRGB raw copy is the only RGBA8 route there). Not checked: other SteamVR versions, other GPUs.
 3. **Latency with mono + pinned pose**: irrelevant to a head-locked quad, but it means this stage cannot say anything about
    motion-to-photon. That is only measurable once poses flow (X4 + hook port).
 4. **SteamVR on Linux session lifecycle** (session state READY/FOCUSED transitions, losing focus while the game window has it):
@@ -233,7 +310,6 @@ the queue-sharing rule, and everything about frames.
 ## Order of work
 
 1. ~~Record the `_rt_gblightdiff` result in `LINUX_PORT.md`~~ (recorded as reported by the author; the snapshot numbers are still to be added).
-2. X0: Monado done (above). **Next: run `bmvr_xfer_helper --xr-probe` with SteamVR on a real machine** and fold the output into
-   "X0 results" (a second column); a failed required item there changes the design before X1 is written.
-3. X1, X2, X3 in order; X4 in parallel with the start of the hook port.
+2. ~~X0: run on Monado and on SteamVR~~ (done, see "X0 results").
+3. ~~X1: run `--selftest-xr` on SteamVR~~ (done, see "X1 results"). **Next: X2** (socket sink: pair -> ring -> swapchain, quad layer, eye 0, with the game), then X3; X4 in parallel with the start of the hook port.
 4. Only then is `docs/LINUX_PORT.md`'s plan item 3 ("hand both to a native OpenXR helper") marked done.

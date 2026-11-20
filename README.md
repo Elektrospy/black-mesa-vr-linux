@@ -80,7 +80,9 @@ Then, with SteamVR running and a headset connected, check it:
 "$HOME/.local/share/Steam/steamapps/common/Black Mesa/bmvr_xfer_helper" --xr-probe
 ```
 
-It should end with `xr-probe: PASS`. (Observed: SteamVR/OpenXR 2.19.4, NVIDIA RTX 3080, session reaches READY. The probe
+It should end with `xr-probe: PASS`. With the headset on you can then run the frame-loop self-test, which needs no game:
+`"$HOME/.local/share/Steam/steamapps/common/Black Mesa/bmvr_xfer_helper" --selftest-xr` (left eye should be BLUE with an "L", right eye RED
+with an "R"; Ctrl-C ends it). Experimental: it passed on SteamVR with an RTX 3080 (one run); the game itself is not wired to it yet. (Observed: SteamVR/OpenXR 2.19.4, NVIDIA RTX 3080, session reaches READY. The probe
 submits no frames.) If it still says `UNAVAILABLE`, see `docs/LINUX_PORT.md` (Stage 4a).
 
 ## Black Mesa: Blue Shift

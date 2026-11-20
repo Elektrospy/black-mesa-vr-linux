@@ -247,6 +247,9 @@ Stage 4a (OpenXR, optional, no game needed): with an OpenXR runtime running (Ste
  button: mkdir -p ~/.config/openxr/1 && ln -sf <SteamVR dir>/steamxr_linux64.json ~/.config/openxr/1/active_runtime.json)
   "$GAME/bmvr_xfer_helper" --xr-probe
 prints what the runtime offers and ends with "xr-probe: PASS / FAILED / UNAVAILABLE" (exit 0 / 1 / 2). Send me the output.
+Stage 4a X1 (headset on, no game needed): "$GAME/bmvr_xfer_helper" --selftest-xr [--xr-layer quad|projection|both] [--xr-seconds N]
+shows a generated pattern: left eye BLUE with an "L", right eye RED with an "R", a frame counter on top (Ctrl-C ends it).
+Send me the output and what you saw in the headset.
 Design and milestones: docs/LINUX_OPENXR_CONSUMER.md.
 
 Kill test (game running, no helper running): ./tests/linux/test_kill_loop.sh -n 10   (needs sync=sem in bmvr_target.txt to be meaningful;

@@ -468,6 +468,11 @@ unchanged. These ran as a host-native (64-bit) build (`BMVR_TEST_NATIVE=1`), bec
   keeps more frames). If (1) shows a picture and (2) a HUD, eye 1 is proven; if (1) is also black, the blit of a second object
   is wrong and the shim log (`xfer:` lines) is what to send.
 
+**Update (2026-11-20, later): the author reports the `_rt_gblightdiff` test completed and successful** (eye 1 carried a real second
+target through the transport). That report is recorded here as given; the snapshot numbers (ticks, non-black percentages) have not
+been added yet. With it, the open question above ("is the blit of a second object wrong?") is answered; the `_rt_hud`-with-HUD run
+is now optional.
+
 Candidate second targets from the real rt-trace (all 3840x2160, same size as `InternalRT0`): `_rt_hud` (the HUD layer, mostly empty),
 `_rt_gblightdiff` (light buffer), `_rt_gbdepthrt` (depth). `_rt_hud` was tried first (see above): all black.
 
@@ -486,7 +491,7 @@ The helper gets an OpenXR sink (same process: `XR_KHR_vulkan_enable2` makes the 
 images must live on it). Milestone X0 exists: `bmvr_xfer_helper --xr-probe` opens the runtime (loader, instance, system,
 runtime-chosen Vulkan device, session, swapchain), submits no frames and ends with PASS / FAILED / UNAVAILABLE (exit 0 / 1 / 2).
 `tests/linux/test_xr_probe.sh [--software]` runs it against a headless Monado. Observed so far: Monado 21.0.0 in a sandbox without
-a GPU or headset (14/14 checks; see the "X0 results" table, including what that does **not** show). **SteamVR: X0 PASS observed once** (user log, SteamVR/OpenXR 2.19.4, NVIDIA RTX 3080 on Vulkan 1.4, 3036x3036 per eye, R8G8B8A8_SRGB offered, opaque-fd image and semaphore export OK, session reaches READY; no frames submitted). It first failed `UNAVAILABLE` (-51) until SteamVR was made the active OpenXR runtime, see below. Not checked: the game feeding the sink, frames in the headset. `--sink xr` (X2) refuses to start: "not implemented yet". Nothing here changes the snapshot sink, T1-T19 or the kill loop.
+a GPU or headset (14/14 checks; see the "X0 results" table, including what that does **not** show). **SteamVR: X0 PASS observed once** (user log, SteamVR/OpenXR 2.19.4, NVIDIA RTX 3080 on Vulkan 1.4, 3036x3036 per eye, R8G8B8A8_SRGB offered, opaque-fd image and semaphore export OK, session reaches READY; no frames submitted). It first failed `UNAVAILABLE` (-51) until SteamVR was made the active OpenXR runtime, see below. Not checked: the game feeding the sink, frames in the headset. Milestone X1 exists: `bmvr_xfer_helper --selftest-xr [--xr-layer quad|projection|both] [--xr-seconds N]` runs a frame loop with a generated pattern (left BLUE "L", right RED "R", frame counter) as a quad and a stereo projection layer, no game needed; compiled clean and **PASSES on SteamVR 2.19.4 + RTX 3080** (author's run: about 90 fps, 895 quad + 898 projection frames submitted, a blue "L" and a red "R" seen in the headset; Monado not run, see `docs/LINUX_OPENXR_CONSUMER.md` "X1 results"). `--sink xr` (X2) refuses to start: "not implemented yet". Nothing here changes the snapshot sink, T1-T19 or the kill loop.
 
 Try it (any OpenXR runtime running; no game needed): `"$GAME/bmvr_xfer_helper" --xr-probe` and send the output.
 
@@ -497,6 +502,8 @@ runtime" was missing on that install):
 
     mkdir -p ~/.config/openxr/1
     ln -sf ~/.local/share/Steam/steamapps/common/SteamVR/steamxr_linux64.json ~/.config/openxr/1/active_runtime.json
+
+After the probe passes, `"$GAME/bmvr_xfer_helper" --selftest-xr` with the headset on shows a generated pattern: left eye BLUE with an "L", right eye RED with an "R".
 
 Other Steam library: adjust the path (check `steamxr_linux64.json` exists first). Flatpak Steam: paths are under
 `~/.var/app/com.valvesoftware.Steam/` and the sandbox needs access to the OpenXR config. Per launch instead of system-wide:

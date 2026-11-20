@@ -6,7 +6,10 @@
  * (loader -> instance -> system -> runtime-chosen Vulkan device -> session -> swapchain) but submits no frames, and
  * prints what it found, so that the assumptions in the design document become observed facts.
  *
- * Later milestones add the pair ring and the frame loop here (X1-X3); nothing of X1+ exists yet.
+ * Milestone X1: --selftest-xr. The same session, then a frame loop with a generated pattern (left blue 'L', right red 'R',
+ * a frame counter), as a quad and/or a stereo projection layer. No game involved.
+ *
+ * The pair ring and the socket sink (X2-X4) do not exist yet.
  */
 #ifndef BMVR_XR_SINK_H
 #define BMVR_XR_SINK_H
@@ -27,6 +30,17 @@ struct bmvr_xr_probe_opts {
 #define BMVR_XR_PROBE_UNAVAILABLE 2 /* no OpenXR loader, no runtime, or no headset system: nothing to test against */
 
 int bmvr_xr_probe(const struct bmvr_xr_probe_opts *opts);
+
+struct bmvr_xr_selftest_opts {
+    int seconds;       /* per layer mode (<= 0: 10) */
+    int layer_mask;    /* 1 = quad, 2 = projection, 3 = both (quad first) */
+    int wait_ready_ms; /* how long to wait for the session to reach READY (<= 0: 10000) */
+    int width;         /* eye image size; 0 = the runtime's recommended size */
+    int height;
+};
+
+/* Exit codes as for the probe: 0 PASS (frames were submitted), 1 FAILED, 2 UNAVAILABLE (nothing to test against). */
+int bmvr_xr_selftest(const struct bmvr_xr_selftest_opts *opts);
 
 #ifdef __cplusplus
 }
