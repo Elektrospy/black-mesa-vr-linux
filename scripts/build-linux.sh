@@ -92,7 +92,8 @@ if ! echo '#include <vulkan/vulkan.h>' | cc -E -x c - >/dev/null 2>&1; then
   done
 fi
 if echo '#include <vulkan/vulkan.h>' | cc $VKINC -E -x c - >/dev/null 2>&1; then
-  if cc -O2 -Wall -Wextra -std=gnu11 $VKINC -I"$ROOT/linux" -o "$BUILD/bmvr_xfer_helper" "$ROOT/linux/bmvr_xfer_helper.c" -ldl; then
+  # bmvr_xr_sink.c (stage 4a, OpenXR) needs the OpenXR headers vendored in third_party/openxr; the loader itself is dlopen'd.
+  if cc -O2 -Wall -Wextra -std=gnu11 $VKINC -I"$ROOT/third_party/openxr/include" -I"$ROOT/linux" -o "$BUILD/bmvr_xfer_helper" "$ROOT/linux/bmvr_xfer_helper.c" "$ROOT/linux/bmvr_xr_sink.c" -ldl; then
     HELPER="$BUILD/bmvr_xfer_helper"; echo "Built $HELPER (64-bit)"
   else
     echo "WARNING: could not build the 64-bit helper (stage 2a test unavailable)." >&2
@@ -240,6 +241,13 @@ snapshot, "GL side N us" (time spent in the game's render thread) and "helper ro
 with sync=finish and once with sync=sem and send both logs. Caution: if the helper process is killed while
 the game is mid-frame, the game's GPU can wait forever on a semaphore (restart the game). That is why it is
 opt-in. \"\$GAME/bmvr_xfer_helper\" --no-semaphores forces the old behaviour from the helper side.
+
+Stage 4a (OpenXR, optional, no game needed): with an OpenXR runtime running (SteamVR, or monado-service):
+(SteamVR must also be the ACTIVE OpenXR runtime. If its Developer tab has no "Set SteamVR as OpenXR runtime"
+ button: mkdir -p ~/.config/openxr/1 && ln -sf <SteamVR dir>/steamxr_linux64.json ~/.config/openxr/1/active_runtime.json)
+  "$GAME/bmvr_xfer_helper" --xr-probe
+prints what the runtime offers and ends with "xr-probe: PASS / FAILED / UNAVAILABLE" (exit 0 / 1 / 2). Send me the output.
+Design and milestones: docs/LINUX_OPENXR_CONSUMER.md.
 
 Kill test (game running, no helper running): ./tests/linux/test_kill_loop.sh -n 10   (needs sync=sem in bmvr_target.txt to be meaningful;
 add --eyes 2 for the two-eye case).

@@ -52,6 +52,37 @@ The VR experience is fully playable, but several features are still a work in pr
 * Two-handed weapons are planned for a later update.
 * Manual reloading is not currently implemented and is planned for a future update.
 
+## Linux quick start: OpenXR runtime
+
+On Linux the OpenXR loader needs an *active runtime*, and running SteamVR is not enough: SteamVR also has to be
+registered as the system's OpenXR runtime. If it is not, `bmvr_xfer_helper --xr-probe` fails with
+`failed to determine active runtime file path` / `no OpenXR runtime installed or active?` (`-51`, `UNAVAILABLE`).
+
+SteamVR's *Set SteamVR as OpenXR runtime* button (Settings → Developer, advanced settings) is missing on some Linux
+installs. The manual way works regardless:
+
+```bash
+mkdir -p ~/.config/openxr/1
+ln -sf ~/.local/share/Steam/steamapps/common/SteamVR/steamxr_linux64.json \
+       ~/.config/openxr/1/active_runtime.json
+```
+
+Adjust the path if SteamVR lives in another Steam library (Flatpak Steam: under `~/.var/app/com.valvesoftware.Steam/`).
+Or override per launch, without touching the system setting:
+
+```bash
+XR_RUNTIME_JSON=$HOME/.local/share/Steam/steamapps/common/SteamVR/steamxr_linux64.json %command%
+```
+
+Then, with SteamVR running and a headset connected, check it:
+
+```bash
+"$HOME/.local/share/Steam/steamapps/common/Black Mesa/bmvr_xfer_helper" --xr-probe
+```
+
+It should end with `xr-probe: PASS`. (Observed: SteamVR/OpenXR 2.19.4, NVIDIA RTX 3080, session reaches READY. The probe
+submits no frames.) If it still says `UNAVAILABLE`, see `docs/LINUX_PORT.md` (Stage 4a).
+
 ## Black Mesa: Blue Shift
 
 Black Mesa VR also supports **Black Mesa: Blue Shift**.

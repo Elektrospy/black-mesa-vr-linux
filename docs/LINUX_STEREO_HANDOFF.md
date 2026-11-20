@@ -97,7 +97,8 @@ real helper (`--eyes 2`) when a Vulkan device exists; that path has only been co
 3. `tests/linux/test_kill_loop.sh -n 10 --eyes 2` (fails if the shim fell back to one eye), then the default 30.
 
 Done so far (2026-11-20, see `docs/LINUX_PORT.md`): step 1; the kill loop 30/30 with two eyes; step 2 with `target2=name:_rt_hud`
-(transport fine, eye 1 all black, probably no HUD on screen). Next: `target2=name:_rt_gblightdiff`, then `_rt_hud` with the HUD visible.
+(transport fine, eye 1 all black, probably no HUD on screen); `target2=name:_rt_gblightdiff` reported completed and successful by the
+author (numbers not yet recorded). Optional: `_rt_hud` with the HUD visible. The consumer is stage 4a: `docs/LINUX_OPENXR_CONSUMER.md`.
 
 ## The consumer (separate from the transport; needs a headset or a runtime to test)
 

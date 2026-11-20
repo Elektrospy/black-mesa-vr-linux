@@ -20,7 +20,9 @@
  *
  * Usage:  bmvr_xfer_helper [game folder] [--size WxH] [--gpu N] [--snapshots N] [--eyes 1|2] [--no-semaphores]
  *         --eyes 2 (stage 3d) offers two shared images; the game uses the second only with target2 in bmvr_target.txt
-        bmvr_xfer_helper --selftest-sync [--gpu N]      (no game needed: checks semaphore sync on this GPU)
+ *         bmvr_xfer_helper --selftest-sync [--gpu N]      (no game needed: checks semaphore sync on this GPU)
+ *         bmvr_xfer_helper --xr-probe [--xr-wait MS] [--xr-size WxH]  (stage 4a, X0: no game needed; opens the OpenXR runtime and reports
+ *                                                          what it offers; exit 0 pass / 1 failed / 2 no runtime or headset)
  *         (game folder defaults to the folder this program lives in)
  */
 #define _GNU_SOURCE
@@ -40,6 +42,7 @@
 
 #include "bmvr_xfer.h"
 #include "bmvr_single_instance.h"
+#include "bmvr_xr_sink.h"
 
 /* ------------------------------------------------------------------ helpers */
 #define LOG(...) do { fprintf(stderr, "[helper] " __VA_ARGS__); fputc('\n', stderr); } while (0)
@@ -627,7 +630,7 @@ static void serve(const char *gamedir, int max_snaps)
 int main(int argc, char **argv)
 {
     char gamedir[900] = "";
-    int want_gpu = -1, max_snaps = 5, selftest = 0;
+    int want_gpu = -1, max_snaps = 5, selftest = 0, xr_probe = 0, xr_wait_ms = 10000, xr_w = 0, xr_h = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--size") && i + 1 < argc) {
             if (sscanf(argv[++i], "%ux%u", &g_w, &g_h) != 2 || !g_w || !g_h || g_w > 8192 || g_h > 8192) DIE("bad --size, use e.g. 1920x1080");
@@ -642,12 +645,26 @@ int main(int argc, char **argv)
             g_no_sem = 1;
         } else if (!strcmp(argv[i], "--selftest-sync")) {
             selftest = 1;
+        } else if (!strcmp(argv[i], "--xr-probe")) {
+            xr_probe = 1;
+        } else if (!strcmp(argv[i], "--xr-wait") && i + 1 < argc) {
+            xr_wait_ms = atoi(argv[++i]);
+        } else if (!strcmp(argv[i], "--xr-size") && i + 1 < argc) {
+            if (sscanf(argv[++i], "%dx%d", &xr_w, &xr_h) != 2 || xr_w <= 0 || xr_h <= 0) DIE("bad --xr-size, use e.g. 3840x2160");
+        } else if (!strcmp(argv[i], "--sink") && i + 1 < argc) {
+            const char *k = argv[++i];
+            if (!strcmp(k, "xr")) DIE("--sink xr is not implemented yet (stage 4a, milestone X2). Use --xr-probe to test the OpenXR runtime.");
+            if (strcmp(k, "snapshot")) DIE("bad --sink, use snapshot (xr: not implemented yet)");
         } else if (argv[i][0] != '-' && !gamedir[0]) {
             snprintf(gamedir, sizeof gamedir, "%s", argv[i]);
         } else {
-            fprintf(stderr, "usage: %s [game folder] [--size WxH] [--gpu N] [--snapshots N] [--eyes 1|2] [--no-semaphores] | --selftest-sync\n", argv[0]);
+            fprintf(stderr, "usage: %s [game folder] [--size WxH] [--gpu N] [--snapshots N] [--eyes 1|2] [--no-semaphores] [--sink snapshot] | --selftest-sync | --xr-probe [--xr-wait MS] [--xr-size WxH]\n", argv[0]);
             return 2;
         }
+    }
+    if (xr_probe) { /* stage 4a X0: needs no game folder, no lock and none of the helper's own Vulkan device */
+        struct bmvr_xr_probe_opts po = { .wait_session_ms = xr_wait_ms, .swapchain_w = xr_w, .swapchain_h = xr_h };
+        return bmvr_xr_probe(&po);
     }
     if (!gamedir[0]) { /* default: the folder this program lives in */
         ssize_t n = readlink("/proc/self/exe", gamedir, sizeof gamedir - 1);

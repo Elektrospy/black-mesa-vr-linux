@@ -204,7 +204,11 @@ Notes:
   * Blue Shift needs to be installed. The mod reads bms/cfg/bmvr.cfg for every
     campaign, so the one config file this installer writes covers Blue Shift too.
   * Make sure your OpenXR runtime is active on the host (e.g. SteamVR set as
-    the OpenXR runtime) before launching the game from Steam.
+    the OpenXR runtime) before launching the game from Steam. If SteamVR has no
+    "Set SteamVR as OpenXR runtime" button (Settings -> Developer), do it by hand:
+      mkdir -p ~/.config/openxr/1
+      ln -sf ~/.local/share/Steam/steamapps/common/SteamVR/steamxr_linux64.json \
+             ~/.config/openxr/1/active_runtime.json
   * Success check: bmvr_log.txt appears next to bms.exe and starts with
     "BMVR d3d9.dll loaded". Send that log (and the helper log) if it fails.
 EOF

@@ -76,9 +76,32 @@ Virtual Desktop (Quest 2/3):
 
 SteamVR / Meta Link / Steam Link:
   SteamVR → Settings → OpenXR → Set SteamVR as OpenXR runtime
+  (On Linux this button can be missing; see "Linux" below.)
   Do not leave Oculus/Meta as the Windows ActiveRuntime while SteamVR runs.
   Steam Link on Quest reports SteamVR OpenXR in Meta compatibility mode.
   That path must not use the SteamVR+Touch submit Y-flip (upside-down).
+
+Linux (SteamVR):
+  Running SteamVR is not enough, it must also be the system's OpenXR runtime.
+  If the "Set SteamVR as OpenXR runtime" button does not exist (SteamVR →
+  Settings → Show Advanced Settings → Developer), set it by hand:
+
+    mkdir -p ~/.config/openxr/1
+    ln -sf ~/.local/share/Steam/steamapps/common/SteamVR/steamxr_linux64.json \
+           ~/.config/openxr/1/active_runtime.json
+
+  (Other Steam library: adjust the path. Flatpak Steam: ~/.var/app/com.valvesoftware.Steam/...)
+  Without changing the system setting, you can add this in front of %command% in the
+  launch options instead:
+
+    XR_RUNTIME_JSON=$HOME/.local/share/Steam/steamapps/common/SteamVR/steamxr_linux64.json %command%
+
+  Check it (SteamVR running, headset connected):
+
+    "$HOME/.local/share/Steam/steamapps/common/Black Mesa/bmvr_xfer_helper" --xr-probe
+
+  It must end with "xr-probe: PASS". "failed to determine active runtime file
+  path" / "no OpenXR runtime installed or active?" means the step above is missing.
 
 Then:
 1. Start SteamVR (Link) or Virtual Desktop with VDXR as above.

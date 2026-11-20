@@ -16,6 +16,10 @@ into `build/` (git-ignored) and runs it.
 What it can not show: anything that depends on the real driver (semaphore fd sharing, GL/Vulkan ordering on
 the GPU, image content). Those need `bmvr_xfer_helper --selftest-sync` and a real run.
 
+`test_xr_probe.sh [helper] [--software]` is NOT part of `run-tests.sh` either (stage 4a, X0): it needs an OpenXR loader and Monado installed. It starts its own
+headless Monado (simulated HMD, null compositor; refuses to run if a Monado is already running) and checks `bmvr_xfer_helper --xr-probe` (exit codes, summary, 10 repeats).
+`--software` uses Mesa's lavapipe for machines without a GPU. It says nothing about SteamVR or real hardware.
+
 `test_kill_loop.sh` is NOT part of `run-tests.sh`: it is a real-game test (needs the game running, a GPU and the real helper). It kills the
 helper with `kill -9` in a loop and checks that the shim notices and reconnects (`--eyes 2` for the two-eye case). Run it as a program from any shell.
 

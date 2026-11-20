@@ -45,7 +45,7 @@ python3 "$T/suite.py"
 # Optional: the real helper against a real (possibly software) Vulkan device.
 if echo '#include <vulkan/vulkan.h>' | cc -E -x c - >/dev/null 2>&1; then
   echo "== real helper (protocol v4 client; skipped if there is no Vulkan device)"
-  cc -O2 -Wall -Wextra -std=gnu11 -I"$ROOT/linux" -o "$B/bmvr_xfer_helper" "$ROOT/linux/bmvr_xfer_helper.c" -ldl
+  cc -O2 -Wall -Wextra -std=gnu11 -I"$ROOT/third_party/openxr/include" -I"$ROOT/linux" -o "$B/bmvr_xfer_helper" "$ROOT/linux/bmvr_xfer_helper.c" "$ROOT/linux/bmvr_xr_sink.c" -ldl
   cc -Wall -I"$ROOT/linux" -o "$B/client" "$T/client.c"
   if timeout 40 "$B/bmvr_xfer_helper" --selftest-sync > "$B/selftest.txt" 2>&1; then
     grep -E "opaque-fd semaphore|selftest:" "$B/selftest.txt" | sed 's/^\[helper\] /  /'

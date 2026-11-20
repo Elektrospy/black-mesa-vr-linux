@@ -480,11 +480,35 @@ Trying it in the real game (the same steps as the kill loop, plus):
    `bmvr_snapshot_<n>_eye0_...` and `..._eye1_...`.
 4. `tests/linux/test_kill_loop.sh -n 10 --eyes 2`: a cycle fails loudly if the shim used one eye only.
 
+## Stage 4a: native OpenXR sink (X0 implemented; design in `docs/LINUX_OPENXR_CONSUMER.md`)
+
+The helper gets an OpenXR sink (same process: `XR_KHR_vulkan_enable2` makes the runtime own the Vulkan device, so the exportable
+images must live on it). Milestone X0 exists: `bmvr_xfer_helper --xr-probe` opens the runtime (loader, instance, system,
+runtime-chosen Vulkan device, session, swapchain), submits no frames and ends with PASS / FAILED / UNAVAILABLE (exit 0 / 1 / 2).
+`tests/linux/test_xr_probe.sh [--software]` runs it against a headless Monado. Observed so far: Monado 21.0.0 in a sandbox without
+a GPU or headset (14/14 checks; see the "X0 results" table, including what that does **not** show). **SteamVR: X0 PASS observed once** (user log, SteamVR/OpenXR 2.19.4, NVIDIA RTX 3080 on Vulkan 1.4, 3036x3036 per eye, R8G8B8A8_SRGB offered, opaque-fd image and semaphore export OK, session reaches READY; no frames submitted). It first failed `UNAVAILABLE` (-51) until SteamVR was made the active OpenXR runtime, see below. Not checked: the game feeding the sink, frames in the headset. `--sink xr` (X2) refuses to start: "not implemented yet". Nothing here changes the snapshot sink, T1-T19 or the kill loop.
+
+Try it (any OpenXR runtime running; no game needed): `"$GAME/bmvr_xfer_helper" --xr-probe` and send the output.
+
+**SteamVR must be the active OpenXR runtime.** A running SteamVR is not enough. Without an active runtime the probe prints
+`RuntimeManifestFile::FindManifestFiles - failed to determine active runtime file path`, `xrEnumerateInstanceExtensionProperties
+failed (-51)` and ends `UNAVAILABLE`. Fix (observed to work; SteamVR's Settings -> Developer button "Set SteamVR as OpenXR
+runtime" was missing on that install):
+
+    mkdir -p ~/.config/openxr/1
+    ln -sf ~/.local/share/Steam/steamapps/common/SteamVR/steamxr_linux64.json ~/.config/openxr/1/active_runtime.json
+
+Other Steam library: adjust the path (check `steamxr_linux64.json` exists first). Flatpak Steam: paths are under
+`~/.var/app/com.valvesoftware.Steam/` and the sandbox needs access to the OpenXR config. Per launch instead of system-wide:
+`XR_RUNTIME_JSON=<SteamVR dir>/steamxr_linux64.json`. Not tested: Flatpak, per-launch override. Needs a headset (or null
+driver) connected to SteamVR, otherwise a "no system" error can follow once the runtime loads.
+
 ## Plan (not implemented)
 
 1. ~~Read the milestone-1 log; confirm eye-target candidates and driver extensions.~~ Done.
 2. ~~Stage 2a: test the transport.~~ Done, verified. ~~Stage 2b: capture an engine render target.~~ Done, verified in the real game (`InternalRT0`).
 3. Stage 3a: ~~replace `glFinish` + ack with `GL_EXT_semaphore_fd` / `VK_KHR_external_semaphore_fd`~~ done, verified in the real game (opt-in). Stage 3b: loading-frame fallback + helper-death guard (helper-death verified by the kill loop; loading fallback awaiting a real run). Stage 3c: one helper per game folder (flock).
+   Stage 4a (OpenXR sink, `docs/LINUX_OPENXR_CONSUMER.md`): X0 probe done on Monado; X1-X4 not started.
    Then (design in `docs/LINUX_STEREO_HANDOFF.md`): render a *separate* stereo pair into two eye targets (the engine renders one view today) and
    hand both to a 64-bit native OpenXR helper. Which targets and sizes to use is decided by the
    `rt-trace` output.
