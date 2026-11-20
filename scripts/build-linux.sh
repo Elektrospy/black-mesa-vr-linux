@@ -241,7 +241,7 @@ with sync=finish and once with sync=sem and send both logs. Caution: if the help
 the game is mid-frame, the game's GPU can wait forever on a semaphore (restart the game). That is why it is
 opt-in. \"\$GAME/bmvr_xfer_helper\" --no-semaphores forces the old behaviour from the helper side.
 
-Kill test (game running, no helper running): ./test_kill_loop.sh -n 10   (needs sync=sem in bmvr_target.txt to be meaningful;
+Kill test (game running, no helper running): ./tests/linux/test_kill_loop.sh -n 10   (needs sync=sem in bmvr_target.txt to be meaningful;
 add --eyes 2 for the two-eye case).
 Only one helper can serve a game folder; a second one exits with an error (stage 3c).
 

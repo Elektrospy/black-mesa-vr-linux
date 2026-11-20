@@ -4,7 +4,7 @@ Two separate things live here. Keep them apart.
 
 | | Black Mesa **through Proton** (Windows build) | Black Mesa **native Linux build** |
 |---|---|---|
-| Status | Reported working (see `docs/open-work-2026-10.md`: PSVR2, SteamVR on Linux, OpenXR helper) | **Not working. Milestone 1 done (observe-only shim); stage 2a (GPU hand-off) and stage 2b (engine render target through the hand-off) run in the real game; stage 3a (GPU semaphores instead of glFinish, opt-in) run in the real game and works; stage 3b (loading-frame fallback, helper-death check before the GPU wait): the helper-death guard is verified in the real game by the kill loop (10/10 `kill -9` cycles, `sync=sem`, no hang), the loading-frame fallback is still stand-in only; stage 3c (one helper per game folder) added, tested without Vulkan; two-eye hand-off (stage 3d, protocol v4) is implemented and passes the stand-in tests (T14-T19), not yet run on a GPU or in the game.** |
+| Status | Reported working (see `docs/open-work-2026-10.md`: PSVR2, SteamVR on Linux, OpenXR helper) | **Not working. Milestone 1 done (observe-only shim); stage 2a (GPU hand-off) and stage 2b (engine render target through the hand-off) run in the real game; stage 3a (GPU semaphores instead of glFinish, opt-in) run in the real game and works; stage 3b (loading-frame fallback, helper-death check before the GPU wait): the helper-death guard is verified in the real game by the kill loop (10/10 `kill -9` cycles, `sync=sem`, no hang), the loading-frame fallback is still stand-in only; stage 3c (one helper per game folder) added, tested without Vulkan; two-eye hand-off (stage 3d, protocol v4) is implemented, passes the stand-in tests (T14-T19) and is verified in the real game: pairs delivered, kill loop 30/30 with two eyes, 32-bit stand-in suite passes; eye 1 content is not proven yet (`_rt_hud` came out all black, probably an empty HUD layer).** |
 | Mod | The normal `d3d9.dll` + `OpenXRHelper64.exe` | `linux/` (this port, not a VR mod yet) |
 | Install | `scripts/bmvr-linux.sh` | `scripts/build-linux.sh` |
 
@@ -389,7 +389,7 @@ shim binary (the stats line needs 5 s of wall time, the fake game takes well und
 
 ## Stage 3b real-game kill loop (verified 2026-11-19)
 
-`./test_kill_loop.sh` (repo root; bash script, runs from fish/zsh/bash because of its shebang, do **not** paste or
+`tests/linux/test_kill_loop.sh` (bash script, runs from fish/zsh/bash because of its shebang, do **not** paste or
 `source` it in fish) starts a helper, waits for `xfer: helper connected` in `bmvr_linux_log.txt`, waits 0-5 s at random,
 `kill -9`s the helper and waits for the shim to log `lost the helper` / `helper's socket is closed` / `back to searching`.
 The next cycle's connect line proves the shim reconnected. It stops at the first failed cycle and prints the last log lines.
@@ -446,8 +446,30 @@ when eye 1 disappears; T16 negotiation (helper offers 2/no target2, target2/help
 after a pair; T18 v3 peer and `eye_count` 3 rejected; T19 loading frames with two eyes. T1-T13 (single eye) still pass
 unchanged. These ran as a host-native (64-bit) build (`BMVR_TEST_NATIVE=1`), because the machine they were written on has no
 32-bit toolchain; **run the normal `tests/linux/run-tests.sh` (32-bit) once on your machine**: it is the authoritative run.
-**Not tested**: the real helper with two images on a GPU (compiles warning-free against the Vulkan headers; the optional
-real-helper section of `run-tests.sh` now also sends two pairs, needs a Vulkan device), and nothing of this in the real game.
+**Real game (2026-11-20, RTX 3080, `sync=sem`, `target=InternalRT0`, same object for both eyes, helper `--eyes 2`):**
+- Manual run: 5 pairs (ticks 240, 360, 480, 600, 720), `eye0` and `eye1` snapshot files written for each, 99.7-100% non-black, the
+  non-black percentage identical for both eyes of every pair (expected: same source, same flip). The log reports both GL
+  textures; no hang, no error.
+- `tests/linux/test_kill_loop.sh -n 10 --eyes 2`: **10/10 cycles passed**, each one requiring the shim to have imported both eyes
+  and to notice the dead helper and reconnect. The per-cycle helper outputs show helpers killed at random points, including
+  between writing the `eye0` and the `eye1` file of one pair (the helper process dies mid-save: expected, the game is unaffected).
+- Same day, later runs: the default **30 kill cycles with `--eyes 2`: 30/30 passed**; the plain 32-bit `tests/linux/run-tests.sh` on
+  the author's machine: lock test, T1-T19 and the real-helper section all passed (selftest PASS on the RTX 3080; the real helper
+  wrote `eye0`/`eye1` files for pairs it was sent).
+- **`target2=name:_rt_hud`** (a genuinely different second target): pairs delivered every time (5 of 5, the same tick for both
+  eyes, no error). Eye 0 holds a real picture (a 3D scene at tick 240, a "Loading resources" screen by tick 720). Eye 1 is **exactly
+  (0,0,0) in every pixel of all 5 snapshots** (helper: "all black"). Most likely the HUD layer was simply empty: the snapshots cover
+  the first ~12 s after the helper connects, and the game showed a menu/background scene and a loading screen, where no HUD is
+  drawn, and an RGB readback of a cleared transparent layer is black. **Not proven**: it could also be that the blit reads a
+  stale or wrong object. The transport itself is not in question (pairs, semaphores, reconnects all behave), but no non-zero
+  pixel has reached the helper through eye 1 yet.
+- Next, to settle it: (1) `target2=name:_rt_gblightdiff` (a full-size buffer filled on every 3D frame in the rt-trace); (2) with
+  `_rt_hud`, start the helper while a map is running with the HUD visible (the game reconnects within a few seconds; `--snapshots 20`
+  keeps more frames). If (1) shows a picture and (2) a HUD, eye 1 is proven; if (1) is also black, the blit of a second object
+  is wrong and the shim log (`xfer:` lines) is what to send.
+
+Candidate second targets from the real rt-trace (all 3840x2160, same size as `InternalRT0`): `_rt_hud` (the HUD layer, mostly empty),
+`_rt_gblightdiff` (light buffer), `_rt_gbdepthrt` (depth). `_rt_hud` was tried first (see above): all black.
 
 Trying it in the real game (the same steps as the kill loop, plus):
 1. Rebuild with `scripts/build-linux.sh` (shim and helper together), stop any old helper.
@@ -456,7 +478,7 @@ Trying it in the real game (the same steps as the kill loop, plus):
    target from the rt-trace output.
 3. `bmvr_xfer_helper --eyes 2`, start the game: the log shows `imported ... GL textures N (eye 0) and M (eye 1)`; the helper writes
    `bmvr_snapshot_<n>_eye0_...` and `..._eye1_...`.
-4. `./test_kill_loop.sh -n 10 --eyes 2`: a cycle fails loudly if the shim used one eye only.
+4. `tests/linux/test_kill_loop.sh -n 10 --eyes 2`: a cycle fails loudly if the shim used one eye only.
 
 ## Plan (not implemented)
 

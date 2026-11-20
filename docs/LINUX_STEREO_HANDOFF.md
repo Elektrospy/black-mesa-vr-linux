@@ -1,7 +1,8 @@
 # Linux port: two-eye hand-off (stage 3d)
 
-Status: **transport implemented and stand-in tested** (protocol v4, T14-T19, host-native build). Not yet run on a GPU or in the
-real game. **Stereo content is not solved**: the engine still renders one view, and no OpenXR consumer exists on Linux.
+Status: **transport implemented, stand-in tested (protocol v4, T14-T19, host-native build) and verified in the real game** (pairs delivered on an RTX 3080, kill loop 30/30 with `--eyes 2`, 32-bit suite passes). **Eye 1 carrying
+different content is not proven yet**: with `target2=name:_rt_hud` every eye-1 pixel was (0,0,0), probably an empty HUD layer (menu and
+loading screens); `_rt_gblightdiff` and a HUD-visible run are the next tests. **Stereo content is not solved**: the engine still renders one view, and no OpenXR consumer exists on Linux.
 Read `docs/LINUX_PORT.md` first (stages 2a-3c) and `docs/openxr-eye-publish.md` (the Windows pipeline whose defects this design
 must not repeat). How to try it in the game: the end of the "Stage 3d" section of `docs/LINUX_PORT.md`.
 
@@ -11,7 +12,7 @@ must not repeat). How to try it in the game: the end of the "Stage 3d" section o
 |---|---|
 | Shim -> helper transport of ONE render target, GPU semaphores, helper-death guard, reconnect | verified in the real game (3a, 3b kill loop) |
 | One helper per game folder (`flock`) | 3c, unit-tested; real-helper check pending |
-| **Two eye images in the transport, a pair as one atomic publication** | **3d, this document; stand-in tested** |
+| **Two eye images in the transport, a pair as one atomic publication** | **3d, this document; stand-in tested; real game verified (transport); eye-1 content pending** |
 | Engine rendering a separate left/right view | **does not exist on Linux**: needs the game-hook port (plan item 4: Itanium-ABI hooks, vtable slot shift, signature/RTTI scanning) |
 | A native OpenXR consumer | **does not exist**: `OpenXRHelper64/` is Windows-only (`XR_USE_GRAPHICS_API_D3D11`, `<Windows.h>`, 10k lines). A Linux consumer is a new program, not a port |
 
@@ -93,7 +94,10 @@ real helper (`--eyes 2`) when a Vulkan device exists; that path has only been co
 1. `target2` = the same object as `target` (e.g. both `InternalRT0`): proves two images, the one semaphore pair and the
    snapshot files with known-good content.
 2. `rt-trace` output decides a real second target; with one engine view both eyes look alike, which is expected.
-3. `./test_kill_loop.sh -n 10 --eyes 2` (fails if the shim fell back to one eye), then the default 30.
+3. `tests/linux/test_kill_loop.sh -n 10 --eyes 2` (fails if the shim fell back to one eye), then the default 30.
+
+Done so far (2026-11-20, see `docs/LINUX_PORT.md`): step 1; the kill loop 30/30 with two eyes; step 2 with `target2=name:_rt_hud`
+(transport fine, eye 1 all black, probably no HUD on screen). Next: `target2=name:_rt_gblightdiff`, then `_rt_hud` with the HUD visible.
 
 ## The consumer (separate from the transport; needs a headset or a runtime to test)
 

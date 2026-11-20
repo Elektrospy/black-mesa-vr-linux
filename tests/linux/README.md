@@ -16,8 +16,8 @@ into `build/` (git-ignored) and runs it.
 What it can not show: anything that depends on the real driver (semaphore fd sharing, GL/Vulkan ordering on
 the GPU, image content). Those need `bmvr_xfer_helper --selftest-sync` and a real run.
 
-Not in this folder: `../../test_kill_loop.sh` is a real-game test (needs the game running, a GPU and the real helper): it kills the
-helper with `kill -9` in a loop and checks that the shim notices and reconnects. Run it as a program from any shell.
+`test_kill_loop.sh` is NOT part of `run-tests.sh`: it is a real-game test (needs the game running, a GPU and the real helper). It kills the
+helper with `kill -9` in a loop and checks that the shim notices and reconnects (`--eyes 2` for the two-eye case). Run it as a program from any shell.
 
 `BMVR_TEST_NATIVE=1 tests/linux/run-tests.sh` builds everything for the host (64-bit) instead of `-m32`, so it runs without multilib.
 It covers all the shim logic (T1-T19) but not the 32-bit build; the plain run is the authoritative one. A build directory deeper than
