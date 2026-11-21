@@ -485,7 +485,7 @@ Trying it in the real game (the same steps as the kill loop, plus):
    `bmvr_snapshot_<n>_eye0_...` and `..._eye1_...`.
 4. `tests/linux/test_kill_loop.sh -n 10 --eyes 2`: a cycle fails loudly if the shim used one eye only.
 
-## Stage 4a: native OpenXR sink (X0 implemented; design in `docs/LINUX_OPENXR_CONSUMER.md`)
+## Stage 4a: native OpenXR sink (X0-X2 done, X3/X4 implemented; design in `docs/LINUX_OPENXR_CONSUMER.md`)
 
 The helper gets an OpenXR sink (same process: `XR_KHR_vulkan_enable2` makes the runtime own the Vulkan device, so the exportable
 images must live on it). Milestone X0 exists: `bmvr_xfer_helper --xr-probe` opens the runtime (loader, instance, system,
@@ -494,6 +494,14 @@ runtime-chosen Vulkan device, session, swapchain), submits no frames and ends wi
 a GPU or headset (14/14 checks; see the "X0 results" table, including what that does **not** show). **SteamVR: X0 PASS observed once** (user log, SteamVR/OpenXR 2.19.4, NVIDIA RTX 3080 on Vulkan 1.4, 3036x3036 per eye, R8G8B8A8_SRGB offered, opaque-fd image and semaphore export OK, session reaches READY; no frames submitted). It first failed `UNAVAILABLE` (-51) until SteamVR was made the active OpenXR runtime, see below. Not checked: the game feeding the sink, frames in the headset. Milestone X1 exists: `bmvr_xfer_helper --selftest-xr [--xr-layer quad|projection|both] [--xr-seconds N]` runs a frame loop with a generated pattern (left BLUE "L", right RED "R", frame counter) as a quad and a stereo projection layer, no game needed; compiled clean and **PASSES on SteamVR 2.19.4 + RTX 3080** (author's run: about 90 fps, 895 quad + 898 projection frames submitted, a blue "L" and a red "R" seen in the headset; Monado not run, see `docs/LINUX_OPENXR_CONSUMER.md` "X1 results"). `--sink xr` (X2: pair ring + XR thread + quad layer, eye 0) is **implemented and passes its stand-in tests on Monado + lavapipe** (kill loop 30/30 with a Vulkan stand-in for the game, sanitizers clean); it has **not** been run with the real game, with GPU semaphores, on SteamVR or in a headset, so plan item 3 stays open (see `docs/LINUX_OPENXR_CONSUMER.md` "X2 results"). Nothing here changes the snapshot sink, T1-T19 or the kill loop (T1-T19 re-run: pass).
 
 Try it (any OpenXR runtime running; no game needed): `"$GAME/bmvr_xfer_helper" --xr-probe` and send the output.
+
+Milestone X2 (the game's picture in the headset), tested configuration: SteamVR running as the active OpenXR runtime, **headset on and
+awake** (a headset in standby when the helper connects makes SteamVR's watchdog kill SteamVR), then `"$GAME/bmvr_xfer_helper" --sink xr
+--eyes 2 --xr-layer projection`, then the game with `bmvr_target.txt` = `target=InternalRT0`, `target2=InternalRT0`, `flip=0`, `sync=sem`,
+`every=1`. Both eyes show the same flat picture (the engine renders one view); the projection layer does not overlap the two eyes
+correctly for that, use `--xr-layer quad` for a plain flat view. After rebuilding with `scripts/build-linux.sh` the helper must print
+`queues: transport thread on its own queue`; if not, the installed helper is old. Results and notes: `docs/LINUX_OPENXR_CONSUMER.md`,
+"X2 results (real game, SteamVR)".
 
 **SteamVR must be the active OpenXR runtime.** A running SteamVR is not enough. Without an active runtime the probe prints
 `RuntimeManifestFile::FindManifestFiles - failed to determine active runtime file path`, `xrEnumerateInstanceExtensionProperties
@@ -515,7 +523,7 @@ driver) connected to SteamVR, otherwise a "no system" error can follow once the 
 1. ~~Read the milestone-1 log; confirm eye-target candidates and driver extensions.~~ Done.
 2. ~~Stage 2a: test the transport.~~ Done, verified. ~~Stage 2b: capture an engine render target.~~ Done, verified in the real game (`InternalRT0`).
 3. Stage 3a: ~~replace `glFinish` + ack with `GL_EXT_semaphore_fd` / `VK_KHR_external_semaphore_fd`~~ done, verified in the real game (opt-in). Stage 3b: loading-frame fallback + helper-death guard (helper-death verified by the kill loop; loading fallback awaiting a real run). Stage 3c: one helper per game folder (flock).
-   Stage 4a (OpenXR sink, `docs/LINUX_OPENXR_CONSUMER.md`): X0 probe done on Monado; X1-X4 not started.
+   Stage 4a (OpenXR sink, `docs/LINUX_OPENXR_CONSUMER.md`): X0 and X1 run on SteamVR; **X2 (`--sink xr`) complete and run with the real game on SteamVR 2.19.4 + RTX 3080** (author-reported, 2026-11-21; the transport thread has its own `VkQueue`, see Decision 2, amended); X3/X4 (projection layer, pose channel) run with the game, but the engine renders one view, so there is no stereo yet.
    Then (design in `docs/LINUX_STEREO_HANDOFF.md`): render a *separate* stereo pair into two eye targets (the engine renders one view today) and
    hand both to a 64-bit native OpenXR helper. Which targets and sizes to use is decided by the
    `rt-trace` output.

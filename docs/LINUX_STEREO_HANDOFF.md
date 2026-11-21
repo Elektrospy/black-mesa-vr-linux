@@ -2,7 +2,7 @@
 
 Status: **transport implemented, stand-in tested (protocol v4, T14-T19, host-native build) and verified in the real game** (pairs delivered on an RTX 3080, kill loop 30/30 with `--eyes 2`, 32-bit suite passes). **Eye 1 carrying
 different content is not proven yet**: with `target2=name:_rt_hud` every eye-1 pixel was (0,0,0), probably an empty HUD layer (menu and
-loading screens); `_rt_gblightdiff` and a HUD-visible run are the next tests. **Stereo content is not solved**: the engine still renders one view, and no OpenXR consumer exists on Linux.
+loading screens); `_rt_gblightdiff` and a HUD-visible run are the next tests. **Stereo content is not solved**: the engine still renders one view. The OpenXR consumer exists and shows the game's pair in the headset (X2, complete 2026-11-21, `docs/LINUX_OPENXR_CONSUMER.md`), but with one engine view both eyes carry the same picture.
 Read `docs/LINUX_PORT.md` first (stages 2a-3c) and `docs/openxr-eye-publish.md` (the Windows pipeline whose defects this design
 must not repeat). How to try it in the game: the end of the "Stage 3d" section of `docs/LINUX_PORT.md`.
 

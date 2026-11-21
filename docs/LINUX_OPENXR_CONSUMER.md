@@ -6,11 +6,13 @@ author, one run). Details and limits: "X0 results" below. **Milestone X1 (`--sel
 pattern) is implemented, compiled (clean with `-Wall -Wextra`, also under `gcc -fanalyzer`) and PASSES on SteamVR 2.19.4 + RTX 3080
 (author's run: 895 quad and 898 projection frames submitted, about 90 fps; the author reports seeing a blue "L" and a red "R" in
 the headset)**; see "X1 results". The Monado X1 script has since been executed (11/11 on Monado 21.0.0 + lavapipe).
-**Milestone X2 (`--sink xr`: socket sink, pair ring, XR thread, quad layer with eye 0) is implemented, compiled clean and passes
-its stand-in tests on Monado + lavapipe (16/16, kill loop 30/30, ASan/UBSan and TSan clean) with a Vulkan stand-in for the game.
-It has NOT been run with the real game, with GPU semaphores, on SteamVR or in a headset: the milestone's own pass criterion
-("game picture visible in the headset") is not met yet.** See "X2 results". X3 and X4 (projection layer, pose channel) do not
-exist yet. Runtime-specific claims that X0 has not settled are still marked *(verify)*.
+**Milestone X2 (`--sink xr`: socket sink, pair ring, XR thread, quad or projection layer) is COMPLETE (2026-11-21).** It passes its
+stand-in tests on Monado + lavapipe (16/16, kill loop 30/30, ASan/UBSan and TSan clean) and, as reported by the author, was run and
+fully tested with the real game on SteamVR/OpenXR 2.19.4 + RTX 3080 (NVIDIA open kernel module 620.73.04), `sync=sem`, two eyes; the
+log-backed numbers are in "X2 results (real game, SteamVR)". Getting there found and fixed a queue-sharing defect: **one queue + one
+mutex was not enough, the transport thread now has its own `VkQueue`** (Decision 2, amended). X3 and X4 (projection layer, pose
+channel) are implemented and ran with the real game, but **X3's pass criterion is not met: the engine still renders one view**, so
+both eyes carry the same flat picture (see the X3/X4 rows). Runtime-specific claims that X0 has not settled are still marked *(verify)*.
 
 Prerequisites: `docs/LINUX_PORT.md` (stages 2a-3d), `docs/LINUX_STEREO_HANDOFF.md` (protocol v4, pair atomicity),
 `docs/openxr-eye-publish.md` (the Windows pipeline and the defects this design must not repeat).
@@ -96,6 +98,25 @@ Threads: the existing socket thread; one new XR thread (event poll, frame loop).
 the runtime may also use the queue it is given in the session binding *(verify the exact rule in the XR spec's Vulkan binding
 section)*. First implementation: ONE queue, ONE mutex around submissions by both threads. Request a second queue only if the
 rate log shows contention.
+
+**Amended 2026-11-21 (X2, real game): one queue was not enough.** With one queue and one mutex on SteamVR 2.19.4 + RTX 3080 the
+transport thread waited 4 ms on average (10 ms max) for the lock at 30 pairs/s, and 18-21 ms on average (90-97 ms max) at
+`sync=finish`, `every=1`, with the XR frame rate collapsing from 90/s to about 5/s. The Vulkan validation layer reported
+`UNASSIGNED-Threading-MultipleThreads-Write` (one `VkQueue` inside `vkQueueSubmit` on two threads at once, despite `qmu`) as soon
+frames were displayed, and the kernel logged NVIDIA Xid 32 (invalid or corrupted push buffer) and Xid 69 (class error, class
+0xC797) against `bmvr_xfer_helper` in three sessions (13:09, 14:00, 14:14 local), each followed by SteamVR's compositor watchdog
+(`WaitForPresent` hung 6.8 s) and a lost session. Which thread was the second submitter is **not proven**: the runtime lives in the
+helper process and may submit on the session's queue from XR calls that are not under `qmu` (`xrWaitFrame`,
+`xrAcquireSwapchainImage`, `xrWaitSwapchainImage`); the fix does not need to know.
+
+**The fix (`linux/bmvr_xr_sink.c`):** the runtime-created device is requested with two queues of the graphics family (family 0 has
+16 on the RTX 3080). Queue 0 stays the session's queue (XR thread and runtime). Queue 1 belongs to the transport thread alone and its
+submits take no mutex. `qmu` is used only when the family has fewer than two queues or `BMVR_XR_ONE_QUEUE=1` is set (fallback and
+A/B comparison). The helper logs `queues: transport thread on its own queue (family N has M)` at start; **if that line is missing
+the installed helper is an old build** (`scripts/build-linux.sh` installs it). No extra synchronization is needed for the hand-over
+between the two queues: the XR thread only picks a slot whose copy fence has signalled (`sk_done_fn`, `vkGetFenceStatus`), all
+images are `VK_SHARING_MODE_EXCLUSIVE` in one family (no ownership transfer), and the ring's mutex orders the slot states.
+After the fix the helper log shows no threading error, a transport lock wait of 0.000 ms and 89-90 XR frames/s throughout.
 
 Cost: one extra GPU copy of both eyes per pair (~50 MB per eye at 3840x2160 RGBA8, a ~1 ms-class GPU copy on the author's RTX 3080
 class hardware, *estimate, to be measured in X2*). In exchange the game's frame rate and the display rate are fully decoupled.
@@ -183,9 +204,9 @@ runtime-initialized / ... / headset presentation verified). A status is written 
 |---|---|---|---|
 | X0 | `bmvr_xr_sink` skeleton, `--xr-probe`: instance, system, view config, swapchain formats, session create/destroy, no game, no frames | Monado **and** SteamVR | Logs runtime name/version/extensions/formats on both; confirms or corrects every *(verify)* above; helper exits cleanly. **Status: implemented; Monado 21.0.0 (sandbox) PASS; SteamVR 2.19.4 + RTX 3080 PASS (author's run)** |
 | X1 | `--selftest-xr`: frame loop with a generated pattern (left tinted one way, right the other, frame counter), quad then projection | Monado sim/qwerty first, then a headset | Correct eye order; steady `xrWaitFrame` cadence; rate lines sane; no per-frame disk writes. **Status: implemented; SteamVR 2.19.4 + RTX 3080 PASS, "L" blue / "R" red seen in the headset (author's run); Monado not run** (see "X1 results") |
-| X2 | Socket sink: pair -> ring -> swapchain, quad layer, eye 0 | game + runtime | **Status: implemented; stand-in tests PASS on Monado + lavapipe; NOT verified with the game, semaphores, SteamVR or a headset** (see "X2 results"). Game picture visible in the headset on each runtime; `test_kill_loop.sh -n 10`, then 30, passes with `--sink xr` (helper killed at random points: game unaffected, helper-less period shows nothing or last image, reconnect restores the picture) |
-| X3 | Projection layer with a pinned pose; `target2=name:_rt_gblightdiff` (**implemented 2026-11-21, compiles clean, NOT run with the game/headset**: `--sink xr --eyes 2 --xr-layer projection`; two swapchains, eye 0 = left, eye 1 = right, head-locked VIEW space, runtime eye poses with pinned fallback) | as X2 | Left and right visibly different content, correct sides, no eye ever shows a different tick than the other |
-| X4 | Protocol v5 pose channel, mock-tested (`mock_game` replays poses; new case T20+) | none (stand-ins) | **Status: implemented 2026-11-21; stand-in tests T21-T23 + `pose_test` PASS (native build); NOT run with the real game, SteamVR or a headset.** Pair slots carry their own `pose_id`; stale id handled; v4 peer rejected with both versions named. Real use waits for the hook port |
+| X2 | Socket sink: pair -> ring -> swapchain, quad layer, eye 0 | game + runtime | **Status: COMPLETE (2026-11-21). Stand-in tests PASS on Monado + lavapipe; run and fully tested with the real game on SteamVR 2.19.4 + RTX 3080, `sync=sem`, two eyes, as reported by the author** (see "X2 results" and "X2 results (real game, SteamVR)"). Game picture visible in the headset on each runtime; `test_kill_loop.sh -n 10`, then 30, passes with `--sink xr` (helper killed at random points: game unaffected, helper-less period shows nothing or last image, reconnect restores the picture). **Recorded: kill loop 30/30 on the stand-in; against the real game with `--sink xr` not recorded** |
+| X3 | Projection layer with a pinned pose; `target2=name:_rt_gblightdiff` (**implemented 2026-11-21; run with the real game on SteamVR (two swapchains, 89-90 XR frames/s, pairs 60/s, 0 dropped) but the pass criterion is NOT met: the engine renders one view, so with `target2=InternalRT0` both eyes carry the same flat picture, and with the per-eye poses/FOVs of the projection layer the two images do not overlap correctly (author's observation, expected for mono content). `--xr-layer quad` shows one picture to both eyes**: `--sink xr --eyes 2 --xr-layer projection`; two swapchains, eye 0 = left, eye 1 = right, head-locked VIEW space, runtime eye poses with pinned fallback) | as X2 | Left and right visibly different content, correct sides, no eye ever shows a different tick than the other |
+| X4 | Protocol v5 pose channel, mock-tested (`mock_game` replays poses; new case T20+) | none (stand-ins) | **Status: implemented 2026-11-21; stand-in tests T21-T23 + `pose_test` PASS (native build). With the real game on SteamVR the poses reach the shim (first pose id received, LOCAL space, left eye at (-0.028 -0.001 -0.001), FOV l/r/u/d -1.029 0.882 0.869 -1.042 rad) and the `stale` counter rises when pairs slow or stop; the game does not render with the poses yet.** Pair slots carry their own `pose_id`; stale id handled; v4 peer rejected with both versions named. Real use waits for the hook port |
 
 Test additions in `tests/linux`: a stand-in for the XR side is not practical (the point is the real runtime), so X1-X3 are
 manual or runtime-assisted; X4 and the ring state machine (slot states, newest-wins, reuse-when-starved, no half pair) are unit
@@ -355,7 +376,7 @@ Also learned: lavapipe exports the opaque-fd memory and a second process **can i
 software driver); Monado's simulated HMD runs at 20 Hz (display period 50 ms), so `dropped` is high when the stand-in sends 40 pairs/s,
 as designed (newest wins).
 
-**What X2 has NOT shown** (all of these are open, and the status lines above must keep saying so):
+**What the stand-in run of X2 did NOT show** (written before the real-game run; the real-game results below settle the game, semaphore, SteamVR/headset and single-queue items; the rest stays open):
 
 - The real game: the shim's GL import of these images and `sync=sem` / `sync=finish` against this helper. The stand-in cannot do
   GL, and lavapipe has no semaphore export, so **the semaphore path (wait gl_ready / signal vk_done on the runtime's queue) has not
@@ -396,9 +417,51 @@ texture without glFinish; (3) SteamVR 2.19.4 beta / NVIDIA 620.73 with imported 
 `glFinish` after the signal; separate VkQueue for the transport; `journalctl -k | grep -i xid`; Vulkan validation layer on the helper.
 Use `sync=finish` for X3 until this is resolved.
 
+### X2 results (real game, SteamVR)
+
+Reported by the author as complete and fully tested, 2026-11-21. Setup: Black Mesa (Proton) with the shim,
+`bmvr_xfer_helper --sink xr --eyes 2 --xr-layer projection`, SteamVR/OpenXR 2.19.4, NVIDIA RTX 3080 (open kernel module 620.73.04),
+headset on SteamVR via vrlink; `bmvr_target.txt`: `target=InternalRT0`, `target2=InternalRT0`, `flip=0`, `sync=sem`, `every=1`. The
+numbers are from the shim and helper logs of those runs. The length of the soak, the Xid check of the final runs and a kill loop with
+`--sink xr` against the real game are not in the logs attached to this record.
+
+| Check | Observed |
+|---|---|
+| Two eyes through GL import | shim: "imported the helper's Vulkan memory as GL textures 997 (eye 0) and 998 (eye 1)"; shared image 3036x3036, 37355520 bytes per image |
+| GPU semaphores (`sync=sem`) | "GL semaphores 1/2 imported", no `glFinish`; this path had never run before, not even against the stand-in |
+| Cost per pair | GL side 122-137 us, helper round trip 107-128 us (averages over 10-50 snapshots) |
+| Pacing | game about 60 fps; XR 89-90 frames/s; pairs 60/s, displayed 90/s, reused 30/s, dropped 0.0/s in steady state (newest wins, reuse when starved, as designed) |
+| Queue contention | single queue: failed (Decision 2, amended); own transport queue: lock wait 0.000 ms, no threading error from the validation layer |
+| Pose channel | the shim receives poses (see the X4 row); the game does not use them yet |
+| Same GPU | the helper prints the runtime's device UUID `afc5d13f9cb1b726f1b996abdf9a7c59`, equal to the kernel's `GPU-afc5d13f-9cb1-b726-f1b9-96abdf9a7c59` (one GPU in the machine); the automatic shim/helper UUID comparison is still not implemented |
+| Session states | SYNCHRONIZED / VISIBLE / FOCUSED alternate when the headset is taken off and put on; the XR loop keeps running at 89-90 frames/s through them |
+
+**Failures found on the way (before the queue fix), for the record:** NVIDIA Xid 32 (twice per event) at 13:09 (pid 13879) and 14:00
+(pid 31481) and Xid 69 + Xid 32 at 14:14 (pid 33548), all `bmvr_xfer_helpe`; the compositor then logged `WaitForAcquire timed out` about
+90 times a second and its watchdog aborted in `WaitForPresent` after 6.8 s, which ended the session.
+
+**Operational notes learned:**
+
+- **Wake the headset before starting the helper.** With the headset in standby SteamVR got no vsync from vrlink, `WaitForPresent`
+  aborted every second, `vrserver`'s `Connection` thread watchdog fired after 21 s and SteamVR exited, with no game running and no
+  Xid. This is not a helper fault.
+- After changing `linux/`, run `scripts/build-linux.sh` (it builds from scratch and installs the helper), then check the `queues:` line.
+- The Vulkan validation layer, when enabled for the helper (`VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation`), prints shader-module
+  (`ShaderViewportIndexLayerEXT`) and `vkCmdDraw` image-layout errors; the helper has no shaders or draw calls, so these come from the
+  SteamVR runtime in the helper process and can be ignored. When the runtime ends the session the helper exits without destroying its
+  Vulkan objects (the layer reports about 315 leaked objects); harmless at exit, not cleaned up.
+- Check for GPU faults after a session with `sudo dmesg | grep -i xid` (the `r8169 ... XID 641` line is the network card).
+- Validation slows the helper a lot at 3036x3036 per eye; use `every=3` while it is enabled.
+
+**Still open after X2:** a kill loop with `--sink xr` against the real game; a `sync=finish` soak after the queue fix (the crashing runs
+used `sync=finish`); the GPU copy time per frame at 3036x3036 (only the round trip above is measured); motion-to-photon (needs poses and
+the hook port); a mono-overlap mode for the projection layer (same pose and one FOV for both eyes) until real stereo exists; poses going
+`stale` while the game is paused or loading (no projection layer is submitted for such a slot).
+
 ## X4: the pose channel (protocol v5)
 
-Implemented and stand-in tested; **not run with the game or a headset**.
+Implemented and stand-in tested; run with the real game on SteamVR 2.19.4 (2026-11-21): the pose channel delivers poses to the shim.
+The game does not render with them yet (that is the hook port), so the pose id of a pair names a pose its picture was not rendered from.
 
 **Deviation from Decision 5:** there is no separate helper -> shim message. The socket stays strictly request/response (the shim only
 ever blocks in `recv` for an ack), so every **ack carries the helper's newest pose** (`struct bmvr_xfer_ack.pose`, `pose_id` 0 = none).
@@ -428,14 +491,17 @@ frame       + pose_id                      "this pair was rendered with pose pos
 
 ## Risks and open questions
 
-1. **Queue synchronization with the runtime** (one queue, two threads, runtime submits on it too): exact rule to confirm in X0,
-   and the mutex scope to measure in X2.
+1. ~~**Queue synchronization with the runtime**~~ **Resolved in X2 (real game):** one queue behind one mutex was not enough (validation
+   threading errors, Xid 32/69, compositor watchdog). The transport thread has its own queue (Decision 2, amended). Not proven: which
+   XR call submits on the session's queue inside the runtime.
 2. **Swapchain format availability**: holds on Monado 21.0.0 (X0, sandbox) and on SteamVR 2.19.4 (X0, author's run: sRGB offered,
    UNORM not offered, so the sRGB raw copy is the only RGBA8 route there). Not checked: other SteamVR versions, other GPUs.
 3. **Latency with mono + pinned pose**: irrelevant to a head-locked quad, but it means this stage cannot say anything about
    motion-to-photon. That is only measurable once poses flow (X4 + hook port).
 4. **SteamVR on Linux session lifecycle** (session state READY/FOCUSED transitions, losing focus while the game window has it):
-   needs a headset run to know; the XR thread must treat `XR_SESSION_STATE_*` as a state machine, not assume FOCUSED.
+   needs a headset run to know; the XR thread must treat `XR_SESSION_STATE_*` as a state machine, not assume FOCUSED. Observed (X2, real
+   game): the states alternate when the headset is taken off and put on, and the loop keeps running; a headset in standby when the helper
+   starts makes SteamVR's own watchdog kill SteamVR (see "Operational notes learned").
 5. **Helper death while the session is running**: the compositor keeps the last submitted layer or drops it, runtime-dependent
    *(verify)*; the XR thread should keep submitting frames from the last READY slot while the game connection is down, so a
    reconnect does not look like a session restart.
@@ -447,5 +513,5 @@ frame       + pose_id                      "this pair was rendered with pose pos
 
 1. ~~Record the `_rt_gblightdiff` result in `LINUX_PORT.md`~~ (recorded as reported by the author; the snapshot numbers are still to be added).
 2. ~~X0: run on Monado and on SteamVR~~ (done, see "X0 results").
-3. ~~X1: run `--selftest-xr` on SteamVR~~ (done, see "X1 results"). X2 is implemented and stand-in tested (see "X2 results"). **Next: run X2 with the real game on SteamVR** (`--sink xr`, game with `sync=sem` and with `sync=finish`, `test_kill_loop.sh -n 10` then 30 with `--sink xr`), then X3; X4 in parallel with the start of the hook port.
+3. ~~X1: run `--selftest-xr` on SteamVR~~ (done, see "X1 results"). X2 is implemented and stand-in tested (see "X2 results"). ~~Run X2 with the real game on SteamVR~~ **done 2026-11-21, as reported by the author** (see "X2 results (real game, SteamVR)"; open: `sync=finish` soak and the kill loop with `--sink xr` against the real game). **Next: X3 needs real stereo content**, so the hook port (two views rendered with the poses of the pose channel) comes first; until then the projection layer shows one flat picture to both eyes.
 4. Only then is `docs/LINUX_PORT.md`'s plan item 3 ("hand both to a native OpenXR helper") marked done.
