@@ -26,6 +26,11 @@
 #include <string.h>
 #include <time.h>
 
+#include <pthread.h>
+#include <stdatomic.h>
+
+#include "bmvr_pair_ring.h"
+#include "bmvr_xfer.h"
 #include "bmvr_xr_sink.h"
 
 #define XLOG(...) do { fprintf(stderr, "[xr] " __VA_ARGS__); fputc('\n', stderr); } while (0)
@@ -524,7 +529,8 @@ int bmvr_xr_probe(const struct bmvr_xr_probe_opts *opts)
     X(vkCreateFence) X(vkDestroyFence) X(vkWaitForFences) X(vkResetFences) X(vkQueueSubmit) X(vkDeviceWaitIdle) \
     X(vkCreateImage) X(vkDestroyImage) X(vkGetImageMemoryRequirements) X(vkAllocateMemory) X(vkFreeMemory) \
     X(vkBindImageMemory) X(vkCreateBuffer) X(vkDestroyBuffer) X(vkGetBufferMemoryRequirements) X(vkBindBufferMemory) \
-    X(vkMapMemory) X(vkUnmapMemory)
+    X(vkMapMemory) X(vkUnmapMemory) X(vkGetFenceStatus) X(vkCmdCopyImageToBuffer) X(vkCreateSemaphore) X(vkDestroySemaphore) \
+    X(vkGetImageMemoryRequirements2)
 
 #define DECL(name) static PFN_##name name##_;
 XR_ST_FUNCS(DECL)
@@ -545,6 +551,9 @@ struct st {
     VkQueue queue;
     uint32_t w, h;
     int usage_color_att; /* 1 if the swapchains were created with COLOR_ATTACHMENT usage too */
+    int want_src;        /* X2 --xr-check: ask for TRANSFER_SRC usage too (readback of the swapchain image) */
+    int usage_src;       /* 1 if the swapchains got it */
+    int has_memfd, has_semfd; /* the device was created with VK_KHR_external_memory_fd / _semaphore_fd */
     XrEnvironmentBlendMode blend;
     XrViewConfigurationView views[2];
     XrSpace view_space;
@@ -609,7 +618,7 @@ static void xr_hint_no_runtime(void)
 }
 
 /* Same sequence and the same device flags as the probe (X0), without its report. Returns 1 on a failure (ledgered). */
-static int st_open(struct st *s, const struct bmvr_xr_selftest_opts *o, int *unavailable)
+static int st_open(struct st *s, int want_w, int want_h, int require_memfd, int *unavailable)
 {
     struct ctx *c = &s->c;
     XrResult r;
@@ -673,8 +682,8 @@ static int st_open(struct st *s, const struct bmvr_xr_selftest_opts *o, int *una
     uint32_t nv = 0;
     r = xrEnumerateViewConfigurationViews_(c->inst, c->sys, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, 2, &nv, s->views);
     if (XR_FAILED(r) || nv != 2) { ledger("view sizes", 0, 1, "%s, %u views", xr_rs(c->inst, r), nv); return 1; }
-    s->w = o->width > 0 ? (uint32_t)o->width : s->views[0].recommendedImageRectWidth;
-    s->h = o->height > 0 ? (uint32_t)o->height : s->views[0].recommendedImageRectHeight;
+    s->w = want_w > 0 ? (uint32_t)want_w : s->views[0].recommendedImageRectWidth;
+    s->h = want_h > 0 ? (uint32_t)want_h : s->views[0].recommendedImageRectHeight;
     ledger("eye image size", 1, 1, "%ux%u (runtime recommends %ux%u)", s->w, s->h, s->views[0].recommendedImageRectWidth,
            s->views[0].recommendedImageRectHeight);
 
@@ -727,6 +736,9 @@ static int st_open(struct st *s, const struct bmvr_xr_selftest_opts *o, int *una
         if (!strcmp(de[i].extensionName, "VK_KHR_external_semaphore_fd")) has_semfd = 1;
     }
     free(de);
+    s->has_memfd = has_memfd;
+    s->has_semfd = has_semfd;
+    if (require_memfd && !has_memfd) { ledger("VK_KHR_external_memory_fd", 0, 1, "the runtime-chosen GPU cannot export image memory: the game's pair cannot be shared with it"); return 1; }
 
     uint32_t nq = 0;
     vkGetPhysicalDeviceQueueFamilyProperties_(c->phys, &nq, NULL);
@@ -768,7 +780,7 @@ static int st_open(struct st *s, const struct bmvr_xr_selftest_opts *o, int *una
 }
 
 /* Swapchains (one per eye), their images, the reference space. */
-static int st_make_swapchains(struct st *s)
+static int st_make_swapchains(struct st *s, int neyes)
 {
     struct ctx *c = &s->c;
     XrResult r;
@@ -782,24 +794,27 @@ static int st_make_swapchains(struct st *s)
     ledger("swapchain format R8G8B8A8_SRGB", has_srgb, 1, has_srgb ? "offered: the raw-copy design works" : "NOT offered: needs the shader fallback (design doc, Decision 3); refusing to guess");
     if (!has_srgb) return 1;
 
-    for (int pass = 0; pass < 2; pass++) { /* with COLOR_ATTACHMENT usage first (what a layout hand-over to the runtime implies), then the X0-verified flags */
+    /* Usage fallback: (0) COLOR_ATTACHMENT [+ TRANSFER_SRC when the readback check wants it], (1) COLOR_ATTACHMENT only, (2) the flags X0 verified. */
+    for (int pass = 0; pass < 3; pass++) {
+        if (pass == 1 && !s->want_src) continue; /* identical to pass 0 */
         XrSwapchainUsageFlags usage = XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT |
-                                      (pass == 0 ? XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT : 0);
+                                      (pass <= 1 ? XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT : 0) |
+                                      (pass == 0 && s->want_src ? XR_SWAPCHAIN_USAGE_TRANSFER_SRC_BIT : 0);
         int made = 0;
-        for (int e = 0; e < 2; e++) {
+        for (int e = 0; e < neyes; e++) {
             XrSwapchainCreateInfo sci = { .type = XR_TYPE_SWAPCHAIN_CREATE_INFO, .usageFlags = usage, .format = 43, .sampleCount = 1,
                 .width = s->w, .height = s->h, .faceCount = 1, .arraySize = 1, .mipCount = 1 };
             r = xrCreateSwapchain_(c->sess, &sci, &s->sc[e]);
             if (XR_FAILED(r)) {
-                if (pass == 1) { ledger("xrCreateSwapchain", 0, 1, "eye %d, %ux%u R8G8B8A8_SRGB: %s", e, s->w, s->h, xr_rs(c->inst, r)); return 1; }
+                if (pass == 2) { ledger("xrCreateSwapchain", 0, 1, "eye %d, %ux%u R8G8B8A8_SRGB: %s", e, s->w, s->h, xr_rs(c->inst, r)); return 1; }
                 break;
             }
             made++;
         }
-        if (made == 2) { s->usage_color_att = (pass == 0); break; }
+        if (made == neyes) { s->usage_color_att = (pass <= 1); s->usage_src = (pass == 0 && s->want_src); break; }
         for (int e = 0; e < 2; e++) if (s->sc[e]) { xrDestroySwapchain_(s->sc[e]); s->sc[e] = 0; }
     }
-    for (int e = 0; e < 2; e++) {
+    for (int e = 0; e < neyes; e++) {
         uint32_t n = 0;
         xrEnumerateSwapchainImages_(s->sc[e], 0, &n, NULL);
         s->img[e] = calloc(n ? n : 1, sizeof *s->img[e]);
@@ -808,8 +823,8 @@ static int st_make_swapchains(struct st *s)
         if (XR_FAILED(r) || !n) { ledger("xrEnumerateSwapchainImages", 0, 1, "eye %d: %s", e, xr_rs(c->inst, r)); return 1; }
         s->nimg[e] = n;
     }
-    ledger("xrCreateSwapchain", 1, 1, "2 x %ux%u R8G8B8A8_SRGB, %u image(s) each, usage TRANSFER_DST|SAMPLED%s", s->w, s->h, s->nimg[0],
-           s->usage_color_att ? "|COLOR_ATTACHMENT" : " (runtime refused COLOR_ATTACHMENT)");
+    ledger("xrCreateSwapchain", 1, 1, "%d x %ux%u R8G8B8A8_SRGB, %u image(s) each, usage TRANSFER_DST|SAMPLED%s%s", neyes, s->w, s->h, s->nimg[0],
+           s->usage_color_att ? "|COLOR_ATTACHMENT" : " (runtime refused COLOR_ATTACHMENT)", s->usage_src ? "|TRANSFER_SRC" : "");
 
     XrReferenceSpaceCreateInfo rsi = { .type = XR_TYPE_REFERENCE_SPACE_CREATE_INFO, .referenceSpaceType = XR_REFERENCE_SPACE_TYPE_VIEW,
         .poseInReferenceSpace = { .orientation = { 0, 0, 0, 1 } } };
@@ -1172,8 +1187,8 @@ int bmvr_xr_selftest(const struct bmvr_xr_selftest_opts *o)
     sigaction(SIGINT, &sa, &old_int);
     sigaction(SIGTERM, &sa, &old_term);
 
-    failed = st_open(s, o, &unavailable);
-    if (!failed && !unavailable) failed = st_make_swapchains(s);
+    failed = st_open(s, o->width, o->height, 0, &unavailable);
+    if (!failed && !unavailable) failed = st_make_swapchains(s, 2);
     if (!failed && !unavailable) failed = st_make_gpu_objects(s);
     if (!failed && !unavailable) {
         /* wait for READY (st_events begins the session), as the probe does */
@@ -1228,4 +1243,607 @@ int bmvr_xr_selftest(const struct bmvr_xr_selftest_opts *o)
     XLOG("eye order, colours, the counter and the marker are NOT checked by this program: look in the headset (left BLUE 'L', right RED 'R')");
     XLOG("xr-selftest: %s", req_fail ? "FAILED (a required item above is missing)" : "PASS (frames were submitted; whether the picture is right is a visual check)");
     return req_fail ? BMVR_XR_PROBE_FAILED : BMVR_XR_PROBE_OK;
+}
+
+/* ================================================================================================================ X2: socket sink
+ * Design: docs/LINUX_OPENXR_CONSUMER.md, Decisions 1-4. What this part does:
+ *
+ *   - st_open() (the X1 code) creates the runtime-chosen Vulkan device; the shared images the game imports are created on THAT
+ *     device (exportable opaque-fd memory), so the game's GL context and this process share one GPU object.
+ *   - The transport thread (the helper's socket loop) calls bmvr_xr_sink_pair() per frame message: ONE queue submission that waits
+ *     gl_ready, copies the pair's images into a ring slot (vkCmdCopyImage, no shader) and signals vk_done. The ack follows at once.
+ *   - The XR thread (the pacing master) runs xrWaitFrame -> xrBeginFrame -> pick the newest complete slot -> copy its eye 0 into
+ *     the acquired swapchain image -> xrEndFrame with a head-locked quad. No new pair: the same slot is copied again (reuse), so a
+ *     slow game never starves the compositor. No pair ever: an empty frame (nothing shown).
+ *   - One queue, one mutex (qmu) around every vkQueueSubmit and around the xr calls that may use the queue (design decision 2). The
+ *     rate line reports how long the transport waited for it.
+ *
+ * No per-frame log lines and no per-frame disk writes: one rate line every 5 s.
+ */
+#define SK_XFRAMES 2
+#define SK_CHK_BYTES 256
+
+static PFN_vkGetMemoryFdKHR vkGetMemoryFdKHR_;
+static PFN_vkGetSemaphoreFdKHR vkGetSemaphoreFdKHR_;
+
+struct bmvr_xr_sink {
+    struct st st;                 /* session, device, queue, swapchain 0, memory properties (shared with the X1 code) */
+    int eyes;                     /* images per pair (shared images, ring slot images) */
+    int sem_ok;                   /* semaphores are offered to the game */
+    int check_left;               /* --xr-check: fresh pairs still to read back */
+    VkImage shared[2];            /* what the game imports: written by GL, read by our copy */
+    VkDeviceMemory shared_mem[2];
+    VkDeviceSize mem_size;
+    VkImage slot_img[BMVR_RING_SLOTS][2];
+    VkDeviceMemory slot_mem[BMVR_RING_SLOTS][2];
+    VkCommandPool tpool;          /* transport thread's pool/command buffers/fences: one per ring slot */
+    VkCommandBuffer tcb[BMVR_RING_SLOTS];
+    VkFence tfence[BMVR_RING_SLOTS];
+    VkFence drop_fence;           /* for a submission without a slot (ring full): wait/signal only, so vk_done is still signalled */
+    int drop_pending;
+    VkSemaphore sem_gl_ready, sem_vk_done;
+    int sem_active;
+    VkCommandPool xpool;          /* XR thread's pool/command buffers/fences */
+    VkCommandBuffer xcb[SK_XFRAMES];
+    VkFence xfence[SK_XFRAMES];
+    int xfence_used[SK_XFRAMES];
+    VkBuffer chk_buf;
+    VkDeviceMemory chk_mem;
+    void *chk_map;
+    struct bmvr_ring ring;
+    pthread_mutex_t qmu;          /* the one queue: vkQueueSubmit (both threads) and the xr calls that may use it (XR thread) */
+    pthread_mutex_t stat_mu;      /* the transport's queue-lock wait statistics */
+    double lw_sum_ms, lw_max_ms;
+    uint64_t lw_n;
+    pthread_t thr;
+    int thr_started;
+    atomic_int stop;              /* set by bmvr_xr_sink_close, polled by the XR thread */
+    atomic_int dead;              /* set (release) by the XR thread after `why` is written; read (acquire) by the transport thread */
+    char why[200];
+    int stuck;                    /* the transport queue is blocked behind a semaphore wait the game never signalled: only a new helper helps */
+};
+
+static int sk_done_fn(void *ctx, int slot)
+{
+    struct bmvr_xr_sink *k = ctx;
+    return vkGetFenceStatus_(k->st.c.dev, k->tfence[slot]) == VK_SUCCESS;
+}
+
+static void sk_qlock(struct bmvr_xr_sink *k) { pthread_mutex_lock(&k->qmu); }
+static void sk_qunlock(struct bmvr_xr_sink *k) { pthread_mutex_unlock(&k->qmu); }
+
+/* One image of the pair size on the runtime's device. exportable: opaque-fd memory the game imports (dedicated allocation, like the
+ * helper's own shared images); otherwise plain device-local memory. */
+static int sk_make_image(struct bmvr_xr_sink *k, int exportable, VkImageUsageFlags usage, VkImage *img, VkDeviceMemory *mem, VkDeviceSize *size)
+{
+    struct st *s = &k->st;
+    VkDevice d = s->c.dev;
+    VkExternalMemoryImageCreateInfo emi = { .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO, .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT };
+    VkImageCreateInfo ii = { .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .pNext = exportable ? &emi : NULL, .imageType = VK_IMAGE_TYPE_2D,
+        .format = VK_FORMAT_R8G8B8A8_UNORM, .extent = { s->w, s->h, 1 }, .mipLevels = 1, .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT,
+        .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = usage, .sharingMode = VK_SHARING_MODE_EXCLUSIVE, .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED };
+    if (vkCreateImage_(d, &ii, NULL, img) != VK_SUCCESS) return 0;
+    VkMemoryDedicatedRequirements ded = { .sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS };
+    VkMemoryRequirements2 mr = { .sType = VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2, .pNext = &ded };
+    VkImageMemoryRequirementsInfo2 mri = { .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2, .image = *img };
+    vkGetImageMemoryRequirements2_(d, &mri, &mr);
+    int mt = find_mem_type(&k->st.mp, mr.memoryRequirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (mt < 0) return 0;
+    VkMemoryDedicatedAllocateInfo da = { .sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO, .image = *img };
+    VkExportMemoryAllocateInfo ema = { .sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO, .pNext = &da, .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT };
+    const void *chain = exportable ? (const void *)&ema : (ded.requiresDedicatedAllocation ? (const void *)&da : NULL);
+    VkMemoryAllocateInfo ai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = chain, .allocationSize = mr.memoryRequirements.size, .memoryTypeIndex = (uint32_t)mt };
+    if (vkAllocateMemory_(d, &ai, NULL, mem) != VK_SUCCESS) return 0;
+    if (vkBindImageMemory_(d, *img, *mem, 0) != VK_SUCCESS) return 0;
+    if (size) *size = ai.allocationSize;
+    return 1;
+}
+
+static int sk_make_gpu_objects(struct bmvr_xr_sink *k)
+{
+    struct st *s = &k->st;
+    VkDevice d = s->c.dev;
+    VkResult vr;
+
+    /* exportable shared images: the pair the game writes, in the helper's own hello format (R8G8B8A8_UNORM) */
+    VkPhysicalDeviceExternalImageFormatInfo ext = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO, .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT };
+    VkPhysicalDeviceImageFormatInfo2 fi = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2, .pNext = &ext, .format = VK_FORMAT_R8G8B8A8_UNORM,
+        .type = VK_IMAGE_TYPE_2D, .tiling = VK_IMAGE_TILING_OPTIMAL,
+        .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT };
+    VkExternalImageFormatProperties efp = { .sType = VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES };
+    VkImageFormatProperties2 fp = { .sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2, .pNext = &efp };
+    vr = vkGetPhysicalDeviceImageFormatProperties2_(s->c.phys, &fi, &fp);
+    int exportable = vr == VK_SUCCESS && (efp.externalMemoryProperties.externalMemoryFeatures & VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT);
+    ledger("shared image export", exportable, 1, exportable ? "RGBA8 optimal-tiling image with opaque-fd export is supported on the runtime's GPU" :
+           "the runtime's GPU cannot export an RGBA8 optimal-tiling image as an opaque fd (VkResult %d)", (int)vr);
+    if (!exportable) return 1;
+
+    int sem_exp = 0, sem_imp = 0;
+    if (s->has_semfd) {
+        VkPhysicalDeviceExternalSemaphoreInfo esi = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_SEMAPHORE_INFO, .handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT };
+        VkExternalSemaphoreProperties esp = { .sType = VK_STRUCTURE_TYPE_EXTERNAL_SEMAPHORE_PROPERTIES };
+        vkGetPhysicalDeviceExternalSemaphoreProperties_(s->c.phys, &esi, &esp);
+        sem_exp = !!(esp.externalSemaphoreFeatures & VK_EXTERNAL_SEMAPHORE_FEATURE_EXPORTABLE_BIT);
+        sem_imp = !!(esp.externalSemaphoreFeatures & VK_EXTERNAL_SEMAPHORE_FEATURE_IMPORTABLE_BIT);
+    }
+    vkGetMemoryFdKHR_ = (PFN_vkGetMemoryFdKHR)vkGetDeviceProcAddr_(s->c.dev, "vkGetMemoryFdKHR");
+    vkGetSemaphoreFdKHR_ = (PFN_vkGetSemaphoreFdKHR)vkGetDeviceProcAddr_(s->c.dev, "vkGetSemaphoreFdKHR");
+    if (!vkGetMemoryFdKHR_) { ledger("vkGetMemoryFdKHR", 0, 1, "missing although VK_KHR_external_memory_fd was enabled"); return 1; }
+    k->sem_ok = s->has_semfd && sem_exp && sem_imp && vkGetSemaphoreFdKHR_ != NULL && !k->sem_ok /* sem_ok holds "--no-semaphores" on entry */;
+    ledger("GPU semaphores for the game", k->sem_ok, 0, k->sem_ok ? "opaque-fd semaphores exportable and importable (the game may use sync=sem)" :
+           "not offered (extension %d, exportable %d, importable %d, or --no-semaphores): the game falls back to glFinish + ack", s->has_semfd, sem_exp, sem_imp);
+
+    VkCommandPoolCreateInfo pci = { .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, .queueFamilyIndex = s->qfam };
+    if (vkCreateCommandPool_(d, &pci, NULL, &k->tpool) != VK_SUCCESS || vkCreateCommandPool_(d, &pci, NULL, &k->xpool) != VK_SUCCESS) { ledger("command pools", 0, 1, "vkCreateCommandPool failed"); return 1; }
+    VkCommandBufferAllocateInfo cai = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = k->tpool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = BMVR_RING_SLOTS };
+    if (vkAllocateCommandBuffers_(d, &cai, k->tcb) != VK_SUCCESS) { ledger("command buffers", 0, 1, "vkAllocateCommandBuffers (transport) failed"); return 1; }
+    cai.commandPool = k->xpool;
+    cai.commandBufferCount = SK_XFRAMES;
+    if (vkAllocateCommandBuffers_(d, &cai, k->xcb) != VK_SUCCESS) { ledger("command buffers", 0, 1, "vkAllocateCommandBuffers (XR) failed"); return 1; }
+    for (int i = 0; i < BMVR_RING_SLOTS; i++) { /* signalled at creation: a free slot's fence is always signalled */
+        VkFenceCreateInfo f = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, .flags = VK_FENCE_CREATE_SIGNALED_BIT };
+        if (vkCreateFence_(d, &f, NULL, &k->tfence[i]) != VK_SUCCESS) { ledger("fences", 0, 1, "vkCreateFence failed"); return 1; }
+    }
+    VkFenceCreateInfo f0 = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+    if (vkCreateFence_(d, &f0, NULL, &k->drop_fence) != VK_SUCCESS) { ledger("fences", 0, 1, "vkCreateFence failed"); return 1; }
+    for (int i = 0; i < SK_XFRAMES; i++) if (vkCreateFence_(d, &f0, NULL, &k->xfence[i]) != VK_SUCCESS) { ledger("fences", 0, 1, "vkCreateFence failed"); return 1; }
+
+    const VkImageUsageFlags shared_usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    for (int e = 0; e < k->eyes; e++) {
+        VkDeviceSize sz = 0;
+        if (!sk_make_image(k, 1, shared_usage, &k->shared[e], &k->shared_mem[e], &sz)) { ledger("shared images", 0, 1, "creating the exportable image of eye %d failed", e); return 1; }
+        if (e > 0 && sz != k->mem_size) { ledger("shared images", 0, 1, "eye %d needs %llu bytes but eye 0 needs %llu: the hello carries one size", e, (unsigned long long)sz, (unsigned long long)k->mem_size); return 1; }
+        k->mem_size = sz;
+    }
+    for (int i = 0; i < BMVR_RING_SLOTS; i++)
+        for (int e = 0; e < k->eyes; e++)
+            if (!sk_make_image(k, 0, VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, &k->slot_img[i][e], &k->slot_mem[i][e], NULL)) {
+                ledger("ring images", 0, 1, "creating ring slot %d eye %d failed (out of GPU memory at %ux%u?)", i, e, s->w, s->h); return 1;
+            }
+    if (k->check_left > 0 && !st_buffer(s, SK_CHK_BYTES, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &k->chk_buf, &k->chk_mem, &k->chk_map)) { ledger("check buffer", 0, 1, "could not create the readback buffer"); return 1; }
+
+    /* One-time UNDEFINED -> GENERAL for every image; they stay in GENERAL (the other API writes the shared ones, and a layout change
+     * from UNDEFINED later could discard the contents). */
+    VkCommandBuffer cb = k->tcb[0];
+    VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
+    vkBeginCommandBuffer_(cb, &bi);
+    VkImageMemoryBarrier b[2 + 2 * BMVR_RING_SLOTS];
+    uint32_t nb = 0;
+    for (int e = 0; e < k->eyes; e++) b[nb++] = st_img_barrier(k->shared[e], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+    for (int i = 0; i < BMVR_RING_SLOTS; i++)
+        for (int e = 0; e < k->eyes; e++) b[nb++] = st_img_barrier(k->slot_img[i][e], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+    vkCmdPipelineBarrier_(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0, NULL, nb, b);
+    vkEndCommandBuffer_(cb);
+    VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cb };
+    vkResetFences_(d, 1, &k->tfence[0]);
+    if (vkQueueSubmit_(s->queue, 1, &si, k->tfence[0]) != VK_SUCCESS || vkWaitForFences_(d, 1, &k->tfence[0], VK_TRUE, 5000000000ull) != VK_SUCCESS) {
+        ledger("image layout setup", 0, 1, "the one-time transition to GENERAL failed"); return 1;
+    }
+    ledger("shared images and ring", 1, 1, "%d shared + %d ring images of %ux%u R8G8B8A8_UNORM (%llu MB each), memory %llu bytes per shared image", k->eyes, BMVR_RING_SLOTS * k->eyes,
+           s->w, s->h, (unsigned long long)((uint64_t)s->w * s->h * 4 >> 20), (unsigned long long)k->mem_size);
+    return 0;
+}
+
+/* Wait (bounded) until every submission of the transport thread has finished. 1 = drained, 0 = timed out (stuck behind a semaphore). */
+static int sk_drain(struct bmvr_xr_sink *k, uint64_t timeout_ns)
+{
+    VkDevice d = k->st.c.dev;
+    VkFence f[BMVR_RING_SLOTS + 1];
+    uint32_t n = 0;
+    for (int i = 0; i < BMVR_RING_SLOTS; i++) f[n++] = k->tfence[i]; /* free slots are signalled; a SUBMITTED slot signals when its copy is done */
+    if (k->drop_pending) f[n++] = k->drop_fence;
+    VkResult r = vkWaitForFences_(d, n, f, VK_TRUE, timeout_ns);
+    if (r == VK_SUCCESS) {
+        if (k->drop_pending) { vkResetFences_(d, 1, &k->drop_fence); k->drop_pending = 0; }
+        return 1;
+    }
+    return 0;
+}
+
+static void sk_destroy_sems(struct bmvr_xr_sink *k)
+{
+    if (!k->sem_active) return;
+    vkDestroySemaphore_(k->st.c.dev, k->sem_gl_ready, NULL);
+    vkDestroySemaphore_(k->st.c.dev, k->sem_vk_done, NULL);
+    k->sem_gl_ready = k->sem_vk_done = VK_NULL_HANDLE;
+    k->sem_active = 0;
+}
+
+/* ---------------------------------------------------------------- XR thread */
+/* Copy slot `slot` (eye 0) into the next swapchain image. Returns 1 on a failure (why set). */
+static int sk_show(struct bmvr_xr_sink *k, int slot, int fidx, int fresh, uint32_t tick, uint64_t seq, const char **why)
+{
+    struct st *s = &k->st;
+    VkDevice d = s->c.dev;
+    uint32_t idx = 0;
+    XrResult r = xrAcquireSwapchainImage_(s->sc[0], NULL, &idx);
+    if (XR_FAILED(r)) { *why = "xrAcquireSwapchainImage"; return 1; }
+    XrSwapchainImageWaitInfo wi = { .type = XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO, .timeout = 1000000000 };
+    r = xrWaitSwapchainImage_(s->sc[0], &wi);
+    if (XR_FAILED(r) || r == XR_TIMEOUT_EXPIRED) { *why = "xrWaitSwapchainImage"; return 1; }
+
+    if (k->xfence_used[fidx]) {
+        if (vkWaitForFences_(d, 1, &k->xfence[fidx], VK_TRUE, 2000000000ull) != VK_SUCCESS) { *why = "vkWaitForFences (previous use of this command buffer)"; return 1; }
+        k->xfence_used[fidx] = 0;
+    }
+    vkResetFences_(d, 1, &k->xfence[fidx]);
+    VkCommandBuffer cb = k->xcb[fidx];
+    VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
+    vkResetCommandBuffer_(cb, 0);
+    vkBeginCommandBuffer_(cb, &bi);
+    VkImage dst = s->img[0][idx].image, src = k->slot_img[slot][0];
+    VkImageMemoryBarrier pre[2] = {
+        st_img_barrier(src, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT),
+        st_img_barrier(dst, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT) };
+    vkCmdPipelineBarrier_(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 2, pre);
+    VkImageCopy ic = { .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, .extent = { s->w, s->h, 1 } };
+    vkCmdCopyImage_(cb, src, VK_IMAGE_LAYOUT_GENERAL, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &ic);
+
+    int check = fresh && k->check_left > 0;
+    int check_sc = check && s->usage_src;
+    if (check) { /* a few pixels of every stage, to see what really arrived: swapchain image, ring eye 0, ring eye 1 */
+        VkBufferImageCopy row = { .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, .imageExtent = { 16, 1, 1 } };
+        if (check_sc) {
+            VkImageMemoryBarrier t = st_img_barrier(dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+            vkCmdPipelineBarrier_(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &t);
+            row.bufferOffset = 0;
+            vkCmdCopyImageToBuffer_(cb, dst, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, k->chk_buf, 1, &row);
+            VkImageMemoryBarrier t2 = st_img_barrier(dst, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+            vkCmdPipelineBarrier_(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &t2);
+        }
+        for (int e = 0; e < k->eyes; e++) {
+            row.bufferOffset = 64 * (1 + e);
+            vkCmdCopyImageToBuffer_(cb, k->slot_img[slot][e], VK_IMAGE_LAYOUT_GENERAL, k->chk_buf, 1, &row);
+        }
+        VkBufferMemoryBarrier bm = { .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT, .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .buffer = k->chk_buf, .size = VK_WHOLE_SIZE };
+        vkCmdPipelineBarrier_(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 0, NULL, 1, &bm, 0, NULL);
+    }
+    VkImageMemoryBarrier post = st_img_barrier(dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+    vkCmdPipelineBarrier_(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0, NULL, 1, &post);
+    vkEndCommandBuffer_(cb);
+
+    VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cb };
+    sk_qlock(k);
+    VkResult vr = vkQueueSubmit_(s->queue, 1, &si, k->xfence[fidx]);
+    sk_qunlock(k);
+    if (vr != VK_SUCCESS) { *why = "vkQueueSubmit"; return 1; }
+    k->xfence_used[fidx] = 1;
+    sk_qlock(k);
+    r = xrReleaseSwapchainImage_(s->sc[0], NULL);
+    sk_qunlock(k);
+    if (XR_FAILED(r)) { *why = "xrReleaseSwapchainImage"; return 1; }
+
+    if (check) {
+        if (vkWaitForFences_(d, 1, &k->xfence[fidx], VK_TRUE, 5000000000ull) != VK_SUCCESS) { *why = "vkWaitForFences (readback)"; return 1; }
+        k->xfence_used[fidx] = 0;
+        const uint8_t *m = k->chk_map;
+        char line[400];
+        int n = snprintf(line, sizeof line, "check: pair tick %u (arrival #%llu, ring slot %d):", tick, (unsigned long long)seq, slot);
+        if (check_sc) n += snprintf(line + n, sizeof line - (size_t)n, " swapchain px0=%02x%02x%02x%02x px15=%02x%02x%02x%02x;", m[0], m[1], m[2], m[3], m[60], m[61], m[62], m[63]);
+        else n += snprintf(line + n, sizeof line - (size_t)n, " swapchain n/a (runtime refused TRANSFER_SRC);");
+        for (int e = 0; e < k->eyes; e++) {
+            const uint8_t *q = m + 64 * (1 + e);
+            n += snprintf(line + n, sizeof line - (size_t)n, " ring eye%d px0=%02x%02x%02x%02x px15=%02x%02x%02x%02x;", e, q[0], q[1], q[2], q[3], q[60], q[61], q[62], q[63]);
+        }
+        XLOG("%s", line);
+        k->check_left--;
+    }
+    return 0;
+}
+
+static void sk_fail(struct bmvr_xr_sink *k, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+static void sk_fail(struct bmvr_xr_sink *k, const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(k->why, sizeof k->why, fmt, ap);
+    va_end(ap);
+}
+
+static void *sk_thread(void *arg)
+{
+    struct bmvr_xr_sink *k = arg;
+    struct st *s = &k->st;
+    struct ctx *c = &s->c;
+    uint64_t frame_no = 0;
+    int last_fidx = -1;
+    double win_start = now_ms();
+    uint64_t xr_frames = 0, empty_frames = 0;
+
+    while (!atomic_load_explicit(&k->stop, memory_order_acquire)) {
+        if (st_events(s, NULL)) { sk_fail(k, "the OpenXR runtime ended the session (state %s)", session_state_name(s->state)); break; }
+        if (!s->running) { struct timespec nap = { 0, 5 * 1000 * 1000 }; nanosleep(&nap, NULL); continue; }
+
+        XrFrameState fs = { .type = XR_TYPE_FRAME_STATE };
+        XrResult r = xrWaitFrame_(c->sess, NULL, &fs);
+        if (XR_FAILED(r)) { sk_fail(k, "xrWaitFrame: %s", xr_rs(c->inst, r)); break; }
+        if (last_fidx >= 0) { /* the GPU must be done with the slot of the previous frame before the ring may hand it out again (ring contract) */
+            if (vkWaitForFences_(c->dev, 1, &k->xfence[last_fidx], VK_TRUE, 2000000000ull) != VK_SUCCESS) { sk_fail(k, "the GPU did not finish the previous frame's copy within 2 s"); break; }
+            k->xfence_used[last_fidx] = 0;
+            last_fidx = -1;
+        }
+        sk_qlock(k);
+        r = xrBeginFrame_(c->sess, NULL);
+        sk_qunlock(k);
+        if (XR_FAILED(r)) { sk_fail(k, "xrBeginFrame: %s", xr_rs(c->inst, r)); break; }
+        xr_frames++;
+
+        XrCompositionLayerQuad quad;
+        const XrCompositionLayerBaseHeader *layers[1];
+        uint32_t nlayers = 0;
+        if (fs.shouldRender) {
+            uint32_t tick = 0; uint64_t seq = 0; int fresh = 0;
+            int slot = bmvr_ring_pick(&k->ring, sk_done_fn, k, &tick, &seq, &fresh);
+            if (slot >= 0) {
+                int fidx = (int)(frame_no % SK_XFRAMES);
+                const char *why = "";
+                if (sk_show(k, slot, fidx, fresh, tick, seq, &why)) { sk_fail(k, "showing a pair failed: %s", why); break; }
+                if (k->xfence_used[fidx]) last_fidx = fidx;
+                frame_no++;
+                XrRect2Di rect = { { 0, 0 }, { (int32_t)s->w, (int32_t)s->h } };
+                quad = (XrCompositionLayerQuad){ .type = XR_TYPE_COMPOSITION_LAYER_QUAD, .layerFlags = 0, .space = s->view_space, .eyeVisibility = XR_EYE_VISIBILITY_BOTH,
+                    .subImage = { .swapchain = s->sc[0], .imageRect = rect, .imageArrayIndex = 0 },
+                    .pose = { .orientation = { 0, 0, 0, 1 }, .position = { 0, 0, -2.0f } }, .size = { 1.6f * (float)s->w / (float)s->h, 1.6f } };
+                layers[nlayers++] = (const XrCompositionLayerBaseHeader *)&quad;
+            } else {
+                empty_frames++; /* no pair has completed yet: show nothing */
+            }
+        }
+        XrFrameEndInfo ei = { .type = XR_TYPE_FRAME_END_INFO, .displayTime = fs.predictedDisplayTime, .environmentBlendMode = s->blend, .layerCount = nlayers, .layers = nlayers ? layers : NULL };
+        sk_qlock(k);
+        r = xrEndFrame_(c->sess, &ei);
+        sk_qunlock(k);
+        if (XR_FAILED(r)) { sk_fail(k, "xrEndFrame: %s", xr_rs(c->inst, r)); break; }
+
+        double now = now_ms();
+        if (now - win_start >= 5000.0) {
+            double secs = (now - win_start) / 1000.0;
+            uint64_t pairs, disp, reused, dropped;
+            bmvr_ring_take_counters(&k->ring, &pairs, &disp, &reused, &dropped);
+            pthread_mutex_lock(&k->stat_mu);
+            double lw_avg = k->lw_n ? k->lw_sum_ms / (double)k->lw_n : 0, lw_max = k->lw_max_ms;
+            k->lw_sum_ms = k->lw_max_ms = 0; k->lw_n = 0;
+            pthread_mutex_unlock(&k->stat_mu);
+            XLOG("xr-sink: pairs=%.1f/s displayed=%.1f/s reused=%.1f/s dropped=%.1f/s empty=%.1f/s | xr frames %.1f/s | queue lock wait (transport) avg %.3f max %.3f ms | window %.1f s",
+                 (double)pairs / secs, (double)disp / secs, (double)reused / secs, (double)dropped / secs, (double)empty_frames / secs, (double)xr_frames / secs, lw_avg, lw_max, secs);
+            win_start = now; xr_frames = 0; empty_frames = 0;
+        }
+    }
+
+    /* Leave properly: request exit and keep the frame loop alive with empty frames until the runtime says STOPPING. */
+    if (s->running) {
+        xrRequestExitSession_(c->sess);
+        double t0 = now_ms();
+        while (s->running && now_ms() - t0 < 3000) {
+            XrFrameState fs = { .type = XR_TYPE_FRAME_STATE };
+            if (XR_SUCCEEDED(xrWaitFrame_(c->sess, NULL, &fs)) && XR_SUCCEEDED(xrBeginFrame_(c->sess, NULL))) {
+                XrFrameEndInfo ei = { .type = XR_TYPE_FRAME_END_INFO, .displayTime = fs.predictedDisplayTime, .environmentBlendMode = s->blend };
+                xrEndFrame_(c->sess, &ei);
+            }
+            st_events(s, NULL);
+        }
+    }
+    atomic_store_explicit(&k->dead, 1, memory_order_release);
+    return NULL;
+}
+
+/* ---------------------------------------------------------------- open / close */
+void bmvr_xr_sink_info(const struct bmvr_xr_sink *k, struct bmvr_xr_sink_info *info)
+{
+    info->width = k->st.w;
+    info->height = k->st.h;
+    info->memory_size = (uint64_t)k->mem_size;
+    info->eyes = k->eyes;
+    info->semaphores = k->sem_ok;
+}
+
+static void sk_destroy(struct bmvr_xr_sink *k)
+{
+    struct st *s = &k->st;
+    VkDevice d = s->c.dev;
+    if (d && !k->stuck && vkDeviceWaitIdle_) {
+        vkDeviceWaitIdle_(d);
+        sk_destroy_sems(k);
+        for (int i = 0; i < BMVR_RING_SLOTS; i++) {
+            if (k->tfence[i]) vkDestroyFence_(d, k->tfence[i], NULL);
+            for (int e = 0; e < 2; e++) {
+                if (k->slot_img[i][e]) vkDestroyImage_(d, k->slot_img[i][e], NULL);
+                if (k->slot_mem[i][e]) vkFreeMemory_(d, k->slot_mem[i][e], NULL);
+            }
+        }
+        for (int e = 0; e < 2; e++) {
+            if (k->shared[e]) vkDestroyImage_(d, k->shared[e], NULL);
+            if (k->shared_mem[e]) vkFreeMemory_(d, k->shared_mem[e], NULL);
+        }
+        if (k->drop_fence) vkDestroyFence_(d, k->drop_fence, NULL);
+        for (int i = 0; i < SK_XFRAMES; i++) if (k->xfence[i]) vkDestroyFence_(d, k->xfence[i], NULL);
+        if (k->tpool) vkDestroyCommandPool_(d, k->tpool, NULL);
+        if (k->xpool) vkDestroyCommandPool_(d, k->xpool, NULL);
+        if (k->chk_buf) vkDestroyBuffer_(d, k->chk_buf, NULL);
+        if (k->chk_mem) vkFreeMemory_(d, k->chk_mem, NULL);
+        st_close(s);
+    } else if (k->stuck) {
+        XLOG("not destroying the Vulkan objects: the transport queue is stuck behind a semaphore wait (the process is about to exit)");
+    } else {
+        st_close(s);
+    }
+}
+
+int bmvr_xr_sink_open(const struct bmvr_xr_sink_opts *o, struct bmvr_xr_sink **out)
+{
+    *out = NULL;
+    struct bmvr_xr_sink *k = calloc(1, sizeof *k);
+    if (!k) return BMVR_XR_PROBE_FAILED;
+    struct st *s = &k->st;
+    g_ledger_n = 0;
+    k->eyes = o->eyes == 2 ? 2 : 1;
+    k->sem_ok = o->no_semaphores; /* temporarily "--no-semaphores"; sk_make_gpu_objects turns it into the real answer */
+    k->check_left = o->check_pairs > 0 ? o->check_pairs : 0;
+    s->want_src = k->check_left > 0;
+    pthread_mutex_init(&k->qmu, NULL);
+    pthread_mutex_init(&k->stat_mu, NULL);
+    bmvr_ring_init(&k->ring);
+
+    int unavailable = 0, failed = st_open(s, o->width, o->height, 1, &unavailable);
+    if (!failed && !unavailable) {
+        VkPhysicalDeviceIDProperties idp = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES };
+        VkPhysicalDeviceProperties2 pp = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &idp };
+        vkGetPhysicalDeviceProperties2_(s->c.phys, &pp);
+        print_uuid("runtime-chosen GPU device UUID (the shim logs the GL one; they must match): ", idp.deviceUUID);
+        failed = st_make_swapchains(s, 1);
+    }
+    if (!failed && !unavailable) failed = sk_make_gpu_objects(k);
+    if (!failed && !unavailable) {
+        int ready = 0, ended = 0;
+        int wait_ms = o->wait_ready_ms > 0 ? o->wait_ready_ms : 10000;
+        double t0 = now_ms();
+        while (!s->running && !ended && now_ms() - t0 < wait_ms && !(o->abort_flag && *o->abort_flag)) {
+            ended = st_events(s, &ready);
+            if (!s->running) { struct timespec nap = { 0, 20 * 1000 * 1000 }; nanosleep(&nap, NULL); }
+        }
+        ledger("session reaches READY", ready, 1, ready ? "yes" : "not within %d ms (is the headset active in SteamVR / is Monado running with a compositor?)", wait_ms);
+        if (!s->running) failed = 1;
+    }
+    if (!failed && !unavailable) {
+        if (pthread_create(&k->thr, NULL, sk_thread, k) != 0) { ledger("XR thread", 0, 1, "pthread_create failed"); failed = 1; }
+        else k->thr_started = 1;
+    }
+    if (failed || unavailable) {
+        atomic_store(&k->stop, 1);
+        sk_destroy(k);
+        bmvr_ring_destroy(&k->ring);
+        free(k);
+        if (unavailable) { XLOG("--sink xr: UNAVAILABLE (no loader, no runtime, or no headset system): refusing to fall back to snapshots"); return BMVR_XR_PROBE_UNAVAILABLE; }
+        XLOG("--sink xr: FAILED (see the FAIL line above): refusing to fall back to snapshots");
+        return BMVR_XR_PROBE_FAILED;
+    }
+    XLOG("--sink xr: ready. %d eye(s) of %ux%u, %s. Quad layer (eye 0), head-locked 2 m ahead.", k->eyes, s->w, s->h, k->sem_ok ? "GPU semaphores offered" : "no semaphores (glFinish + ack)");
+    *out = k;
+    return BMVR_XR_PROBE_OK;
+}
+
+int bmvr_xr_sink_alive(const struct bmvr_xr_sink *k, char *why, size_t why_size)
+{
+    if (!atomic_load_explicit(&((struct bmvr_xr_sink *)k)->dead, memory_order_acquire)) return 1;
+    if (why && why_size) snprintf(why, why_size, "%s", k->why[0] ? k->why : "the XR thread ended");
+    return 0;
+}
+
+void bmvr_xr_sink_close(struct bmvr_xr_sink *k)
+{
+    if (!k) return;
+    atomic_store_explicit(&k->stop, 1, memory_order_release);
+    if (k->thr_started) pthread_join(k->thr, NULL);
+    sk_drain(k, 2000000000ull) || (k->stuck = 1);
+    sk_destroy(k);
+    bmvr_ring_destroy(&k->ring);
+    pthread_mutex_destroy(&k->qmu);
+    pthread_mutex_destroy(&k->stat_mu);
+    free(k);
+}
+
+/* ---------------------------------------------------------------- transport side */
+int bmvr_xr_sink_client_begin(struct bmvr_xr_sink *k, int fds[4], int *nfds)
+{
+    VkDevice d = k->st.c.dev;
+    *nfds = 0;
+    if (k->stuck) return -1;
+    if (!sk_drain(k, 3000000000ull)) { k->stuck = 1; XLOG("transport queue still busy 3 s after the previous game left: stuck behind a semaphore the game never signalled. Restart this helper."); return -1; }
+    sk_destroy_sems(k);
+    for (int e = 0; e < k->eyes; e++) {
+        VkMemoryGetFdInfoKHR gi = { .sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR, .memory = k->shared_mem[e], .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT };
+        if (vkGetMemoryFdKHR_(d, &gi, &fds[*nfds]) != VK_SUCCESS) { while (*nfds > 0) close(fds[--*nfds]); return -1; }
+        (*nfds)++;
+    }
+    if (k->sem_ok) { /* fresh semaphores per client: a previous game may have left one signalled. ONE pair serves both eyes. */
+        VkExportSemaphoreCreateInfo ex = { .sType = VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO, .handleTypes = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT };
+        VkSemaphoreCreateInfo sci = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, .pNext = &ex };
+        if (vkCreateSemaphore_(d, &sci, NULL, &k->sem_gl_ready) != VK_SUCCESS || vkCreateSemaphore_(d, &sci, NULL, &k->sem_vk_done) != VK_SUCCESS) { while (*nfds > 0) close(fds[--*nfds]); return -1; }
+        k->sem_active = 1;
+        VkSemaphore both[2] = { k->sem_gl_ready, k->sem_vk_done };
+        for (int i = 0; i < 2; i++) {
+            VkSemaphoreGetFdInfoKHR gi = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR, .semaphore = both[i], .handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT };
+            if (vkGetSemaphoreFdKHR_(d, &gi, &fds[*nfds]) != VK_SUCCESS) { while (*nfds > 0) close(fds[--*nfds]); return -1; }
+            (*nfds)++;
+        }
+    }
+    return 0;
+}
+
+void bmvr_xr_sink_client_end(struct bmvr_xr_sink *k)
+{
+    if (k->stuck) return;
+    if (!sk_drain(k, 3000000000ull)) { k->stuck = 1; XLOG("the game left with a pair that never completed (it never signalled gl_ready?): the transport queue is stuck; restart this helper before the next game"); }
+}
+
+static void sk_record_copy(struct bmvr_xr_sink *k, VkCommandBuffer cb, int slot, int eyes)
+{
+    VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
+    vkResetCommandBuffer_(cb, 0);
+    vkBeginCommandBuffer_(cb, &bi);
+    VkImageMemoryBarrier pre[4];
+    uint32_t n = 0;
+    for (int e = 0; e < eyes; e++) pre[n++] = st_img_barrier(k->shared[e], VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    for (int e = 0; e < eyes; e++) pre[n++] = st_img_barrier(k->slot_img[slot][e], VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_MEMORY_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+    vkCmdPipelineBarrier_(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, n, pre);
+    VkImageCopy ic = { .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, .extent = { k->st.w, k->st.h, 1 } };
+    for (int e = 0; e < eyes; e++) vkCmdCopyImage_(cb, k->shared[e], VK_IMAGE_LAYOUT_GENERAL, k->slot_img[slot][e], VK_IMAGE_LAYOUT_GENERAL, 1, &ic);
+    VkImageMemoryBarrier post[2];
+    for (int e = 0; e < eyes; e++) post[e] = st_img_barrier(k->slot_img[slot][e], VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+    vkCmdPipelineBarrier_(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0, NULL, (uint32_t)eyes, post);
+    vkEndCommandBuffer_(cb);
+}
+
+int bmvr_xr_sink_pair(struct bmvr_xr_sink *k, uint32_t tick, int eyes, int use_sem)
+{
+    VkDevice d = k->st.c.dev;
+    if (k->stuck || eyes < 1 || eyes > k->eyes) return -1;
+    if (use_sem && !k->sem_active) return -1;
+
+    int slot = bmvr_ring_begin_write(&k->ring, sk_done_fn, k);
+    VkFence fence = VK_NULL_HANDLE;
+    VkCommandBuffer cb = VK_NULL_HANDLE;
+    if (slot >= 0) {
+        fence = k->tfence[slot];
+        cb = k->tcb[slot];
+        vkResetFences_(d, 1, &fence);          /* a slot handed out by the ring has a signalled fence */
+        sk_record_copy(k, cb, slot, eyes);
+    } else if (use_sem) {                       /* ring full: no copy, but wait(gl_ready)/signal(vk_done) must still happen so the game never stalls */
+        if (k->drop_pending) {
+            if (vkWaitForFences_(d, 1, &k->drop_fence, VK_TRUE, 5000000000ull) != VK_SUCCESS) { k->stuck = 1; return -1; }
+            vkResetFences_(d, 1, &k->drop_fence);
+            k->drop_pending = 0;
+        }
+        fence = k->drop_fence;
+    } else {
+        return 0;                               /* glFinish path and no slot: nothing to submit, the pair is simply dropped (counted by the ring) */
+    }
+
+    VkPipelineStageFlags ws = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .waitSemaphoreCount = use_sem ? 1u : 0u, .pWaitSemaphores = &k->sem_gl_ready, .pWaitDstStageMask = &ws,
+        .commandBufferCount = slot >= 0 ? 1u : 0u, .pCommandBuffers = &cb,
+        .signalSemaphoreCount = use_sem ? 1u : 0u, .pSignalSemaphores = &k->sem_vk_done };
+    double t0 = now_ms();
+    sk_qlock(k);
+    double waited = now_ms() - t0;
+    VkResult vr = vkQueueSubmit_(k->st.queue, 1, &si, fence);
+    sk_qunlock(k);
+    pthread_mutex_lock(&k->stat_mu);
+    k->lw_sum_ms += waited; k->lw_n++;
+    if (waited > k->lw_max_ms) k->lw_max_ms = waited;
+    pthread_mutex_unlock(&k->stat_mu);
+    if (vr != VK_SUCCESS) {
+        XLOG("vkQueueSubmit failed (VkResult %d)", (int)vr);
+        if (slot >= 0) bmvr_ring_abort_write(&k->ring, slot);
+        return -1;
+    }
+    if (slot >= 0) bmvr_ring_end_write(&k->ring, slot, tick);
+    else k->drop_pending = 1;
+
+    if (!use_sem && slot >= 0) { /* glFinish path: the ack means "the helper has read the shared images", so wait for the copy */
+        if (vkWaitForFences_(d, 1, &fence, VK_TRUE, 5000000000ull) != VK_SUCCESS) { XLOG("the GPU did not finish the copy within 5 s"); return -1; }
+    }
+    return 0;
 }

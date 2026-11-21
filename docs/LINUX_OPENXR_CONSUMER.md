@@ -5,8 +5,12 @@ Status: **milestone X0 (the probe) is implemented, compiled, and PASSES on two r
 author, one run). Details and limits: "X0 results" below. **Milestone X1 (`--selftest-xr`, the frame loop with a generated
 pattern) is implemented, compiled (clean with `-Wall -Wextra`, also under `gcc -fanalyzer`) and PASSES on SteamVR 2.19.4 + RTX 3080
 (author's run: 895 quad and 898 projection frames submitted, about 90 fps; the author reports seeing a blue "L" and a red "R" in
-the headset)**; see "X1 results". Not run on Monado, and the Monado test script has not been executed. X2-X4 (socket sink,
-the pair ring, the pose channel) do not exist yet. Runtime-specific claims that X0 has not settled are still marked *(verify)*.
+the headset)**; see "X1 results". The Monado X1 script has since been executed (11/11 on Monado 21.0.0 + lavapipe).
+**Milestone X2 (`--sink xr`: socket sink, pair ring, XR thread, quad layer with eye 0) is implemented, compiled clean and passes
+its stand-in tests on Monado + lavapipe (16/16, kill loop 30/30, ASan/UBSan and TSan clean) with a Vulkan stand-in for the game.
+It has NOT been run with the real game, with GPU semaphores, on SteamVR or in a headset: the milestone's own pass criterion
+("game picture visible in the headset") is not met yet.** See "X2 results". X3 and X4 (projection layer, pose channel) do not
+exist yet. Runtime-specific claims that X0 has not settled are still marked *(verify)*.
 
 Prerequisites: `docs/LINUX_PORT.md` (stages 2a-3d), `docs/LINUX_STEREO_HANDOFF.md` (protocol v4, pair atomicity),
 `docs/openxr-eye-publish.md` (the Windows pipeline and the defects this design must not repeat).
@@ -50,8 +54,9 @@ Resulting structure (C11, 64-bit, same style as the helper):
 
 ```
 linux/bmvr_xfer_helper.c      transport + --sink snapshot (today's behaviour, kept: it is what the tests use); --xr-probe entry
-linux/bmvr_xr_sink.c  (new)   OpenXR instance/session/swapchain (X0: probe); --selftest-xr frame loop (X1: single thread, written, not yet run); pair ring + XR thread (X2+: not yet)
-linux/bmvr_xr_sink.h  (new)   X0: bmvr_xr_probe(); the transport-facing interface below arrives with X2
+linux/bmvr_xr_sink.c  (new)   OpenXR instance/session/swapchain (X0: probe); --selftest-xr frame loop (X1); the socket sink: shared images, ring copies, XR thread (X2)
+linux/bmvr_xr_sink.h  (new)   bmvr_xr_probe(), bmvr_xr_selftest(), and the transport-facing interface of X2 (bmvr_xr_sink_open/_client_begin/_pair/_client_end/_close)
+linux/bmvr_pair_ring.h (new)  the 3-slot ring state machine, pure bookkeeping (no Vulkan), unit-tested with a fake GPU (tests/linux/ring_test.c)
 third_party/openxr/           ALREADY vendored (Khronos headers 1.1.60, Apache-2.0 OR MIT); the loader is dlopen'd, like the Vulkan loader
 ```
 
@@ -179,7 +184,7 @@ runtime-initialized / ... / headset presentation verified). A status is written 
 |---|---|---|---|
 | X0 | `bmvr_xr_sink` skeleton, `--xr-probe`: instance, system, view config, swapchain formats, session create/destroy, no game, no frames | Monado **and** SteamVR | Logs runtime name/version/extensions/formats on both; confirms or corrects every *(verify)* above; helper exits cleanly. **Status: implemented; Monado 21.0.0 (sandbox) PASS; SteamVR 2.19.4 + RTX 3080 PASS (author's run)** |
 | X1 | `--selftest-xr`: frame loop with a generated pattern (left tinted one way, right the other, frame counter), quad then projection | Monado sim/qwerty first, then a headset | Correct eye order; steady `xrWaitFrame` cadence; rate lines sane; no per-frame disk writes. **Status: implemented; SteamVR 2.19.4 + RTX 3080 PASS, "L" blue / "R" red seen in the headset (author's run); Monado not run** (see "X1 results") |
-| X2 | Socket sink: pair -> ring -> swapchain, quad layer, eye 0 | game + runtime | Game picture visible in the headset on each runtime; `test_kill_loop.sh -n 10`, then 30, passes with `--sink xr` (helper killed at random points: game unaffected, helper-less period shows nothing or last image, reconnect restores the picture) |
+| X2 | Socket sink: pair -> ring -> swapchain, quad layer, eye 0 | game + runtime | **Status: implemented; stand-in tests PASS on Monado + lavapipe; NOT verified with the game, semaphores, SteamVR or a headset** (see "X2 results"). Game picture visible in the headset on each runtime; `test_kill_loop.sh -n 10`, then 30, passes with `--sink xr` (helper killed at random points: game unaffected, helper-less period shows nothing or last image, reconnect restores the picture) |
 | X3 | Projection layer with a pinned pose; `target2=name:_rt_gblightdiff` | as X2 | Left and right visibly different content, correct sides, no eye ever shows a different tick than the other |
 | X4 | Protocol v5 pose channel, mock-tested (`mock_game` replays poses; new case T20+) | none (stand-ins) | Pair slots carry their own `pose_id`; stale id handled; v4 peer rejected with both versions named. Real use waits for the hook port |
 
@@ -290,6 +295,83 @@ in both eyes.
 Still open after X1: the eye assignment and counter/marker checks above (a quick look with one eye closed settles the first),
 the two startup interval spikes, Monado, a validation-layer run, the Ctrl-C path, and everything involving the game (X2 onward).
 
+## X2: `--sink xr`
+
+```
+bmvr_xfer_helper [game folder] --sink xr [--eyes 1|2] [--no-semaphores] [--xr-size WxH] [--xr-wait MS] [--xr-check N]
+```
+
+Same socket, hello, frame and ack as the snapshot sink (protocol v4 unchanged); `--sink snapshot` (default) is untouched. The
+helper opens the OpenXR runtime first, **creates the shared images and semaphores on the runtime's Vulkan device**, and only then
+listens. Image size = the runtime's recommended size unless `--xr-size`; `--size` and `--gpu` are ignored (logged). Unavailable
+runtime / no headset / session not READY in `--xr-wait` ms (default 10 s) / missing `VK_KHR_external_memory_fd`: the helper
+**exits with the reason (exit 2 unavailable, 1 failed) and does not fall back to snapshots**. `--xr-layer` other than quad is refused (X3).
+
+Data path per pair, as designed in Decision 2:
+
+1. Socket thread, per frame message: `bmvr_ring_begin_write` -> ONE queue submission `[wait gl_ready] -> copy shared eye(s) -> ring slot
+   (vkCmdCopyImage, no shader) -> [signal vk_done]` with a per-slot fence -> `bmvr_ring_end_write` -> ack. With `sync=finish` (no
+   semaphores) the ack follows after the copy's fence instead. If no slot can be had, the submission still waits/signals (no copy), so the
+   game never stalls on a full ring; the pair is counted as dropped.
+2. XR thread (pacing master): `xrWaitFrame` -> wait for the previous frame's GPU copy -> `xrBeginFrame` -> `bmvr_ring_pick` (the newest
+   complete pair) -> copy its eye 0 into the acquired swapchain image -> `xrEndFrame` with a head-locked quad (VIEW space, 2 m ahead,
+   1.6 m high). No newer pair: the same slot is copied again (`reused`). No pair ever: an empty frame. The game leaving does not stop
+   this: the last pair stays on the quad, and a reconnect restores the live picture.
+3. The ring (`linux/bmvr_pair_ring.h`): slots FREE / WRITING / SUBMITTED / READY, one mutex. A slot holds both eyes of one pair and is
+   published as a whole; the reader sees it only after the GPU fence says the whole copy finished. The slot the XR thread displays
+   is never recycled (also not by the writer, which recycles finished, superseded slots itself when it finds none free).
+4. One queue, one mutex (`qmu`) around every `vkQueueSubmit` and around `xrBeginFrame`/`xrReleaseSwapchainImage`/`xrEndFrame`
+   (the calls where a runtime may touch the application's queue, *(verify)*). The rate line reports how long the transport waited for it.
+5. Output: one line per 5 s, `xr-sink: pairs=N/s displayed=N/s reused=N/s dropped=N/s empty=N/s | xr frames N/s | queue lock wait
+   (transport) avg .. max .. ms`. No per-frame lines, no per-frame disk writes.
+
+`--xr-check N` (debug) reads back 16 pixels of the first N fresh pairs at every stage (swapchain image, ring eye 0, ring eye 1) and logs
+them. It stalls one frame per checked pair. It is what lets a test say that the bytes that arrive carry the pair's own tick.
+
+### Tests (`tests/linux`, not part of `run-tests.sh`)
+
+- `ring_test.c`: ring state machine with a fake GPU thread, five speed ratios, also under `-fsanitize=thread`: no half pair at any
+  point of a display period, a displayed slot is never rewritten, the sequence never goes backwards, a pair is fresh at most once,
+  everything accounted for. **Mutation-checked**: promoting without the GPU's `done`, and recycling the displayed slot, are both caught.
+- `xr_client.c`: a Vulkan stand-in for the shim (imports the exported memory, writes tick-coded pixels, sends frames, reconnects, reports a
+  HANG if an ack is missing for 5 s).
+- `test_xr_sink.sh [build dir] [--software] [--kill-rounds N]`: cases X2-a..g against its own headless Monado.
+
+### X2 results
+
+Monado 21.0.0 (Ubuntu 24.04 package, `SIMULATED_ENABLE=1 XRT_COMPOSITOR_NULL=1`), Mesa lavapipe, no GPU, no headset, 2026-11-21:
+
+| Check | Observed |
+|---|---|
+| Runtime unavailable | exit 2, "refusing to fall back to snapshots", no files, no socket |
+| 1 eye, 157 frames at 40/s | 157 sent, 157 acked; `--xr-check`: in all 6 checked pairs the swapchain image and the ring slot carry the message's tick |
+| 2 eyes, 156 frames | negotiated `eyes=2`; in all 6 checked pairs eye 0 and eye 1 carry the same tick (eye colours differ, so they really are two images) |
+| Game leaves | rate lines continue with `pairs=0 displayed=20/s reused=20/s`: the last pair keeps being shown |
+| Second helper, same folder | refused |
+| SIGINT | exit 0, session goes through STOPPING, socket removed |
+| `kill -9` of the helper while the game runs | **30 rounds**: the game process never hung, reconnected after every kill (31 connects, 1427 of 1455 pairs acked; the rest were in flight at a kill) |
+| Sanitizers | ASan+UBSan: 16/16 clean. TSan: found a real (formal) race on the stop/dead flags and the `why` string, fixed with C11 atomics; clean afterwards |
+| Regression | T1-T19 stand-in suite, X0 (14/14) and X1 (11/11) unchanged |
+
+Also learned: lavapipe exports the opaque-fd memory and a second process **can import it** (the cross-process image sharing works on a
+software driver); Monado's simulated HMD runs at 20 Hz (display period 50 ms), so `dropped` is high when the stand-in sends 40 pairs/s,
+as designed (newest wins).
+
+**What X2 has NOT shown** (all of these are open, and the status lines above must keep saying so):
+
+- The real game: the shim's GL import of these images and `sync=sem` / `sync=finish` against this helper. The stand-in cannot do
+  GL, and lavapipe has no semaphore export, so **the semaphore path (wait gl_ready / signal vk_done on the runtime's queue) has not
+  run at all**, not even against the stand-in.
+- SteamVR, any real GPU, a headset: nothing was seen. Monado's null compositor shows no picture; what is verified is the bytes in the
+  swapchain image, not that a runtime displayed them.
+- The single-queue rule: whether the runtime uses the application's queue in calls that are not under `qmu` (e.g.
+  `xrWaitSwapchainImage`, `xrLocateViews`) is unknown; the lock-wait numbers on a real runtime will say whether the mutex is cheap.
+- Device UUID comparison between the runtime's GPU and the shim's GL context: the helper **prints** the runtime's UUID at start;
+  the comparison needs a hello addition and is still open.
+- Performance: the copy cost at 3036x3036 per eye (the design's "~1 ms class" is still an estimate), frame pacing against a 90 Hz compositor.
+- Known limit: if a game dies after signalling nothing for a pair it already announced (never signalled `gl_ready`), the transport queue
+  stays blocked; the helper detects it (bounded waits), says so and asks for a restart (same hazard as the snapshot sink's 5 s check).
+
 ## Risks and open questions
 
 1. **Queue synchronization with the runtime** (one queue, two threads, runtime submits on it too): exact rule to confirm in X0,
@@ -311,5 +393,5 @@ the two startup interval spikes, Monado, a validation-layer run, the Ctrl-C path
 
 1. ~~Record the `_rt_gblightdiff` result in `LINUX_PORT.md`~~ (recorded as reported by the author; the snapshot numbers are still to be added).
 2. ~~X0: run on Monado and on SteamVR~~ (done, see "X0 results").
-3. ~~X1: run `--selftest-xr` on SteamVR~~ (done, see "X1 results"). **Next: X2** (socket sink: pair -> ring -> swapchain, quad layer, eye 0, with the game), then X3; X4 in parallel with the start of the hook port.
+3. ~~X1: run `--selftest-xr` on SteamVR~~ (done, see "X1 results"). X2 is implemented and stand-in tested (see "X2 results"). **Next: run X2 with the real game on SteamVR** (`--sink xr`, game with `sync=sem` and with `sync=finish`, `test_kill_loop.sh -n 10` then 30 with `--sink xr`), then X3; X4 in parallel with the start of the hook port.
 4. Only then is `docs/LINUX_PORT.md`'s plan item 3 ("hand both to a native OpenXR helper") marked done.

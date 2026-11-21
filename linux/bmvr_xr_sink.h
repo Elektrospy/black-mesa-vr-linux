@@ -9,10 +9,18 @@
  * Milestone X1: --selftest-xr. The same session, then a frame loop with a generated pattern (left blue 'L', right red 'R',
  * a frame counter), as a quad and/or a stereo projection layer. No game involved.
  *
- * The pair ring and the socket sink (X2-X4) do not exist yet.
+ * Milestone X2: the socket sink. The helper's transport (bmvr_xfer_helper.c, --sink xr) hands every pair the game delivers to
+ * this sink: the sink owns the runtime-chosen Vulkan device, the shared images and semaphores the game imports, a 3-slot
+ * pair ring (bmvr_pair_ring.h) and one XR thread that displays the newest complete pair on a head-locked quad (eye 0).
+ *
+ * The pose channel (X4) does not exist yet; X3 (projection layer) neither.
  */
 #ifndef BMVR_XR_SINK_H
 #define BMVR_XR_SINK_H
+
+#include <signal.h>
+#include <stddef.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -41,6 +49,48 @@ struct bmvr_xr_selftest_opts {
 
 /* Exit codes as for the probe: 0 PASS (frames were submitted), 1 FAILED, 2 UNAVAILABLE (nothing to test against). */
 int bmvr_xr_selftest(const struct bmvr_xr_selftest_opts *opts);
+
+/* ------------------------------------------------------------------------------------------------ X2: socket sink */
+struct bmvr_xr_sink; /* opaque */
+
+struct bmvr_xr_sink_opts {
+    int eyes;                                  /* images per pair the game may deliver: 1 or 2 */
+    int no_semaphores;                         /* do not offer GPU semaphores (the game falls back to glFinish + ack) */
+    int wait_ready_ms;                         /* how long to wait for the session to reach READY (<= 0: 10000) */
+    int width, height;                         /* eye image size; 0 = the runtime's recommended size */
+    int check_pairs;                           /* --xr-check N: read back and log a few pixels of the first N fresh pairs (debug; stalls ~1 frame each) */
+    const volatile sig_atomic_t *abort_flag;   /* optional: set by the caller's signal handler; ends the wait for READY */
+};
+
+struct bmvr_xr_sink_info {
+    uint32_t width, height;   /* the size of every shared image: offer exactly this in the hello */
+    uint64_t memory_size;     /* VkMemoryAllocateInfo::allocationSize of each shared image (the hello's memory_size) */
+    int eyes;
+    int semaphores;           /* 1: the hello may carry BMVR_XFER_CAP_SEMAPHORES */
+};
+
+/* Opens the runtime (loader, instance, runtime-chosen device, session, one swapchain), creates the shared images, the ring and the
+ * GPU objects, waits for READY and starts the XR thread. Returns BMVR_XR_PROBE_OK / _FAILED / _UNAVAILABLE (exit codes as the
+ * probe); on anything but OK nothing is left running and *out is NULL. The reason has been printed. */
+int bmvr_xr_sink_open(const struct bmvr_xr_sink_opts *opts, struct bmvr_xr_sink **out);
+void bmvr_xr_sink_info(const struct bmvr_xr_sink *k, struct bmvr_xr_sink_info *info);
+
+/* A game connected. Fills fds[] with fresh exported fds (eyes memory fds, then gl_ready and vk_done when semaphores are offered;
+ * the caller closes them after sending) and sets *nfds. Fresh semaphores per client. Returns 0, or -1 (the sink is unusable). */
+int bmvr_xr_sink_client_begin(struct bmvr_xr_sink *k, int fds[4], int *nfds);
+
+/* One complete pair is in the shared images. Submits the GPU copy into a ring slot (wait gl_ready / signal vk_done when use_sem)
+ * and returns right after vkQueueSubmit, which is what the ack promises. Without use_sem it returns after the copy finished.
+ * Returns 0, or -1 on a fatal Vulkan failure (the caller drops the game and exits with the reason). */
+int bmvr_xr_sink_pair(struct bmvr_xr_sink *k, uint32_t tick, int eyes, int use_sem);
+
+/* The game went away: wait (bounded) for our submissions to finish. The XR thread keeps showing the last pair. */
+void bmvr_xr_sink_client_end(struct bmvr_xr_sink *k);
+
+/* 0 once the XR thread has ended (the runtime ended the session, or a failure); *why then says why. */
+int bmvr_xr_sink_alive(const struct bmvr_xr_sink *k, char *why, size_t why_size);
+
+void bmvr_xr_sink_close(struct bmvr_xr_sink *k);
 
 #ifdef __cplusplus
 }

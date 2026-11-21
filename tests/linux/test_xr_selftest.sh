@@ -71,8 +71,8 @@ echo "X1-b: quad, 6 s"
 rc="$(run b --xr-layer quad --xr-seconds 6 --xr-wait 8000)"
 [[ "$rc" == 0 ]] && ok "exit 0 (PASS)" || bad "expected exit 0, got $rc"
 check_mode "$T/b.log" quad
-n="$(wc -l <"$T/b.log")"
-[[ "$n" -lt 80 ]] && ok "log is short ($n lines): no per-frame logging" || bad "log has $n lines: per-frame logging?"
+n="$(grep -c "^\[xr\]" "$T/b.log")"  # the helper's own lines only: Monado prints ~40 lines of its own at startup
+[[ "$n" -lt 80 ]] && ok "helper log is short ($n [xr] lines): no per-frame logging" || bad "helper log has $n [xr] lines: per-frame logging?"
 [[ -z "$(ls -A "$T/work")" ]] && ok "no files created in the working directory" || bad "files appeared: $(ls "$T/work")"
 grep -E 'selftest\[quad\]|swapchain|session state' "$T/b.log" | head -8 | sed 's/^/        /'
 

@@ -93,7 +93,7 @@ if ! echo '#include <vulkan/vulkan.h>' | cc -E -x c - >/dev/null 2>&1; then
 fi
 if echo '#include <vulkan/vulkan.h>' | cc $VKINC -E -x c - >/dev/null 2>&1; then
   # bmvr_xr_sink.c (stage 4a, OpenXR) needs the OpenXR headers vendored in third_party/openxr; the loader itself is dlopen'd.
-  if cc -O2 -Wall -Wextra -std=gnu11 $VKINC -I"$ROOT/third_party/openxr/include" -I"$ROOT/linux" -o "$BUILD/bmvr_xfer_helper" "$ROOT/linux/bmvr_xfer_helper.c" "$ROOT/linux/bmvr_xr_sink.c" -ldl; then
+  if cc -O2 -Wall -Wextra -std=gnu11 $VKINC -I"$ROOT/third_party/openxr/include" -I"$ROOT/linux" -o "$BUILD/bmvr_xfer_helper" "$ROOT/linux/bmvr_xfer_helper.c" "$ROOT/linux/bmvr_xr_sink.c" -pthread -ldl; then
     HELPER="$BUILD/bmvr_xfer_helper"; echo "Built $HELPER (64-bit)"
   else
     echo "WARNING: could not build the 64-bit helper (stage 2a test unavailable)." >&2
@@ -248,6 +248,7 @@ Stage 4a (OpenXR, optional, no game needed): with an OpenXR runtime running (Ste
   "$GAME/bmvr_xfer_helper" --xr-probe
 prints what the runtime offers and ends with "xr-probe: PASS / FAILED / UNAVAILABLE" (exit 0 / 1 / 2). Send me the output.
 Stage 4a X1 (headset on, no game needed): "$GAME/bmvr_xfer_helper" --selftest-xr [--xr-layer quad|projection|both] [--xr-seconds N]
+Stage 4a X2 (headset on, SteamVR active runtime, then start the game): "$GAME/bmvr_xfer_helper" --sink xr [--eyes 1|2]   (untested with the real game so far)
 shows a generated pattern: left eye BLUE with an "L", right eye RED with an "R", a frame counter on top (Ctrl-C ends it).
 Send me the output and what you saw in the headset.
 Design and milestones: docs/LINUX_OPENXR_CONSUMER.md.

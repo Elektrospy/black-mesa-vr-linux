@@ -20,6 +20,9 @@
  *
  * Usage:  bmvr_xfer_helper [game folder] [--size WxH] [--gpu N] [--snapshots N] [--eyes 1|2] [--no-semaphores]
  *         --eyes 2 (stage 3d) offers two shared images; the game uses the second only with target2 in bmvr_target.txt
+ *         bmvr_xfer_helper [game folder] --sink xr [--eyes 1|2] [--no-semaphores] [--xr-size WxH] [--xr-wait MS] [--xr-check N]
+ *         (stage 4a, X2: the game's pairs go to an OpenXR runtime (head-locked quad, eye 0) instead of snapshot files; the runtime
+ *         owns the Vulkan device, so --gpu and --size do not apply; exits with the reason if the runtime or headset is unavailable)
  *         bmvr_xfer_helper --selftest-sync [--gpu N]      (no game needed: checks semaphore sync on this GPU)
  *         bmvr_xfer_helper --selftest-xr [--xr-layer quad|projection|both] [--xr-seconds N] [--xr-wait MS] [--xr-size WxH]  (stage 4a, X1: frame loop with a
  *         generated pattern, no game needed)
@@ -33,6 +36,7 @@
 
 #include <dlfcn.h>
 #include <errno.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -629,14 +633,88 @@ static void serve(const char *gamedir, int max_snaps)
     unlink(sock_path);
 }
 
+/* ---------------------------------------------------------------- stage 4a, X2: --sink xr
+ * The transport is the same protocol (hello with fds, frame, ack); the images, semaphores and the ring live in bmvr_xr_sink.c, on
+ * the OpenXR runtime's own Vulkan device. This loop only moves messages: poll() with a timeout so that Ctrl-C and a dead XR session
+ * are noticed while the game is idle. A game that leaves does not touch the XR thread: it keeps showing the last pair. */
+static int serve_xr(const char *gamedir, struct bmvr_xr_sink *sink)
+{
+    char sock_path[sizeof(((struct sockaddr_un *)0)->sun_path) + 256];
+    snprintf(sock_path, sizeof sock_path, "%s/%s", gamedir, BMVR_XFER_SOCKET_NAME);
+    struct sockaddr_un sa = { .sun_family = AF_UNIX };
+    if (strlen(sock_path) >= sizeof sa.sun_path)
+        DIE("socket path too long for a unix socket (%zu >= %zu): %s", strlen(sock_path), sizeof sa.sun_path, sock_path);
+    strcpy(sa.sun_path, sock_path);
+    unlink(sock_path);
+    int srv = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (srv < 0 || bind(srv, (struct sockaddr *)&sa, sizeof sa) < 0 || listen(srv, 1) < 0)
+        DIE("cannot listen on %s: %s", sock_path, strerror(errno));
+
+    struct bmvr_xr_sink_info info;
+    bmvr_xr_sink_info(sink, &info);
+    g_w = info.width; g_h = info.height; g_eyes = info.eyes; g_image_mem_size = (VkDeviceSize)info.memory_size; /* what send_hello_with_fds() says */
+    LOG("listening on %s (sink xr: %ux%u, %d eye(s), sync offered: %s)", sock_path, g_w, g_h, g_eyes,
+        info.semaphores ? "GPU semaphores (the game opts in with sync=sem in bmvr_target.txt), otherwise glFinish + ack" : "glFinish + ack only");
+    LOG("now start Black Mesa from Steam (with the bmvr-run.sh launch option); its picture appears on a quad in the headset. Ctrl-C stops the helper.");
+
+    int rc = 0;
+    char why[200];
+    while (!g_stop) {
+        if (!bmvr_xr_sink_alive(sink, why, sizeof why)) { LOG("ERROR: %s", why); rc = 1; break; }
+        struct pollfd pf = { .fd = srv, .events = POLLIN };
+        int pr = poll(&pf, 1, 250);
+        if (pr < 0) { if (errno == EINTR) continue; break; }
+        if (pr == 0) continue;
+        int cl = accept(srv, NULL, NULL);
+        if (cl < 0) { if (errno == EINTR) continue; break; }
+
+        int fds[4] = { -1, -1, -1, -1 }, nfds = 0;
+        if (bmvr_xr_sink_client_begin(sink, fds, &nfds) < 0) { LOG("ERROR: could not export the shared images / semaphores for the game"); close(cl); rc = 1; break; }
+        int hello_ok = send_hello_with_fds(cl, fds, nfds, info.semaphores ? BMVR_XFER_CAP_SEMAPHORES : 0) == 0;
+        for (int i = 0; i < nfds; i++) close(fds[i]);     /* our copies; the game holds its own */
+        if (!hello_ok) { LOG("could not send the memory fd to the game"); close(cl); bmvr_xr_sink_client_end(sink); continue; }
+        LOG("game connected; %s sent (%ux%u)%s", g_eyes > 1 ? "two shared images (eye 0, eye 1)" : "shared image", g_w, g_h, info.semaphores ? ", with two GPU semaphores" : "");
+
+        int fatal = 0;
+        for (;;) {
+            struct pollfd cp = { .fd = cl, .events = POLLIN };
+            int p = poll(&cp, 1, 250);
+            if (g_stop) break;
+            if (p < 0) { if (errno == EINTR) continue; break; }
+            if (p == 0) { if (!bmvr_xr_sink_alive(sink, why, sizeof why)) break; continue; }
+            struct bmvr_xfer_frame fr;
+            if (recv_all(cl, &fr, sizeof fr) < 0) break;
+            if (fr.magic != BMVR_XFER_MAGIC_FRAME) { LOG("bad frame message, dropping the game connection"); break; }
+            if (fr.eye_count < 1 || fr.eye_count > (uint32_t)g_eyes) {
+                LOG("frame with %u eye(s) but this helper serves %d (start it with --eyes 2 for pairs); dropping the game connection", fr.eye_count, g_eyes);
+                break;
+            }
+            int use_sem = (fr.flags & BMVR_XFER_FLAG_SEMAPHORE) != 0;
+            if (use_sem && !info.semaphores) { LOG("frame wants semaphore sync but none were offered; dropping the game connection"); break; }
+            if (bmvr_xr_sink_pair(sink, fr.tick, (int)fr.eye_count, use_sem) < 0) { LOG("ERROR: the GPU copy of the pair failed; stopping"); fatal = 1; break; }
+            struct bmvr_xfer_ack ack = { .magic = BMVR_XFER_MAGIC_ACK, .status = 0 };
+            if (send(cl, &ack, sizeof ack, MSG_NOSIGNAL) != (ssize_t)sizeof ack) break;
+        }
+        close(cl);
+        bmvr_xr_sink_client_end(sink);
+        LOG("game disconnected%s", fatal ? "" : " (the headset keeps showing the last pair; a reconnect restores the live picture)");
+        if (fatal) { rc = 1; break; }
+    }
+    if (rc == 0 && !bmvr_xr_sink_alive(sink, why, sizeof why) && !g_stop) { LOG("ERROR: %s", why); rc = 1; }
+    close(srv);
+    unlink(sock_path);
+    return rc;
+}
+
 int main(int argc, char **argv)
 {
     char gamedir[900] = "";
     int want_gpu = -1, max_snaps = 5, selftest = 0, xr_probe = 0, xr_wait_ms = 10000, xr_w = 0, xr_h = 0;
-    int xr_selftest = 0, xr_layers = 3, xr_seconds = 10;
+    int xr_selftest = 0, xr_layers = 3, xr_seconds = 10, sink_xr = 0, xr_layer_given = 0, xr_check = 0, size_given = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--size") && i + 1 < argc) {
             if (sscanf(argv[++i], "%ux%u", &g_w, &g_h) != 2 || !g_w || !g_h || g_w > 8192 || g_h > 8192) DIE("bad --size, use e.g. 1920x1080");
+            size_given = 1;
         } else if (!strcmp(argv[i], "--gpu") && i + 1 < argc) {
             want_gpu = atoi(argv[++i]);
         } else if (!strcmp(argv[i], "--snapshots") && i + 1 < argc) {
@@ -654,6 +732,7 @@ int main(int argc, char **argv)
             xr_selftest = 1;
         } else if (!strcmp(argv[i], "--xr-layer") && i + 1 < argc) {
             const char *k = argv[++i];
+            xr_layer_given = 1;
             if (!strcmp(k, "quad")) xr_layers = 1;
             else if (!strcmp(k, "projection")) xr_layers = 2;
             else if (!strcmp(k, "both")) xr_layers = 3;
@@ -667,12 +746,15 @@ int main(int argc, char **argv)
             if (sscanf(argv[++i], "%dx%d", &xr_w, &xr_h) != 2 || xr_w <= 0 || xr_h <= 0) DIE("bad --xr-size, use e.g. 3840x2160");
         } else if (!strcmp(argv[i], "--sink") && i + 1 < argc) {
             const char *k = argv[++i];
-            if (!strcmp(k, "xr")) DIE("--sink xr is not implemented yet (stage 4a, milestone X2). Use --xr-probe to test the OpenXR runtime.");
-            if (strcmp(k, "snapshot")) DIE("bad --sink, use snapshot (xr: not implemented yet)");
+            if (!strcmp(k, "xr")) sink_xr = 1;
+            else if (strcmp(k, "snapshot")) DIE("bad --sink, use snapshot or xr");
+        } else if (!strcmp(argv[i], "--xr-check") && i + 1 < argc) {
+            xr_check = atoi(argv[++i]);
+            if (xr_check < 0 || xr_check > 1000) DIE("bad --xr-check, use 0..1000");
         } else if (argv[i][0] != '-' && !gamedir[0]) {
             snprintf(gamedir, sizeof gamedir, "%s", argv[i]);
         } else {
-            fprintf(stderr, "usage: %s [game folder] [--size WxH] [--gpu N] [--snapshots N] [--eyes 1|2] [--no-semaphores] [--sink snapshot] | --selftest-sync | --xr-probe [--xr-wait MS] [--xr-size WxH] | --selftest-xr [--xr-layer quad|projection|both] [--xr-seconds N] [--xr-wait MS] [--xr-size WxH]\n", argv[0]);
+            fprintf(stderr, "usage: %s [game folder] [--size WxH] [--gpu N] [--snapshots N] [--eyes 1|2] [--no-semaphores] [--sink snapshot|xr [--xr-size WxH] [--xr-wait MS] [--xr-check N]] | --selftest-sync | --xr-probe [--xr-wait MS] [--xr-size WxH] | --selftest-xr [--xr-layer quad|projection|both] [--xr-seconds N] [--xr-wait MS] [--xr-size WxH]\n", argv[0]);
             return 2;
         }
     }
@@ -704,6 +786,19 @@ int main(int argc, char **argv)
             if (holder > 0) DIE("%s (pid %ld). Stop it first (Ctrl-C in its terminal, or: kill %ld).", err, holder, holder);
             DIE("%s", err);
         }
+    }
+    if (sink_xr) { /* stage 4a X2: the runtime owns the Vulkan device; none of this file's own Vulkan setup is used */
+        if (xr_layer_given && xr_layers != 1) DIE("--sink xr supports --xr-layer quad only (the projection layer is milestone X3)");
+        if (size_given) LOG("--size is ignored with --sink xr: the images have the OpenXR runtime's recommended size (override with --xr-size WxH)");
+        if (want_gpu >= 0) LOG("--gpu is ignored with --sink xr: the OpenXR runtime chooses the GPU");
+        struct bmvr_xr_sink_opts so = { .eyes = g_eyes, .no_semaphores = g_no_sem, .wait_ready_ms = xr_wait_ms, .width = xr_w, .height = xr_h,
+                                        .check_pairs = xr_check, .abort_flag = &g_stop };
+        struct bmvr_xr_sink *sink = NULL;
+        int orc = bmvr_xr_sink_open(&so, &sink);
+        if (orc != BMVR_XR_PROBE_OK) return orc; /* 1 failed / 2 unavailable: the reason was printed; no fallback to snapshots */
+        int rc = serve_xr(gamedir, sink);
+        bmvr_xr_sink_close(sink);
+        return rc;
     }
     vulkan_init(want_gpu);
     create_shared_image();
