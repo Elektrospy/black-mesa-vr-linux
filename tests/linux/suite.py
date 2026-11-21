@@ -66,7 +66,7 @@ check('glFinish path used', len(gl(tr,'FINISH'))==nsnap(tr)>=3 and 'exit=0' in e
 
 print('T6  helper speaks the old protocol (v2)')
 log,tr,out,ex=run('t6',['--sem','--version','2'],'sync=sem\n')
-check('mismatch reported with both versions', 'bad hello from helper' in log and 'version 2, want 4' in log)
+check('mismatch reported with both versions', 'bad hello from helper' in log and 'version 2, want 5' in log)
 check('game unaffected', 'gl_state_violations=0' in out and 'exit=0' in ex and nsnap(tr)==0)
 
 print('T7  helper dies in the middle of a semaphore session')
@@ -151,7 +151,7 @@ print('T14 two eyes, sync=sem: a PAIR is one wait, two blits, ONE signal, one fr
 log,tr,out,ex=run('t14',['--sem','--eyes','2'],PAIR+'sync=sem\n')
 n=len(frames(tr))
 check('game ran clean, GL bindings preserved', 'gl_state_violations=0' in out and 'exit=0' in ex)
-check('hello offered 2 images + 2 semaphores (4 fds), protocol v4', 'HELPER hello version=4 caps=1 fds=4 eyes=2' in tr)
+check('hello offered 2 images + 2 semaphores (4 fds), protocol v5', 'HELPER hello version=5 caps=1 fds=4 eyes=2' in tr)
 check('both images imported as GL textures (2 memory imports, 2 semaphore imports)', len([l for l in tr if l.startswith('GL ImportMemoryFd')])==2 and len([l for l in tr if 'ImportSemaphoreFd' in l])==2)
 check('log names both textures', '(eye 0) and' in log and '(eye 1)' in log)
 check('pairs delivered', n>=3, str(n))
@@ -213,8 +213,8 @@ check('no GL wait / blit / signal after the helper died', bool(idx) and not [l f
 check('semaphores deleted, game kept running with clean GL state', len(gl(tr,'DeleteSemaphore'))>=2 and 'gl_state_violations=0' in out and 'exit=0' in ex)
 
 print('T18 protocol: other versions and bad eye counts are rejected, the game is unaffected')
-log,tr,out,ex=run('t18a',['--sem','--eyes','2','--version','3'],PAIR+'sync=sem\n')
-check('v3 helper vs v4 shim: both versions named', 'bad hello from helper' in log and 'version 3, want 4' in log and not frames(tr))
+log,tr,out,ex=run('t18a',['--sem','--eyes','2','--version','4'],PAIR+'sync=sem\n')
+check('v4 helper vs v5 shim: both versions named', 'bad hello from helper' in log and 'version 4, want 5' in log and not frames(tr))
 log,tr,out,ex=run('t18b',['--sem','--eyes','3'],PAIR+'sync=sem\n')
 check('eye_count 3 rejected', 'bad hello from helper' in log and not frames(tr))
 check('game unaffected', 'gl_state_violations=0' in out and 'exit=0' in ex)
@@ -235,6 +235,28 @@ check('many more pairs than with the default', n_fast >= 20 and n_fast >= 10*max
 check('every pair is still whole (2 eyes) and the game is clean', all(field(l,'eyes')=='2' for l in frames(tr)) and 'gl_state_violations=0' in out and 'exit=0' in ex)
 log,tr,out,ex=run('t20c',['--eyes','2'],PAIR+'every=0\n')
 check('every=0 rejected, default kept', 'bad every=0' in log and 'pairs delivered every 120 presents' in log and 'exit=0' in ex)
+
+
+print('T21 protocol v5 pose channel: acks carry poses, frames say which pose they were rendered with')
+log,tr,out,ex=run('t21',['--eyes','2','--poses'],PAIR+'every=2\n')
+fr=frames(tr); pids=[int(field(l,'pose')) for l in fr]
+check('helper offers poses and the shim logs the first one', 'xfer: pose channel: first pose id' in log and 'LOCAL space' in log)
+check('pairs delivered, whole, game clean', len(fr)>=20 and all(field(l,'eyes')=='2' for l in fr) and 'gl_state_violations=0' in out and 'exit=0' in ex, str(len(fr)))
+check('the first frames carry no pose (none received yet)', pids[0]==0, str(pids[:4]))
+check('later frames carry a real pose id, never 0 once poses flow', all(p>0 for p in pids[3:]), str(pids[:8]))
+check('ids never decrease', all(b>=a for a,b in zip(pids,pids[1:])), str(pids[:12]))
+check('a frame never uses a pose the helper had not sent yet (frame n has seen n acks, id <= n)', all(p<=i for i,p in enumerate(pids)), str(pids[:12]))
+check('ids advance with the acks (the shim keeps up with the newest pose)', pids[-1]>=len(pids)-3, '%d vs %d'%(pids[-1],len(pids)))
+
+print('T22 helper without the pose channel (v5 helper, no CAP_POSES): frames carry pose 0')
+log,tr,out,ex=run('t22',['--eyes','2'],PAIR+'every=2\n')
+fr=frames(tr)
+check('no pose channel logged, every frame pose 0, game clean', 'pose channel' not in log and len(fr)>=20 and all(int(field(l,'pose'))==0 for l in fr) and 'exit=0' in ex, str(len(fr)))
+
+print('T23 a single-eye game also receives and stamps poses (eye count 1)')
+log,tr,out,ex=run('t23',['--poses'],'every=2\n')
+fr=frames(tr)
+check('single-eye frames still carry the pose id', len(fr)>=20 and all(field(l,'eyes')=='1' for l in fr) and max(int(field(l,'pose')) for l in fr)>0 and 'exit=0' in ex, str(len(fr)))
 
 print()
 print('FAILED: %d'%fails if fails else 'ALL CHECKS PASSED')

@@ -130,8 +130,7 @@ Two layer modes, selectable (`--xr-layer quad|projection`):
 
 The Windows lesson (`openxr-eye-publish.md` §7a): the pose submitted with a frame must be the pose the frame was **rendered**
 with, and it travels with the frame, not read at display time. On Linux the game needs the per-eye view/projection *before*
-the engine renders, so a helper -> shim direction is required. Proposed **protocol v5** (not implemented; v4 peers keep working
-only if the helper sees no pose-capable shim, otherwise reject with both versions logged, like T18):
+the engine renders, so a helper -> shim direction is required. Proposed **protocol v5** (**implemented in X4, see "X4: the pose channel"**; a v4 peer is rejected with both versions logged, like T18):
 
 ```
 pose   (helper -> shim, new, sent ahead of need, e.g. once per xrWaitFrame):
@@ -186,7 +185,7 @@ runtime-initialized / ... / headset presentation verified). A status is written 
 | X1 | `--selftest-xr`: frame loop with a generated pattern (left tinted one way, right the other, frame counter), quad then projection | Monado sim/qwerty first, then a headset | Correct eye order; steady `xrWaitFrame` cadence; rate lines sane; no per-frame disk writes. **Status: implemented; SteamVR 2.19.4 + RTX 3080 PASS, "L" blue / "R" red seen in the headset (author's run); Monado not run** (see "X1 results") |
 | X2 | Socket sink: pair -> ring -> swapchain, quad layer, eye 0 | game + runtime | **Status: implemented; stand-in tests PASS on Monado + lavapipe; NOT verified with the game, semaphores, SteamVR or a headset** (see "X2 results"). Game picture visible in the headset on each runtime; `test_kill_loop.sh -n 10`, then 30, passes with `--sink xr` (helper killed at random points: game unaffected, helper-less period shows nothing or last image, reconnect restores the picture) |
 | X3 | Projection layer with a pinned pose; `target2=name:_rt_gblightdiff` (**implemented 2026-11-21, compiles clean, NOT run with the game/headset**: `--sink xr --eyes 2 --xr-layer projection`; two swapchains, eye 0 = left, eye 1 = right, head-locked VIEW space, runtime eye poses with pinned fallback) | as X2 | Left and right visibly different content, correct sides, no eye ever shows a different tick than the other |
-| X4 | Protocol v5 pose channel, mock-tested (`mock_game` replays poses; new case T20+) | none (stand-ins) | Pair slots carry their own `pose_id`; stale id handled; v4 peer rejected with both versions named. Real use waits for the hook port |
+| X4 | Protocol v5 pose channel, mock-tested (`mock_game` replays poses; new case T20+) | none (stand-ins) | **Status: implemented 2026-11-21; stand-in tests T21-T23 + `pose_test` PASS (native build); NOT run with the real game, SteamVR or a headset.** Pair slots carry their own `pose_id`; stale id handled; v4 peer rejected with both versions named. Real use waits for the hook port |
 
 Test additions in `tests/linux`: a stand-in for the XR side is not practical (the point is the real runtime), so X1-X3 are
 manual or runtime-assisted; X4 and the ring state machine (slot states, newest-wins, reuse-when-starved, no half pair) are unit
@@ -396,6 +395,36 @@ submission blocks the single shared VkQueue while GL is slow, stalling the XR th
 texture without glFinish; (3) SteamVR 2.19.4 beta / NVIDIA 620.73 with imported opaque-fd binary semaphores. Bisect: `sem` + extra
 `glFinish` after the signal; separate VkQueue for the transport; `journalctl -k | grep -i xid`; Vulkan validation layer on the helper.
 Use `sync=finish` for X3 until this is resolved.
+
+## X4: the pose channel (protocol v5)
+
+Implemented and stand-in tested; **not run with the game or a headset**.
+
+**Deviation from Decision 5:** there is no separate helper -> shim message. The socket stays strictly request/response (the shim only
+ever blocks in `recv` for an ack), so every **ack carries the helper's newest pose** (`struct bmvr_xfer_ack.pose`, `pose_id` 0 = none).
+Poses reach the game at the delivery rate (`every=N`), which is also the rate at which the game could use them.
+
+```
+hello.caps  BMVR_XFER_CAP_POSES (2)        helper offers poses (only --sink xr --xr-layer projection with a LOCAL space)
+ack         + struct bmvr_xfer_pose        pose_id, flags (POSE_LOCAL), display_time, eye[2]{pos[3], rot[4], fov[4]}   (112 bytes total)
+frame       + pose_id                      "this pair was rendered with pose pose_id" (96 bytes total)
+```
+
+- **Helper:** the XR thread locates both eyes in LOCAL space for every `shouldRender` frame (`xrLocateViews`, the frame's predicted
+  display time) and puts the result in the pose table (`linux/bmvr_pose_store.h`: last 32 poses by id, mutex, stale counter; no
+  Vulkan/OpenXR, unit-tested). The transport thread reads the newest for each ack. The transport records each pair's `pose_id` in
+  `slot_pose[slot]` before `bmvr_ring_end_write`; the XR thread reads it after `bmvr_ring_pick` (the ring's mutex orders the two).
+- **Layer:** pair with `pose_id` N: the projection layer uses exactly pose N's eye poses and FOVs, in LOCAL space, so the compositor
+  reprojects from where the frame was rendered. `pose_id` 0 (game without poses): head-locked as in X3. N no longer stored: no layer
+  that frame, counted (`stale=` in the rate line, shown as `poses issued=.. stale=..` when poses are on).
+- **Shim:** keeps the pose of the newest ack. `xfer_tick` latches ids one Present apart: the frame delivered now was rendered with the id
+  latched at the previous Present; the next frame starts with the newest. `bmvr_get_render_pose()` (exported) returns the newest pose for
+  the hook port; nothing calls it yet, so today the ids are real but the picture is still rendered with the game's own camera.
+- **Versions:** `BMVR_XFER_VERSION` is 5. A v4 helper/shim pair is refused by the shim's hello check with both versions in the log.
+- **Not done / open:** converting OpenXR poses to Source space and the off-centre projection (hook port); a depth layer; what the
+  compositor does with a pose that is several frames old (the pose is located at `predictedDisplayTime` of the frame it was issued on).
+- **Tests:** `tests/linux/pose_test.c` (table: ids, stale, wrap, counters, writer/reader stress, TSAN clean) and suite cases T21-T23 with
+  `mock_helper --poses` (first frames carry pose 0, ids never decrease, never ahead of what the helper sent, 2- and 1-eye games, helper without poses).
 
 ## Risks and open questions
 

@@ -16,6 +16,14 @@
  * ack, so a frame is never overwritten while the helper reads it. Stage 3a adds GPU semaphores
  * (below) as an opt-in that falls back to this when anything is missing.
  *
+ * Version 5 (stage 4a, X4): POSES. The helper (OpenXR sink) tells the game where the headset's eyes are, and the game says which
+ * pose each pair was rendered with. There is no separate helper->shim message: every ack carries the helper's NEWEST pose (struct
+ * bmvr_xfer_pose, pose_id 0 = none), so the shim never has to poll the socket and the exchange stays strictly request/response. The shim
+ * keeps the pose of the ack it last saw, uses that one for its next frame, and stamps frame.pose_id with it. The sink keeps the last 32
+ * poses by id and submits a pair with exactly the pose/FOV it was rendered with. Offered by the hello with BMVR_XFER_CAP_POSES; a helper
+ * that does not offer it sends pose_id 0 and the shim sends pose_id 0. Poses are OpenXR's own convention (right-handed, +Y up, -Z
+ * forward); converting to Source space is the game side's job (one place, with the hook port).
+ *
  * Version 4 (stage 3d): TWO EYES. A pair is the unit of publication (never one eye at a time, so the two eyes of
  * a pair always come from the same game frame). The hello says how many images the helper offers (eye_count, 1 or 2)
  * and carries one memory fd per image, then the two semaphore fds. The frame message describes both eyes; ONE
@@ -41,15 +49,17 @@
 #ifndef BMVR_XFER_H
 #define BMVR_XFER_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 #define BMVR_XFER_SOCKET_NAME "bmvr_xfer.sock"
-#define BMVR_XFER_VERSION 4u
+#define BMVR_XFER_VERSION 5u
 #define BMVR_XFER_MAGIC_HELLO 0x31564d42u /* "BMV1" */
 #define BMVR_XFER_MAGIC_FRAME 0x31524642u /* "BFR1" */
 #define BMVR_XFER_MAGIC_ACK   0x314b4341u /* "ACK1" */
 
 #define BMVR_XFER_CAP_SEMAPHORES 1u /* hello carries 3 fds: memory, gl_ready semaphore, vk_done semaphore */
+#define BMVR_XFER_CAP_POSES      2u /* v5: every ack may carry a pose (the helper submits a projection layer with game-rendered poses) */
 
 struct bmvr_xfer_hello {
     uint32_t magic;             /* BMVR_XFER_MAGIC_HELLO */
@@ -82,15 +92,38 @@ struct bmvr_xfer_frame {
     uint32_t eye1_flags;        /* BMVR_XFER_FLAG_FLIPPED / _WINDOW (SEMAPHORE is taken from `flags`) */
     uint32_t eye1_gl_name;
     char     eye1_name[24];
+    /* v5: the pose (bmvr_xfer_ack.pose.pose_id) this pair was rendered with; 0 = none / the helper offers no poses. */
+    uint32_t pose_id;
+};
+
+/* v5: where one eye is, in OpenXR's convention (right-handed, +Y up, -Z forward), relative to the pose's reference space. */
+struct bmvr_xfer_eye_pose {
+    float pos[3];               /* meters */
+    float rot[4];               /* orientation quaternion x, y, z, w */
+    float fov[4];               /* radians, XrFovf order: angleLeft, angleRight, angleUp, angleDown (left and down are negative) */
+};
+
+#define BMVR_XFER_POSE_LOCAL 1u /* the poses are in the runtime's LOCAL space (fixed in the room); otherwise VIEW (head-locked) */
+
+struct bmvr_xfer_pose {
+    uint32_t pose_id;           /* 0 = no pose; otherwise issued by the helper, increasing, wraps skipping 0 */
+    uint32_t flags;             /* BMVR_XFER_POSE_* */
+    int64_t  display_time;      /* XrTime the pose was predicted for (diagnostics; the compositor is given the frame's own time) */
+    struct bmvr_xfer_eye_pose eye[2];   /* 0 = left, 1 = right */
 };
 
 struct bmvr_xfer_ack {
     uint32_t magic;             /* BMVR_XFER_MAGIC_ACK */
     uint32_t status;            /* 0 = ok. With BMVR_XFER_FLAG_SEMAPHORE: the helper's queue submission is done */
+    struct bmvr_xfer_pose pose; /* v5: the newest pose (pose_id 0 = none yet / not offered) */
 };
 
 _Static_assert(sizeof(struct bmvr_xfer_hello) == 48, "bmvr_xfer_hello layout differs between 32/64-bit");
-_Static_assert(sizeof(struct bmvr_xfer_frame) == 92, "bmvr_xfer_frame layout");
-_Static_assert(sizeof(struct bmvr_xfer_ack) == 8, "bmvr_xfer_ack layout");
+_Static_assert(sizeof(struct bmvr_xfer_frame) == 96, "bmvr_xfer_frame layout");
+_Static_assert(sizeof(struct bmvr_xfer_eye_pose) == 44, "bmvr_xfer_eye_pose layout");
+_Static_assert(sizeof(struct bmvr_xfer_pose) == 104, "bmvr_xfer_pose layout differs between 32/64-bit");
+_Static_assert(sizeof(struct bmvr_xfer_ack) == 112, "bmvr_xfer_ack layout");
+_Static_assert(offsetof(struct bmvr_xfer_pose, display_time) == 8 && offsetof(struct bmvr_xfer_pose, eye) == 16 && offsetof(struct bmvr_xfer_ack, pose) == 8,
+               "pose offsets differ between 32/64-bit (int64 alignment)");
 
 #endif

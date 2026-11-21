@@ -416,6 +416,9 @@ static unsigned g_x_neyes = 1;               /* eyes in use on this connection (
 static unsigned g_x_rfbo;                    /* private FBO used as the blit SOURCE (attaches the target) */
 /* Stage 3a: GPU semaphores instead of glFinish. */
 static int g_sync_want;                      /* config: 0 = glFinish + ack (default, verified), 1 = GPU semaphores */
+static int g_x_poses_on;                     /* v5: the helper offers poses (its acks carry one) */
+static struct bmvr_xfer_pose g_x_pose_latest;/* the pose of the newest ack that had one (pose_id 0 = none yet) */
+static uint32_t g_x_pose_pending, g_x_pose_used;   /* pose id for the NEXT frame / for the frame being delivered now (see xfer_tick) */
 static int g_x_sem_on;                       /* semaphores imported and in use for this connection */
 static int g_x_sem_inflight;                 /* a frame was published: the next blit must first wait for vk_done */
 static unsigned g_x_sem_gl_ready, g_x_sem_vk_done;   /* GL semaphore names (imported from the helper) */
@@ -768,6 +771,7 @@ static void xfer_teardown(void)
         if (xgl.DeleteMemoryObjects && g_x_mem[e]) xgl.DeleteMemoryObjects(1, &g_x_mem[e]);
     g_x_sem_gl_ready = g_x_sem_vk_done = 0;
     g_x_sem_on = g_x_sem_inflight = 0;
+    g_x_poses_on = 0;
     for (int e = 0; e < XFER_EYES; e++) g_x_fbo[e] = g_x_tex[e] = g_x_mem[e] = 0;
     g_x_rfbo = 0;
     g_x_neyes = 1;
@@ -852,6 +856,9 @@ static int xfer_connect_and_import(void)
         close(s);
         return 0;
     }
+    g_x_poses_on = (h.caps & BMVR_XFER_CAP_POSES) != 0;   /* v5 */
+    memset(&g_x_pose_latest, 0, sizeof g_x_pose_latest);
+    g_x_pose_pending = g_x_pose_used = 0;
     /* Eye 1 is used only when asked for (target2) and offered; an unused second memory fd is closed. */
     int neyes = (offered >= 2 && g_spec2_on && g_spec[0].kind != SPEC_WINDOW) ? 2 : 1;
     bmvr_log("xfer: helper connected: shared image %ux%u, memory %llu bytes, fd %d%s", h.width, h.height,
@@ -1196,6 +1203,7 @@ static int xfer_send_frame(unsigned neyes, const struct eyeinfo *ei, unsigned se
     fr.gl_name = ei[0].gl_name;
     snprintf(fr.name, sizeof fr.name, "%.23s", name);
     fr.eye_count = neyes;
+    fr.pose_id = g_x_poses_on ? g_x_pose_used : 0;   /* v5: the pose this pair was rendered with */
     if (neyes == 2) {
         fr.eye1_src_w = ei[1].w;
         fr.eye1_src_h = ei[1].h;
@@ -1213,6 +1221,13 @@ static int xfer_send_frame(unsigned neyes, const struct eyeinfo *ei, unsigned se
         return 0;
     }
     uint64_t t2 = now_ns();
+    if (g_x_poses_on && ack.pose.pose_id) {
+        if (!g_x_pose_latest.pose_id)
+            bmvr_log("xfer: pose channel: first pose id %u (%s space), left eye at (%.3f %.3f %.3f) fov l/r/u/d %.3f %.3f %.3f %.3f rad", ack.pose.pose_id,
+                     (ack.pose.flags & BMVR_XFER_POSE_LOCAL) ? "LOCAL" : "VIEW", (double)ack.pose.eye[0].pos[0], (double)ack.pose.eye[0].pos[1], (double)ack.pose.eye[0].pos[2],
+                     (double)ack.pose.eye[0].fov[0], (double)ack.pose.eye[0].fov[1], (double)ack.pose.eye[0].fov[2], (double)ack.pose.eye[0].fov[3]);
+        g_x_pose_latest = ack.pose;
+    }
     if (flags & BMVR_XFER_FLAG_SEMAPHORE) g_x_sem_inflight = 1;   /* the helper's vk_done signal is now pending */
     unsigned long long gl_us = g_x_t0 && t1 > g_x_t0 ? (unsigned long long)((t1 - g_x_t0) / 1000u) : 0ull;
     unsigned long long rtt_us = (unsigned long long)((t2 - t1) / 1000u);
@@ -1393,11 +1408,24 @@ static int xfer_peer_alive(void)
     return 1;
 }
 
+/* v5 hook-port interface: the newest pose the helper sent (what the NEXT frame should be rendered with; its id is what gets stamped on
+ * that frame). Returns 1 and fills *out, or 0 when the helper offers no poses (or has not sent one yet). Poses are OpenXR-convention
+ * (right-handed, +Y up, -Z forward); the conversion to Source space belongs to the caller. Nothing in the shim calls this yet. */
+BMVR_EXPORT int bmvr_get_render_pose(struct bmvr_xfer_pose *out)
+{
+    if (!g_x_poses_on || !g_x_pose_latest.pose_id) return 0;
+    *out = g_x_pose_latest;
+    return 1;
+}
+
 /* Called once per Present, after report_gl_once(), on the render thread (GL context current). */
 static void xfer_tick(void)
 {
     if (g_x_state < 0 || !g_gl_reported) return;
     g_x_tick++;
+    /* v5: the frame delivered at this Present was rendered with the pose latched one Present ago; the next frame starts with the newest one. */
+    g_x_pose_used = g_x_pose_pending;
+    g_x_pose_pending = g_x_pose_latest.pose_id;
     load_cfg_once();
     if (!xfer_resolve_gl()) return;
 

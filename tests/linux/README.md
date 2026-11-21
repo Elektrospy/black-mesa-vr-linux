@@ -8,7 +8,7 @@ into `build/` (git-ignored) and runs it.
 | `mock_gl.c` | "libSDL2-2.0.so.0": `SDL_GL_GetProcAddress` + a small GL state machine (FBOs, textures, renderbuffers, memory objects, semaphores) that records every call to `$MOCK_TRACE` |
 | `fake_togl.cpp`, `decls.h` | stand-in `libtogl.so` with the real C++ signatures (so the mangled names match) and ToGL's lazy FBO binding |
 | `fake_game.cpp` | loading frames, then gameplay frames with many `SetRenderTarget(0)` switches ending on the back buffer, then (optional 3rd arg) a second loading screen |
-| `mock_helper.c` | helper stand-in: real unix socket + `SCM_RIGHTS`, protocol v4 (`--sem`, `--eyes N`, `--version N`, `--die-after N`, `--die-idle-after N` = exit right after acking frame N) |
+| `mock_helper.c` | helper stand-in: real unix socket + `SCM_RIGHTS`, protocol v5 (`--sem`, `--eyes N`, `--poses`, `--version N`, `--die-after N`, `--die-idle-after N` = exit right after acking frame N) |
 | `lock_test.c` | the helper's one-instance `flock()` guard (`linux/bmvr_single_instance.h`), no Vulkan needed |
 | `client.c` | drives the REAL helper like the shim would |
 | `suite.py`, `run_case.sh` | the cases and assertions (call ordering, fallbacks, state restore, trace trigger) |
@@ -33,3 +33,5 @@ T14-T19 are the stage 3d two-eye cases (`fake_game` takes `FAKE_SKIP_RT` / `FAKE
 `test_xr_sink.sh [build dir] [--software] [--kill-rounds N]` (X2, NOT part of `run-tests.sh`) runs `bmvr_xfer_helper --sink xr` against its own headless Monado, with `xr_client.c` (`cc -O2 -o xr_client tests/linux/xr_client.c -lvulkan`) as a Vulkan stand-in for the game: frame integrity at every stage (`--xr-check`), two-eye pairs, last-image-after-disconnect, second helper refused, SIGINT, and a `kill -9` loop. The semaphore path, GL, SteamVR and the picture in a headset are NOT covered.
 
 T20 (in `suite.py`, run by `run-tests.sh`) covers the `every=N` key of `bmvr_target.txt` (delivery cadence of the shim).
+
+T21-T23 (X4, in `suite.py`) cover the protocol v5 pose channel through `mock_helper --poses` (acks carry pose id n+1; the shim must stamp frames with a pose it has already seen). `pose_test.c` (run by `run-tests.sh`, no GPU) stress-tests `linux/bmvr_pose_store.h`; also with `-fsanitize=thread`.

@@ -670,10 +670,11 @@ static int serve_xr(const char *gamedir, struct bmvr_xr_sink *sink)
 
         int fds[4] = { -1, -1, -1, -1 }, nfds = 0;
         if (bmvr_xr_sink_client_begin(sink, fds, &nfds) < 0) { LOG("ERROR: could not export the shared images / semaphores for the game"); close(cl); rc = 1; break; }
-        int hello_ok = send_hello_with_fds(cl, fds, nfds, info.semaphores ? BMVR_XFER_CAP_SEMAPHORES : 0) == 0;
+        int hello_ok = send_hello_with_fds(cl, fds, nfds, (info.semaphores ? BMVR_XFER_CAP_SEMAPHORES : 0u) | (info.poses ? BMVR_XFER_CAP_POSES : 0u)) == 0;
         for (int i = 0; i < nfds; i++) close(fds[i]);     /* our copies; the game holds its own */
         if (!hello_ok) { LOG("could not send the memory fd to the game"); close(cl); bmvr_xr_sink_client_end(sink); continue; }
         LOG("game connected; %s sent (%ux%u)%s", g_eyes > 1 ? "two shared images (eye 0, eye 1)" : "shared image", g_w, g_h, info.semaphores ? ", with two GPU semaphores" : "");
+        if (info.poses) LOG("pose channel offered (protocol v5): every ack carries the newest eye pose, frames say which pose they were rendered with");
 
         int fatal = 0;
         for (;;) {
@@ -691,8 +692,9 @@ static int serve_xr(const char *gamedir, struct bmvr_xr_sink *sink)
             }
             int use_sem = (fr.flags & BMVR_XFER_FLAG_SEMAPHORE) != 0;
             if (use_sem && !info.semaphores) { LOG("frame wants semaphore sync but none were offered; dropping the game connection"); break; }
-            if (bmvr_xr_sink_pair(sink, fr.tick, (int)fr.eye_count, use_sem) < 0) { LOG("ERROR: the GPU copy of the pair failed; stopping"); fatal = 1; break; }
+            if (bmvr_xr_sink_pair(sink, fr.tick, (int)fr.eye_count, use_sem, fr.pose_id) < 0) { LOG("ERROR: the GPU copy of the pair failed; stopping"); fatal = 1; break; }
             struct bmvr_xfer_ack ack = { .magic = BMVR_XFER_MAGIC_ACK, .status = 0 };
+            bmvr_xr_sink_latest_pose(sink, &ack.pose);   /* v5: the newest pose rides on the ack (pose_id 0 when none / not offered) */
             if (send(cl, &ack, sizeof ack, MSG_NOSIGNAL) != (ssize_t)sizeof ack) break;
         }
         close(cl);

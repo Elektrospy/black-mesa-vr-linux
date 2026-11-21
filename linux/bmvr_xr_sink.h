@@ -21,6 +21,7 @@
 #include <signal.h>
 #include <stddef.h>
 #include <stdint.h>
+#include "bmvr_xfer.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -69,6 +70,7 @@ struct bmvr_xr_sink_info {
     uint64_t memory_size;     /* VkMemoryAllocateInfo::allocationSize of each shared image (the hello's memory_size) */
     int eyes;
     int semaphores;           /* 1: the hello may carry BMVR_XFER_CAP_SEMAPHORES */
+    int poses;                /* 1: the hello may carry BMVR_XFER_CAP_POSES (projection layer + LOCAL space: X4) */
 };
 
 /* Opens the runtime (loader, instance, runtime-chosen device, session, one swapchain), creates the shared images, the ring and the
@@ -81,10 +83,13 @@ void bmvr_xr_sink_info(const struct bmvr_xr_sink *k, struct bmvr_xr_sink_info *i
  * the caller closes them after sending) and sets *nfds. Fresh semaphores per client. Returns 0, or -1 (the sink is unusable). */
 int bmvr_xr_sink_client_begin(struct bmvr_xr_sink *k, int fds[4], int *nfds);
 
-/* One complete pair is in the shared images. Submits the GPU copy into a ring slot (wait gl_ready / signal vk_done when use_sem)
+/* One complete pair is in the shared images (rendered with pose `pose_id`, 0 = none). Submits the GPU copy into a ring slot (wait gl_ready / signal vk_done when use_sem)
  * and returns right after vkQueueSubmit, which is what the ack promises. Without use_sem it returns after the copy finished.
  * Returns 0, or -1 on a fatal Vulkan failure (the caller drops the game and exits with the reason). */
-int bmvr_xr_sink_pair(struct bmvr_xr_sink *k, uint32_t tick, int eyes, int use_sem);
+int bmvr_xr_sink_pair(struct bmvr_xr_sink *k, uint32_t tick, int eyes, int use_sem, uint32_t pose_id);
+
+/* X4: the newest pose the XR thread located (for the ack). 1 and *out filled, 0 when none yet or poses are not offered. */
+int bmvr_xr_sink_latest_pose(struct bmvr_xr_sink *k, struct bmvr_xfer_pose *out);
 
 /* The game went away: wait (bounded) for our submissions to finish. The XR thread keeps showing the last pair. */
 void bmvr_xr_sink_client_end(struct bmvr_xr_sink *k);
