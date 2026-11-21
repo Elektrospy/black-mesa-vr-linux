@@ -549,7 +549,8 @@ static void st_on_signal(int sig) { (void)sig; g_st_stop = 1; }
 struct st {
     struct ctx c;
     uint32_t qfam;
-    VkQueue queue;
+    VkQueue queue;   /* queue 0: the OpenXR session's queue (XR thread only) */
+    VkQueue tqueue;  /* queue 1: the transport thread's own queue; == queue when the family has only one (then qmu serializes both) */
     uint32_t w, h;
     int usage_color_att; /* 1 if the swapchains were created with COLOR_ATTACHMENT usage too */
     int want_src;        /* X2 --xr-check: ask for TRANSFER_SRC usage too (readback of the swapchain image) */
@@ -747,12 +748,18 @@ static int st_open(struct st *s, int want_w, int want_h, int require_memfd, int 
     vkGetPhysicalDeviceQueueFamilyProperties_(c->phys, &nq, qf);
     int qfam = -1;
     for (uint32_t i = 0; i < nq; i++) if ((qf[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) && qfam < 0) qfam = (int)i;
+    uint32_t fam_queues = qfam >= 0 ? qf[qfam].queueCount : 0;
     free(qf);
     if (qfam < 0) { ledger("graphics queue family", 0, 1, "none"); return 1; }
     s->qfam = (uint32_t)qfam;
 
-    float prio = 1.0f;
-    VkDeviceQueueCreateInfo qci = { .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex = s->qfam, .queueCount = 1, .pQueuePriorities = &prio };
+    /* The transport thread gets its own VkQueue (index 1) so it never submits on the session's queue (index 0) at the same time as the
+     * XR thread or the runtime (a VkQueue must be externally synchronized; Xid 32/69 and the validation layer's THREADING ERROR).
+     * BMVR_XR_ONE_QUEUE=1 forces the old single-queue + mutex design for comparison. */
+    const char *oneq = getenv("BMVR_XR_ONE_QUEUE");
+    uint32_t want_q = (fam_queues >= 2 && !(oneq && *oneq && *oneq != '0')) ? 2u : 1u;
+    float prio[2] = { 1.0f, 1.0f };
+    VkDeviceQueueCreateInfo qci = { .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex = s->qfam, .queueCount = want_q, .pQueuePriorities = prio };
     const char *dext[2];
     uint32_t ndext = 0;
     if (has_memfd) dext[ndext++] = "VK_KHR_external_memory_fd";
@@ -769,7 +776,9 @@ static int st_open(struct st *s, int want_w, int want_h, int require_memfd, int 
     VK_ST_DEV_FUNCS(LOADD)
 #undef LOADD
     vkGetDeviceQueue_(c->dev, s->qfam, 0, &s->queue);
+    if (want_q >= 2) vkGetDeviceQueue_(c->dev, s->qfam, 1, &s->tqueue); else s->tqueue = s->queue;
     ledger("Vulkan device", 1, 1, "created on the runtime-chosen GPU (external memory/semaphore fd: %d/%d)", has_memfd, has_semfd);
+    ledger("queues", 1, 0, want_q >= 2 ? "transport thread on its own queue (family %u has %u): no shared-queue submits" : "ONE queue shared by both threads behind a mutex (family %u has %u queue(s), or BMVR_XR_ONE_QUEUE is set)", s->qfam, fam_queues);
 
     XrGraphicsBindingVulkanKHR gb = { .type = XR_TYPE_GRAPHICS_BINDING_VULKAN2_KHR, .instance = c->vk_inst, .physicalDevice = c->phys,
         .device = c->dev, .queueFamilyIndex = s->qfam, .queueIndex = 0 };
@@ -1946,11 +1955,12 @@ int bmvr_xr_sink_pair(struct bmvr_xr_sink *k, uint32_t tick, int eyes, int use_s
         .waitSemaphoreCount = use_sem ? 1u : 0u, .pWaitSemaphores = &k->sem_gl_ready, .pWaitDstStageMask = &ws,
         .commandBufferCount = slot >= 0 ? 1u : 0u, .pCommandBuffers = &cb,
         .signalSemaphoreCount = use_sem ? 1u : 0u, .pSignalSemaphores = &k->sem_vk_done };
+    int own_q = k->st.tqueue && k->st.tqueue != k->st.queue; /* own queue: nothing else submits on it, no lock needed (the ring and slot fences order the hand-over to the XR thread) */
     double t0 = now_ms();
-    sk_qlock(k);
-    double waited = now_ms() - t0;
-    VkResult vr = vkQueueSubmit_(k->st.queue, 1, &si, fence);
-    sk_qunlock(k);
+    if (!own_q) sk_qlock(k);
+    double waited = own_q ? 0.0 : now_ms() - t0;
+    VkResult vr = vkQueueSubmit_(own_q ? k->st.tqueue : k->st.queue, 1, &si, fence);
+    if (!own_q) sk_qunlock(k);
     pthread_mutex_lock(&k->stat_mu);
     k->lw_sum_ms += waited; k->lw_n++;
     if (waited > k->lw_max_ms) k->lw_max_ms = waited;
