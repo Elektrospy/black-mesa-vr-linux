@@ -301,7 +301,8 @@ static void report_gl_once(void)
  * texture/renderbuffer binding, scissor) is saved and restored and GL errors raised by our own
  * calls are drained so the engine never sees them. Everything runs only on a thread that has a
  * current GL context. */
-#define XFER_EVERY 120          /* presents between snapshots (~2 s at 60 fps) */
+#define XFER_EVERY_DEFAULT 120  /* presents between deliveries (~2 s at 60 fps): the snapshot-era default */
+static unsigned g_x_every = XFER_EVERY_DEFAULT; /* bmvr_target.txt "every=N": 1 = deliver on every present (needed for a live picture in a headset) */
 #define XFER_RETRY 240          /* presents between attempts to find the helper */
 #define XFER_TIMEOUT_SEC 2
 #define TRACE_LINES 1500        /* SetRenderTarget events traced per frame (a gameplay frame has ~400; identical neighbours are merged in the log) */
@@ -544,6 +545,11 @@ static void load_cfg_once(void)
             else if (!strncmp(line, "flip=", 5)) parse_flip(line + 5);
             else if (!strncmp(line, "flip2=", 6)) parse_flip2(line + 6);
             else if (!strncmp(line, "sync=", 5)) parse_sync(line + 5);
+            else if (!strncmp(line, "every=", 6)) {
+                long v = strtol(line + 6, NULL, 10);
+                if (v >= 1 && v <= 3600) { g_x_every = (unsigned)v; bmvr_log("xfer: every=%ld (one delivery per %ld present(s))", v, v); }
+                else bmvr_log("xfer: bad every=%s (use 1..3600); keeping %u", line + 6, g_x_every);
+            }
             else if (first) parse_spec(&g_spec[0], line);
             first = 0;
         }
@@ -947,9 +953,9 @@ static int xfer_connect_and_import(void)
     g_x_neyes = (unsigned)neyes;
     g_x_sock = s;
     g_x_state = 1;
-    if (neyes == 2) bmvr_log("xfer: imported the helper's Vulkan memory as GL textures %u (eye 0) and %u (eye 1); pairs delivered every %d presents",
-                             g_x_tex[0], g_x_tex[1], XFER_EVERY);
-    else bmvr_log("xfer: imported the helper's Vulkan memory as GL texture %u; snapshot every %d presents", g_x_tex[0], XFER_EVERY);
+    if (neyes == 2) bmvr_log("xfer: imported the helper's Vulkan memory as GL textures %u (eye 0) and %u (eye 1); pairs delivered every %u presents",
+                             g_x_tex[0], g_x_tex[1], g_x_every);
+    else bmvr_log("xfer: imported the helper's Vulkan memory as GL texture %u; snapshot every %u presents", g_x_tex[0], g_x_every);
     return 1;
 }
 
@@ -1424,7 +1430,7 @@ static void xfer_tick(void)
         if (!xfer_gl_usable() || !xfer_connect_and_import()) return;
         return; /* first snapshot on the next period */
     }
-    if (g_x_tick % XFER_EVERY == 0) {
+    if (g_x_tick % g_x_every == 0) {
         if (xfer_gl_usable() && xfer_peer_alive()) {
             g_x_t0 = now_ns();
             if (g_spec[0].kind == SPEC_WINDOW) xfer_snapshot_window();
@@ -1432,7 +1438,7 @@ static void xfer_tick(void)
         }
         g_x_armed = 0;
     }
-    if (g_x_state == 1 && g_x_tick % XFER_EVERY == XFER_EVERY - 1) {
+    if (g_x_state == 1 && g_x_tick % g_x_every == g_x_every - 1) {
         for (unsigned e = 0; e < XFER_EYES; e++) g_cap[e].valid = 0;
         g_cap_leaves = g_cap_mismatch = g_cap_unresolved = 0;   /* the miss line must describe THIS frame */
         g_x_armed = (g_spec[0].kind != SPEC_WINDOW);   /* record the targets left during the next frame */

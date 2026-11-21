@@ -20,7 +20,7 @@
  *
  * Usage:  bmvr_xfer_helper [game folder] [--size WxH] [--gpu N] [--snapshots N] [--eyes 1|2] [--no-semaphores]
  *         --eyes 2 (stage 3d) offers two shared images; the game uses the second only with target2 in bmvr_target.txt
- *         bmvr_xfer_helper [game folder] --sink xr [--eyes 1|2] [--no-semaphores] [--xr-size WxH] [--xr-wait MS] [--xr-check N]
+ *         bmvr_xfer_helper [game folder] --sink xr [--eyes 1|2] [--no-semaphores] [--xr-size WxH] [--xr-wait MS] [--xr-check N] [--xr-quad world|head]
  *         (stage 4a, X2: the game's pairs go to an OpenXR runtime (head-locked quad, eye 0) instead of snapshot files; the runtime
  *         owns the Vulkan device, so --gpu and --size do not apply; exits with the reason if the runtime or headset is unavailable)
  *         bmvr_xfer_helper --selftest-sync [--gpu N]      (no game needed: checks semaphore sync on this GPU)
@@ -710,7 +710,7 @@ int main(int argc, char **argv)
 {
     char gamedir[900] = "";
     int want_gpu = -1, max_snaps = 5, selftest = 0, xr_probe = 0, xr_wait_ms = 10000, xr_w = 0, xr_h = 0;
-    int xr_selftest = 0, xr_layers = 3, xr_seconds = 10, sink_xr = 0, xr_layer_given = 0, xr_check = 0, size_given = 0;
+    int xr_selftest = 0, xr_layers = 3, xr_seconds = 10, sink_xr = 0, xr_layer_given = 0, xr_check = 0, size_given = 0, quad_head = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--size") && i + 1 < argc) {
             if (sscanf(argv[++i], "%ux%u", &g_w, &g_h) != 2 || !g_w || !g_h || g_w > 8192 || g_h > 8192) DIE("bad --size, use e.g. 1920x1080");
@@ -748,13 +748,17 @@ int main(int argc, char **argv)
             const char *k = argv[++i];
             if (!strcmp(k, "xr")) sink_xr = 1;
             else if (strcmp(k, "snapshot")) DIE("bad --sink, use snapshot or xr");
+        } else if (!strcmp(argv[i], "--xr-quad") && i + 1 < argc) {
+            const char *q = argv[++i];
+            if (!strcmp(q, "head")) quad_head = 1;
+            else if (strcmp(q, "world")) DIE("bad --xr-quad, use world (default) or head");
         } else if (!strcmp(argv[i], "--xr-check") && i + 1 < argc) {
             xr_check = atoi(argv[++i]);
             if (xr_check < 0 || xr_check > 1000) DIE("bad --xr-check, use 0..1000");
         } else if (argv[i][0] != '-' && !gamedir[0]) {
             snprintf(gamedir, sizeof gamedir, "%s", argv[i]);
         } else {
-            fprintf(stderr, "usage: %s [game folder] [--size WxH] [--gpu N] [--snapshots N] [--eyes 1|2] [--no-semaphores] [--sink snapshot|xr [--xr-size WxH] [--xr-wait MS] [--xr-check N]] | --selftest-sync | --xr-probe [--xr-wait MS] [--xr-size WxH] | --selftest-xr [--xr-layer quad|projection|both] [--xr-seconds N] [--xr-wait MS] [--xr-size WxH]\n", argv[0]);
+            fprintf(stderr, "usage: %s [game folder] [--size WxH] [--gpu N] [--snapshots N] [--eyes 1|2] [--no-semaphores] [--sink snapshot|xr [--xr-size WxH] [--xr-wait MS] [--xr-check N] [--xr-quad world|head]] | --selftest-sync | --xr-probe [--xr-wait MS] [--xr-size WxH] | --selftest-xr [--xr-layer quad|projection|both] [--xr-seconds N] [--xr-wait MS] [--xr-size WxH]\n", argv[0]);
             return 2;
         }
     }
@@ -792,7 +796,7 @@ int main(int argc, char **argv)
         if (size_given) LOG("--size is ignored with --sink xr: the images have the OpenXR runtime's recommended size (override with --xr-size WxH)");
         if (want_gpu >= 0) LOG("--gpu is ignored with --sink xr: the OpenXR runtime chooses the GPU");
         struct bmvr_xr_sink_opts so = { .eyes = g_eyes, .no_semaphores = g_no_sem, .wait_ready_ms = xr_wait_ms, .width = xr_w, .height = xr_h,
-                                        .check_pairs = xr_check, .abort_flag = &g_stop };
+                                        .check_pairs = xr_check, .quad_head_locked = quad_head, .abort_flag = &g_stop };
         struct bmvr_xr_sink *sink = NULL;
         int orc = bmvr_xr_sink_open(&so, &sink);
         if (orc != BMVR_XR_PROBE_OK) return orc; /* 1 failed / 2 unavailable: the reason was printed; no fallback to snapshots */

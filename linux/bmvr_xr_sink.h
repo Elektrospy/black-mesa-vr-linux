@@ -59,6 +59,7 @@ struct bmvr_xr_sink_opts {
     int wait_ready_ms;                         /* how long to wait for the session to reach READY (<= 0: 10000) */
     int width, height;                         /* eye image size; 0 = the runtime's recommended size */
     int check_pairs;                           /* --xr-check N: read back and log a few pixels of the first N fresh pairs (debug; stalls ~1 frame each) */
+    int quad_head_locked;                      /* 1: the quad follows the head (X2 default of the first version); 0: fixed in the room (LOCAL space), 2 m ahead of where the head was at session start */
     const volatile sig_atomic_t *abort_flag;   /* optional: set by the caller's signal handler; ends the wait for READY */
 };
 

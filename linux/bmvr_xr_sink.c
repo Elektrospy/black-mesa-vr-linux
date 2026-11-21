@@ -1271,6 +1271,8 @@ struct bmvr_xr_sink {
     int eyes;                     /* images per pair (shared images, ring slot images) */
     int sem_ok;                   /* semaphores are offered to the game */
     int check_left;               /* --xr-check: fresh pairs still to read back */
+    int head_locked;              /* quad in VIEW space (follows the head) instead of LOCAL space (fixed in the room) */
+    XrSpace world_space;          /* LOCAL reference space, when !head_locked */
     VkImage shared[2];            /* what the game imports: written by GL, read by our copy */
     VkDeviceMemory shared_mem[2];
     VkDeviceSize mem_size;
@@ -1582,7 +1584,7 @@ static void *sk_thread(void *arg)
                 if (k->xfence_used[fidx]) last_fidx = fidx;
                 frame_no++;
                 XrRect2Di rect = { { 0, 0 }, { (int32_t)s->w, (int32_t)s->h } };
-                quad = (XrCompositionLayerQuad){ .type = XR_TYPE_COMPOSITION_LAYER_QUAD, .layerFlags = 0, .space = s->view_space, .eyeVisibility = XR_EYE_VISIBILITY_BOTH,
+                quad = (XrCompositionLayerQuad){ .type = XR_TYPE_COMPOSITION_LAYER_QUAD, .layerFlags = 0, .space = k->head_locked ? s->view_space : k->world_space, .eyeVisibility = XR_EYE_VISIBILITY_BOTH,
                     .subImage = { .swapchain = s->sc[0], .imageRect = rect, .imageArrayIndex = 0 },
                     .pose = { .orientation = { 0, 0, 0, 1 }, .position = { 0, 0, -2.0f } }, .size = { 1.6f * (float)s->w / (float)s->h, 1.6f } };
                 layers[nlayers++] = (const XrCompositionLayerBaseHeader *)&quad;
@@ -1662,6 +1664,7 @@ static void sk_destroy(struct bmvr_xr_sink *k)
         if (k->xpool) vkDestroyCommandPool_(d, k->xpool, NULL);
         if (k->chk_buf) vkDestroyBuffer_(d, k->chk_buf, NULL);
         if (k->chk_mem) vkFreeMemory_(d, k->chk_mem, NULL);
+        if (k->world_space) xrDestroySpace_(k->world_space);
         st_close(s);
     } else if (k->stuck) {
         XLOG("not destroying the Vulkan objects: the transport queue is stuck behind a semaphore wait (the process is about to exit)");
@@ -1680,6 +1683,7 @@ int bmvr_xr_sink_open(const struct bmvr_xr_sink_opts *o, struct bmvr_xr_sink **o
     k->eyes = o->eyes == 2 ? 2 : 1;
     k->sem_ok = o->no_semaphores; /* temporarily "--no-semaphores"; sk_make_gpu_objects turns it into the real answer */
     k->check_left = o->check_pairs > 0 ? o->check_pairs : 0;
+    k->head_locked = o->quad_head_locked;
     s->want_src = k->check_left > 0;
     pthread_mutex_init(&k->qmu, NULL);
     pthread_mutex_init(&k->stat_mu, NULL);
@@ -1692,6 +1696,12 @@ int bmvr_xr_sink_open(const struct bmvr_xr_sink_opts *o, struct bmvr_xr_sink **o
         vkGetPhysicalDeviceProperties2_(s->c.phys, &pp);
         print_uuid("runtime-chosen GPU device UUID (the shim logs the GL one; they must match): ", idp.deviceUUID);
         failed = st_make_swapchains(s, 1);
+    }
+    if (!failed && !unavailable && !k->head_locked) {
+        XrReferenceSpaceCreateInfo rsi = { .type = XR_TYPE_REFERENCE_SPACE_CREATE_INFO, .referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL,
+            .poseInReferenceSpace = { .orientation = { 0, 0, 0, 1 } } };
+        XrResult lr = xrCreateReferenceSpace_(s->c.sess, &rsi, &k->world_space);
+        if (XR_FAILED(lr)) { ledger("xrCreateReferenceSpace(LOCAL)", 0, 0, "%s: falling back to a head-locked quad", xr_rs(s->c.inst, lr)); k->head_locked = 1; k->world_space = XR_NULL_HANDLE; }
     }
     if (!failed && !unavailable) failed = sk_make_gpu_objects(k);
     if (!failed && !unavailable) {
@@ -1718,7 +1728,7 @@ int bmvr_xr_sink_open(const struct bmvr_xr_sink_opts *o, struct bmvr_xr_sink **o
         XLOG("--sink xr: FAILED (see the FAIL line above): refusing to fall back to snapshots");
         return BMVR_XR_PROBE_FAILED;
     }
-    XLOG("--sink xr: ready. %d eye(s) of %ux%u, %s. Quad layer (eye 0), head-locked 2 m ahead.", k->eyes, s->w, s->h, k->sem_ok ? "GPU semaphores offered" : "no semaphores (glFinish + ack)");
+    XLOG("--sink xr: ready. %d eye(s) of %ux%u, %s. Quad layer (eye 0), %s, 2 m ahead.", k->eyes, s->w, s->h, k->sem_ok ? "GPU semaphores offered" : "no semaphores (glFinish + ack)", k->head_locked ? "head-locked" : "fixed in the room (LOCAL space)");
     *out = k;
     return BMVR_XR_PROBE_OK;
 }

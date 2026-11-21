@@ -298,7 +298,7 @@ the two startup interval spikes, Monado, a validation-layer run, the Ctrl-C path
 ## X2: `--sink xr`
 
 ```
-bmvr_xfer_helper [game folder] --sink xr [--eyes 1|2] [--no-semaphores] [--xr-size WxH] [--xr-wait MS] [--xr-check N]
+bmvr_xfer_helper [game folder] --sink xr [--eyes 1|2] [--no-semaphores] [--xr-size WxH] [--xr-wait MS] [--xr-check N] [--xr-quad world|head]
 ```
 
 Same socket, hello, frame and ack as the snapshot sink (protocol v4 unchanged); `--sink snapshot` (default) is untouched. The
@@ -314,8 +314,7 @@ Data path per pair, as designed in Decision 2:
    semaphores) the ack follows after the copy's fence instead. If no slot can be had, the submission still waits/signals (no copy), so the
    game never stalls on a full ring; the pair is counted as dropped.
 2. XR thread (pacing master): `xrWaitFrame` -> wait for the previous frame's GPU copy -> `xrBeginFrame` -> `bmvr_ring_pick` (the newest
-   complete pair) -> copy its eye 0 into the acquired swapchain image -> `xrEndFrame` with a head-locked quad (VIEW space, 2 m ahead,
-   1.6 m high). No newer pair: the same slot is copied again (`reused`). No pair ever: an empty frame. The game leaving does not stop
+   complete pair) -> copy its eye 0 into the acquired swapchain image -> `xrEndFrame` with a quad 2 m ahead, 1.6 m high (default `--xr-quad world`: fixed in the room, LOCAL space; `head`: VIEW space, follows the head). No newer pair: the same slot is copied again (`reused`). No pair ever: an empty frame. The game leaving does not stop
    this: the last pair stays on the quad, and a reconnect restores the live picture.
 3. The ring (`linux/bmvr_pair_ring.h`): slots FREE / WRITING / SUBMITTED / READY, one mutex. A slot holds both eyes of one pair and is
    published as a whole; the reader sees it only after the GPU fence says the whole copy finished. The slot the XR thread displays
@@ -371,6 +370,22 @@ as designed (newest wins).
 - Performance: the copy cost at 3036x3036 per eye (the design's "~1 ms class" is still an estimate), frame pacing against a 90 Hz compositor.
 - Known limit: if a game dies after signalling nothing for a pair it already announced (never signalled `gl_ready`), the transport queue
   stays blocked; the helper detects it (bounded waits), says so and asks for a restart (same hazard as the snapshot sink's 5 s check).
+
+### X2 first run with the real game (author's report, SteamVR, RTX 3080, 2026-11-21)
+
+Reported, not measured (no logs were attached yet):
+
+- `--sink xr --eyes 1 --xr-check 6`: the quad is visible in the headset and the game image **updates every 5-6 s**.
+  Cause found in the code, **not yet confirmed by a run**: the shim delivers one pair every `XFER_EVERY` = 120 presents (a snapshot-era
+  constant, about 2 s at 60 fps, 5-6 s at this game's frame rate). The sink shows the newest pair on every XR frame; it just gets few.
+  Change made afterwards (tested host-native with the mock GL, T20; **not tested in the 32-bit shim or the real game**): `bmvr_target.txt` key
+  `every=N` (1..3600, default stays 120). Try `every=1`, then `every=2` if the engine cost is too high.
+- `--sink xr --eyes 2` with `target=InternalRT0`, `target2=name:_rt_gblightdiff`, `flip=0`, `sync=sem`: the same image in both eyes (expected: X2
+  shows eye 0 on a quad, stereo is X3) and the view "stuck" (expected: the quad was head-locked). Change made afterwards: `--xr-quad world`
+  (new default; the quad is fixed in the room, LOCAL space, 2 m ahead of the head's position at session start) and `--xr-quad head` for the old
+  behaviour. Checked only that both start on Monado. The author also saw the game as a "floating desktop application" in the headset; that is
+  not explained (probably SteamVR's own desktop/window overlay of the game window, not this sink) and has not been investigated.
+- Not yet reported: whether `sync=sem` delivered pairs at all in this run, the helper's rate/check lines, the UUID lines.
 
 ## Risks and open questions
 

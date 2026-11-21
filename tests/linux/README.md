@@ -31,3 +31,5 @@ T14-T19 are the stage 3d two-eye cases (`fake_game` takes `FAKE_SKIP_RT` / `FAKE
 `ring_test.c` (stage 4a X2) needs no GPU: `cc -O2 -pthread -I linux -o ring_test tests/linux/ring_test.c && ./ring_test`, also with `-fsanitize=thread`. It stress-tests `linux/bmvr_pair_ring.h` with a fake GPU thread.
 
 `test_xr_sink.sh [build dir] [--software] [--kill-rounds N]` (X2, NOT part of `run-tests.sh`) runs `bmvr_xfer_helper --sink xr` against its own headless Monado, with `xr_client.c` (`cc -O2 -o xr_client tests/linux/xr_client.c -lvulkan`) as a Vulkan stand-in for the game: frame integrity at every stage (`--xr-check`), two-eye pairs, last-image-after-disconnect, second helper refused, SIGINT, and a `kill -9` loop. The semaphore path, GL, SteamVR and the picture in a headset are NOT covered.
+
+T20 (in `suite.py`, run by `run-tests.sh`) covers the `every=N` key of `bmvr_target.txt` (delivery cadence of the shim).
