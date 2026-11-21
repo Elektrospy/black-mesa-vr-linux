@@ -13,7 +13,7 @@
  * this sink: the sink owns the runtime-chosen Vulkan device, the shared images and semaphores the game imports, a 3-slot
  * pair ring (bmvr_pair_ring.h) and one XR thread that displays the newest complete pair on a head-locked quad (eye 0).
  *
- * The pose channel (X4) does not exist yet; X3 (projection layer) neither.
+ * The pose channel (X4) does not exist yet. X3 (projection layer, `layer = 1`) exists: both eyes, head-locked, runtime eye poses.
  */
 #ifndef BMVR_XR_SINK_H
 #define BMVR_XR_SINK_H
@@ -60,6 +60,7 @@ struct bmvr_xr_sink_opts {
     int width, height;                         /* eye image size; 0 = the runtime's recommended size */
     int check_pairs;                           /* --xr-check N: read back and log a few pixels of the first N fresh pairs (debug; stalls ~1 frame each) */
     int quad_head_locked;                      /* 1: the quad follows the head (X2 default of the first version); 0: fixed in the room (LOCAL space), 2 m ahead of where the head was at session start */
+    int layer;                                 /* 0 = quad (eye 0, X2), 1 = stereo projection layer (X3; needs eyes == 2, two swapchains, head-locked) */
     const volatile sig_atomic_t *abort_flag;   /* optional: set by the caller's signal handler; ends the wait for READY */
 };
 

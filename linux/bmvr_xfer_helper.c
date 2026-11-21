@@ -20,7 +20,7 @@
  *
  * Usage:  bmvr_xfer_helper [game folder] [--size WxH] [--gpu N] [--snapshots N] [--eyes 1|2] [--no-semaphores]
  *         --eyes 2 (stage 3d) offers two shared images; the game uses the second only with target2 in bmvr_target.txt
- *         bmvr_xfer_helper [game folder] --sink xr [--eyes 1|2] [--no-semaphores] [--xr-size WxH] [--xr-wait MS] [--xr-check N] [--xr-quad world|head]
+ *         bmvr_xfer_helper [game folder] --sink xr [--eyes 1|2] [--no-semaphores] [--xr-size WxH] [--xr-wait MS] [--xr-check N] [--xr-quad world|head] [--xr-layer quad|projection]
  *         (stage 4a, X2: the game's pairs go to an OpenXR runtime (head-locked quad, eye 0) instead of snapshot files; the runtime
  *         owns the Vulkan device, so --gpu and --size do not apply; exits with the reason if the runtime or headset is unavailable)
  *         bmvr_xfer_helper --selftest-sync [--gpu N]      (no game needed: checks semaphore sync on this GPU)
@@ -792,11 +792,12 @@ int main(int argc, char **argv)
         }
     }
     if (sink_xr) { /* stage 4a X2: the runtime owns the Vulkan device; none of this file's own Vulkan setup is used */
-        if (xr_layer_given && xr_layers != 1) DIE("--sink xr supports --xr-layer quad only (the projection layer is milestone X3)");
+        if (xr_layer_given && xr_layers == 3) DIE("--sink xr supports --xr-layer quad or projection (not both)");
+        if (xr_layer_given && xr_layers == 2 && g_eyes < 2) DIE("--xr-layer projection needs --eyes 2 (and target2 in bmvr_target.txt)");
         if (size_given) LOG("--size is ignored with --sink xr: the images have the OpenXR runtime's recommended size (override with --xr-size WxH)");
         if (want_gpu >= 0) LOG("--gpu is ignored with --sink xr: the OpenXR runtime chooses the GPU");
         struct bmvr_xr_sink_opts so = { .eyes = g_eyes, .no_semaphores = g_no_sem, .wait_ready_ms = xr_wait_ms, .width = xr_w, .height = xr_h,
-                                        .check_pairs = xr_check, .quad_head_locked = quad_head, .abort_flag = &g_stop };
+                                        .check_pairs = xr_check, .quad_head_locked = quad_head, .layer = (xr_layer_given && xr_layers == 2) ? 1 : 0, .abort_flag = &g_stop };
         struct bmvr_xr_sink *sink = NULL;
         int orc = bmvr_xr_sink_open(&so, &sink);
         if (orc != BMVR_XR_PROBE_OK) return orc; /* 1 failed / 2 unavailable: the reason was printed; no fallback to snapshots */

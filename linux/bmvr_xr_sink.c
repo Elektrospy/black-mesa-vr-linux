@@ -1271,6 +1271,7 @@ struct bmvr_xr_sink {
     int eyes;                     /* images per pair (shared images, ring slot images) */
     int sem_ok;                   /* semaphores are offered to the game */
     int check_left;               /* --xr-check: fresh pairs still to read back */
+    int projection;               /* X3: submit a stereo projection layer (eye 0 + eye 1, two swapchains) instead of the quad */
     int head_locked;              /* quad in VIEW space (follows the head) instead of LOCAL space (fixed in the room) */
     XrSpace world_space;          /* LOCAL reference space, when !head_locked */
     VkImage shared[2];            /* what the game imports: written by GL, read by our copy */
@@ -1452,17 +1453,22 @@ static void sk_destroy_sems(struct bmvr_xr_sink *k)
 }
 
 /* ---------------------------------------------------------------- XR thread */
-/* Copy slot `slot` (eye 0) into the next swapchain image. Returns 1 on a failure (why set). */
+/* Copy slot `slot` into the next swapchain image(s): eye 0 only (quad) or eye 0 -> sc[0] and eye 1 -> sc[1] (projection, X3).
+ * Returns 1 on a failure (why set). */
 static int sk_show(struct bmvr_xr_sink *k, int slot, int fidx, int fresh, uint32_t tick, uint64_t seq, const char **why)
 {
     struct st *s = &k->st;
     VkDevice d = s->c.dev;
-    uint32_t idx = 0;
-    XrResult r = xrAcquireSwapchainImage_(s->sc[0], NULL, &idx);
-    if (XR_FAILED(r)) { *why = "xrAcquireSwapchainImage"; return 1; }
-    XrSwapchainImageWaitInfo wi = { .type = XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO, .timeout = 1000000000 };
-    r = xrWaitSwapchainImage_(s->sc[0], &wi);
-    if (XR_FAILED(r) || r == XR_TIMEOUT_EXPIRED) { *why = "xrWaitSwapchainImage"; return 1; }
+    int ne = k->projection ? 2 : 1;
+    uint32_t idx[2] = { 0, 0 };
+    XrResult r;
+    for (int e = 0; e < ne; e++) {
+        r = xrAcquireSwapchainImage_(s->sc[e], NULL, &idx[e]);
+        if (XR_FAILED(r)) { *why = "xrAcquireSwapchainImage"; return 1; }
+        XrSwapchainImageWaitInfo wi = { .type = XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO, .timeout = 1000000000 };
+        r = xrWaitSwapchainImage_(s->sc[e], &wi);
+        if (XR_FAILED(r) || r == XR_TIMEOUT_EXPIRED) { *why = "xrWaitSwapchainImage"; return 1; }
+    }
 
     if (k->xfence_used[fidx]) {
         if (vkWaitForFences_(d, 1, &k->xfence[fidx], VK_TRUE, 2000000000ull) != VK_SUCCESS) { *why = "vkWaitForFences (previous use of this command buffer)"; return 1; }
@@ -1473,17 +1479,20 @@ static int sk_show(struct bmvr_xr_sink *k, int slot, int fidx, int fresh, uint32
     VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
     vkResetCommandBuffer_(cb, 0);
     vkBeginCommandBuffer_(cb, &bi);
-    VkImage dst = s->img[0][idx].image, src = k->slot_img[slot][0];
-    VkImageMemoryBarrier pre[2] = {
-        st_img_barrier(src, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT),
-        st_img_barrier(dst, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT) };
-    vkCmdPipelineBarrier_(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 2, pre);
     VkImageCopy ic = { .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, .extent = { s->w, s->h, 1 } };
-    vkCmdCopyImage_(cb, src, VK_IMAGE_LAYOUT_GENERAL, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &ic);
+    for (int e = 0; e < ne; e++) {
+        VkImage dst_e = s->img[e][idx[e]].image, src_e = k->slot_img[slot][e];
+        VkImageMemoryBarrier pre[2] = {
+            st_img_barrier(src_e, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT),
+            st_img_barrier(dst_e, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT) };
+        vkCmdPipelineBarrier_(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 2, pre);
+        vkCmdCopyImage_(cb, src_e, VK_IMAGE_LAYOUT_GENERAL, dst_e, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &ic);
+    }
+    VkImage dst = s->img[0][idx[0]].image; /* the readback below looks at swapchain eye 0 */
 
     int check = fresh && k->check_left > 0;
     int check_sc = check && s->usage_src;
-    if (check) { /* a few pixels of every stage, to see what really arrived: swapchain image, ring eye 0, ring eye 1 */
+    if (check) { /* a few pixels of every stage, to see what really arrived: swapchain image(s), ring eye 0, ring eye 1 */
         VkBufferImageCopy row = { .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, .imageExtent = { 16, 1, 1 } };
         if (check_sc) {
             VkImageMemoryBarrier t = st_img_barrier(dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
@@ -1501,8 +1510,10 @@ static int sk_show(struct bmvr_xr_sink *k, int slot, int fidx, int fresh, uint32
             .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .buffer = k->chk_buf, .size = VK_WHOLE_SIZE };
         vkCmdPipelineBarrier_(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 0, NULL, 1, &bm, 0, NULL);
     }
-    VkImageMemoryBarrier post = st_img_barrier(dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
-    vkCmdPipelineBarrier_(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0, NULL, 1, &post);
+    for (int e = 0; e < ne; e++) {
+        VkImageMemoryBarrier post = st_img_barrier(s->img[e][idx[e]].image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+        vkCmdPipelineBarrier_(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0, NULL, 1, &post);
+    }
     vkEndCommandBuffer_(cb);
 
     VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cb };
@@ -1511,10 +1522,12 @@ static int sk_show(struct bmvr_xr_sink *k, int slot, int fidx, int fresh, uint32
     sk_qunlock(k);
     if (vr != VK_SUCCESS) { *why = "vkQueueSubmit"; return 1; }
     k->xfence_used[fidx] = 1;
-    sk_qlock(k);
-    r = xrReleaseSwapchainImage_(s->sc[0], NULL);
-    sk_qunlock(k);
-    if (XR_FAILED(r)) { *why = "xrReleaseSwapchainImage"; return 1; }
+    for (int e = 0; e < ne; e++) {
+        sk_qlock(k);
+        r = xrReleaseSwapchainImage_(s->sc[e], NULL);
+        sk_qunlock(k);
+        if (XR_FAILED(r)) { *why = "xrReleaseSwapchainImage"; return 1; }
+    }
 
     if (check) {
         if (vkWaitForFences_(d, 1, &k->xfence[fidx], VK_TRUE, 5000000000ull) != VK_SUCCESS) { *why = "vkWaitForFences (readback)"; return 1; }
@@ -1552,6 +1565,7 @@ static void *sk_thread(void *arg)
     int last_fidx = -1;
     double win_start = now_ms();
     uint64_t xr_frames = 0, empty_frames = 0;
+    int view_fallback_logged = 0;
 
     while (!atomic_load_explicit(&k->stop, memory_order_acquire)) {
         if (st_events(s, NULL)) { sk_fail(k, "the OpenXR runtime ended the session (state %s)", session_state_name(s->state)); break; }
@@ -1572,6 +1586,8 @@ static void *sk_thread(void *arg)
         xr_frames++;
 
         XrCompositionLayerQuad quad;
+        XrCompositionLayerProjection proj;
+        XrCompositionLayerProjectionView pv[2];
         const XrCompositionLayerBaseHeader *layers[1];
         uint32_t nlayers = 0;
         if (fs.shouldRender) {
@@ -1584,10 +1600,36 @@ static void *sk_thread(void *arg)
                 if (k->xfence_used[fidx]) last_fidx = fidx;
                 frame_no++;
                 XrRect2Di rect = { { 0, 0 }, { (int32_t)s->w, (int32_t)s->h } };
-                quad = (XrCompositionLayerQuad){ .type = XR_TYPE_COMPOSITION_LAYER_QUAD, .layerFlags = 0, .space = k->head_locked ? s->view_space : k->world_space, .eyeVisibility = XR_EYE_VISIBILITY_BOTH,
-                    .subImage = { .swapchain = s->sc[0], .imageRect = rect, .imageArrayIndex = 0 },
-                    .pose = { .orientation = { 0, 0, 0, 1 }, .position = { 0, 0, -2.0f } }, .size = { 1.6f * (float)s->w / (float)s->h, 1.6f } };
-                layers[nlayers++] = (const XrCompositionLayerBaseHeader *)&quad;
+                if (!k->projection) {
+                    quad = (XrCompositionLayerQuad){ .type = XR_TYPE_COMPOSITION_LAYER_QUAD, .layerFlags = 0, .space = k->head_locked ? s->view_space : k->world_space, .eyeVisibility = XR_EYE_VISIBILITY_BOTH,
+                        .subImage = { .swapchain = s->sc[0], .imageRect = rect, .imageArrayIndex = 0 },
+                        .pose = { .orientation = { 0, 0, 0, 1 }, .position = { 0, 0, -2.0f } }, .size = { 1.6f * (float)s->w / (float)s->h, 1.6f } };
+                    layers[nlayers++] = (const XrCompositionLayerBaseHeader *)&quad;
+                } else {
+                    /* X3: both eyes, head-locked (VIEW space). Pose/FOV: the runtime's own eye poses (no game pose exists before X4);
+                     * if the runtime gives none, pinned ones (64 mm apart, symmetric 90 degrees). Eye 0 = left view, eye 1 = right view. */
+                    XrView views[2] = { { .type = XR_TYPE_VIEW }, { .type = XR_TYPE_VIEW } };
+                    XrViewState vs = { .type = XR_TYPE_VIEW_STATE };
+                    XrViewLocateInfo li = { .type = XR_TYPE_VIEW_LOCATE_INFO, .viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO,
+                        .displayTime = fs.predictedDisplayTime, .space = s->view_space };
+                    uint32_t nvw = 0;
+                    sk_qlock(k);
+                    XrResult lr = xrLocateViews_(c->sess, &li, &vs, 2, &nvw, views);
+                    sk_qunlock(k);
+                    int vok = XR_SUCCEEDED(lr) && nvw == 2 && (vs.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT) && (vs.viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT);
+                    if (!vok) {
+                        if (!view_fallback_logged) { XLOG("xr-sink[projection]: xrLocateViews gave no valid views (%s, flags 0x%llx): using pinned eye poses", xr_rs(c->inst, lr), (unsigned long long)vs.viewStateFlags); view_fallback_logged = 1; }
+                        for (int e = 0; e < 2; e++) {
+                            views[e].pose = (XrPosef){ .orientation = { 0, 0, 0, 1 }, .position = { e ? 0.032f : -0.032f, 0, 0 } };
+                            views[e].fov = (XrFovf){ -0.785398f, 0.785398f, 0.785398f, -0.785398f };
+                        }
+                    }
+                    for (int e = 0; e < 2; e++)
+                        pv[e] = (XrCompositionLayerProjectionView){ .type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW, .pose = views[e].pose, .fov = views[e].fov,
+                            .subImage = { .swapchain = s->sc[e], .imageRect = rect, .imageArrayIndex = 0 } };
+                    proj = (XrCompositionLayerProjection){ .type = XR_TYPE_COMPOSITION_LAYER_PROJECTION, .layerFlags = 0, .space = s->view_space, .viewCount = 2, .views = pv };
+                    layers[nlayers++] = (const XrCompositionLayerBaseHeader *)&proj;
+                }
             } else {
                 empty_frames++; /* no pair has completed yet: show nothing */
             }
@@ -1684,20 +1726,23 @@ int bmvr_xr_sink_open(const struct bmvr_xr_sink_opts *o, struct bmvr_xr_sink **o
     k->sem_ok = o->no_semaphores; /* temporarily "--no-semaphores"; sk_make_gpu_objects turns it into the real answer */
     k->check_left = o->check_pairs > 0 ? o->check_pairs : 0;
     k->head_locked = o->quad_head_locked;
+    k->projection = o->layer == 1;
     s->want_src = k->check_left > 0;
     pthread_mutex_init(&k->qmu, NULL);
     pthread_mutex_init(&k->stat_mu, NULL);
     bmvr_ring_init(&k->ring);
 
-    int unavailable = 0, failed = st_open(s, o->width, o->height, 1, &unavailable);
+    int unavailable = 0, failed = 0;
+    if (k->projection && k->eyes < 2) { ledger("projection layer", 0, 1, "--xr-layer projection needs --eyes 2 (two shared images)"); failed = 1; }
+    if (!failed) failed = st_open(s, o->width, o->height, 1, &unavailable);
     if (!failed && !unavailable) {
         VkPhysicalDeviceIDProperties idp = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES };
         VkPhysicalDeviceProperties2 pp = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &idp };
         vkGetPhysicalDeviceProperties2_(s->c.phys, &pp);
         print_uuid("runtime-chosen GPU device UUID (the shim logs the GL one; they must match): ", idp.deviceUUID);
-        failed = st_make_swapchains(s, 1);
+        failed = st_make_swapchains(s, k->projection ? 2 : 1);
     }
-    if (!failed && !unavailable && !k->head_locked) {
+    if (!failed && !unavailable && !k->head_locked && !k->projection) {
         XrReferenceSpaceCreateInfo rsi = { .type = XR_TYPE_REFERENCE_SPACE_CREATE_INFO, .referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL,
             .poseInReferenceSpace = { .orientation = { 0, 0, 0, 1 } } };
         XrResult lr = xrCreateReferenceSpace_(s->c.sess, &rsi, &k->world_space);
@@ -1728,7 +1773,8 @@ int bmvr_xr_sink_open(const struct bmvr_xr_sink_opts *o, struct bmvr_xr_sink **o
         XLOG("--sink xr: FAILED (see the FAIL line above): refusing to fall back to snapshots");
         return BMVR_XR_PROBE_FAILED;
     }
-    XLOG("--sink xr: ready. %d eye(s) of %ux%u, %s. Quad layer (eye 0), %s, 2 m ahead.", k->eyes, s->w, s->h, k->sem_ok ? "GPU semaphores offered" : "no semaphores (glFinish + ack)", k->head_locked ? "head-locked" : "fixed in the room (LOCAL space)");
+    if (k->projection) XLOG("--sink xr: ready. %d eye(s) of %ux%u, %s. Stereo projection layer (eye 0 = left, eye 1 = right), head-locked.", k->eyes, s->w, s->h, k->sem_ok ? "GPU semaphores offered" : "no semaphores (glFinish + ack)");
+    else XLOG("--sink xr: ready. %d eye(s) of %ux%u, %s. Quad layer (eye 0), %s, 2 m ahead.", k->eyes, s->w, s->h, k->sem_ok ? "GPU semaphores offered" : "no semaphores (glFinish + ack)", k->head_locked ? "head-locked" : "fixed in the room (LOCAL space)");
     *out = k;
     return BMVR_XR_PROBE_OK;
 }

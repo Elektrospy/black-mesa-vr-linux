@@ -185,7 +185,7 @@ runtime-initialized / ... / headset presentation verified). A status is written 
 | X0 | `bmvr_xr_sink` skeleton, `--xr-probe`: instance, system, view config, swapchain formats, session create/destroy, no game, no frames | Monado **and** SteamVR | Logs runtime name/version/extensions/formats on both; confirms or corrects every *(verify)* above; helper exits cleanly. **Status: implemented; Monado 21.0.0 (sandbox) PASS; SteamVR 2.19.4 + RTX 3080 PASS (author's run)** |
 | X1 | `--selftest-xr`: frame loop with a generated pattern (left tinted one way, right the other, frame counter), quad then projection | Monado sim/qwerty first, then a headset | Correct eye order; steady `xrWaitFrame` cadence; rate lines sane; no per-frame disk writes. **Status: implemented; SteamVR 2.19.4 + RTX 3080 PASS, "L" blue / "R" red seen in the headset (author's run); Monado not run** (see "X1 results") |
 | X2 | Socket sink: pair -> ring -> swapchain, quad layer, eye 0 | game + runtime | **Status: implemented; stand-in tests PASS on Monado + lavapipe; NOT verified with the game, semaphores, SteamVR or a headset** (see "X2 results"). Game picture visible in the headset on each runtime; `test_kill_loop.sh -n 10`, then 30, passes with `--sink xr` (helper killed at random points: game unaffected, helper-less period shows nothing or last image, reconnect restores the picture) |
-| X3 | Projection layer with a pinned pose; `target2=name:_rt_gblightdiff` | as X2 | Left and right visibly different content, correct sides, no eye ever shows a different tick than the other |
+| X3 | Projection layer with a pinned pose; `target2=name:_rt_gblightdiff` (**implemented 2026-11-21, compiles clean, NOT run with the game/headset**: `--sink xr --eyes 2 --xr-layer projection`; two swapchains, eye 0 = left, eye 1 = right, head-locked VIEW space, runtime eye poses with pinned fallback) | as X2 | Left and right visibly different content, correct sides, no eye ever shows a different tick than the other |
 | X4 | Protocol v5 pose channel, mock-tested (`mock_game` replays poses; new case T20+) | none (stand-ins) | Pair slots carry their own `pose_id`; stale id handled; v4 peer rejected with both versions named. Real use waits for the hook port |
 
 Test additions in `tests/linux`: a stand-in for the XR side is not practical (the point is the real runtime), so X1-X3 are
@@ -386,6 +386,16 @@ Reported, not measured (no logs were attached yet):
   behaviour. Checked only that both start on Monado. The author also saw the game as a "floating desktop application" in the headset; that is
   not explained (probably SteamVR's own desktop/window overlay of the game window, not this sink) and has not been investigated.
 - Not yet reported: whether `sync=sem` delivered pairs at all in this run, the helper's rate/check lines, the UUID lines.
+
+### X2 `sync=sem` crash (author's logs, 2026-11-21)
+
+`sync=finish`: stable through a level load. `sync=sem`: after ~65 s of normal running (25-30 pairs/s, no drops), during a level load
+(game 14.7 fps, 600+ CreateTexture per window, then frames with 0 SetRenderTarget), the helper's `vkQueueSubmit` returned
+`VK_ERROR_DEVICE_LOST` (-4) and SteamVR showed Fail -203. **Cause not established.** Suspects: (1) the transport's wait(gl_ready)
+submission blocks the single shared VkQueue while GL is slow, stalling the XR thread's copy behind it; (2) async lifetime of the source
+texture without glFinish; (3) SteamVR 2.19.4 beta / NVIDIA 620.73 with imported opaque-fd binary semaphores. Bisect: `sem` + extra
+`glFinish` after the signal; separate VkQueue for the transport; `journalctl -k | grep -i xid`; Vulkan validation layer on the helper.
+Use `sync=finish` for X3 until this is resolved.
 
 ## Risks and open questions
 
