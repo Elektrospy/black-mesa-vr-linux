@@ -671,7 +671,7 @@ input, no hands or weapon at the controller, no HUD in the world on Linux.
 - The i386 inline-patch code (`bmvr_inline_hook`) was only syntax-checked where it was written; the decoder has 12 unit checks (`inline_test.c`).
   It ran correctly in the real game (hook installed, trampoline called) but nothing tested the 32-bit build in CI.
 - Why exactly the pairs stopped without `mat_queue_mode 0` (hypothesis above).
-- `+mat_queue_mode 0` is still a manual launch option; make it automatic (`bmvr-bms.sh` / `bmvr.cfg`) and make `stereo=1` + `stereo_hook=inline` the shipped defaults.
+- ~~`+mat_queue_mode 0` manual; defaults~~ Done (not yet re-run in the game): `scripts/build-linux.sh` now generates `bmvr-bms.sh` which appends `+mat_queue_mode 0` (opt out with `BMVR_KEEP_QUEUE=1`), and writes a default `bmvr_target.txt` (`target=InternalRT0 flip=0 sync=sem every=1 stereo=1 stereo_hook=inline`) only when none exists. The shim's own code defaults are unchanged (stereo stays opt-in, `stereo_hook=auto`) so the stand-in suite is unaffected. Launch options are just `"<game folder>/bmvr-run.sh" %command%` again.
 - Frame pacing: the game delivers ~30 pairs/s against a 90 Hz compositor (helper log: `pairs=30/s displayed=90/s reused=60/s`). The Windows
   "one pair per `xrWaitFrame` pose" handshake (`docs/openxr-eye-publish.md`) is not ported.
 - Which class (`CViewRender` or `CBlackMesaViewRender`) the engine instantiates; the inline detour makes this irrelevant for `RenderView` itself.
@@ -679,3 +679,9 @@ input, no hands or weapon at the controller, no HUD in the world on Linux.
 **Next stages (plan):** (1) defaults and cleanup above; (2) OpenXR controller input (action set in the helper, channel to the shim, aim from the
 controller; see `docs/LINUX_OPENXR_CONSUMER.md` on input); (3) hands/viewmodel at the controller pose, off D3D9-on-DXVK; (4) HUD in the world,
 bloom/exposure on the eyes, frame pacing.
+
+**Helper auto-start (compiled as a script, `bash -n` only; not run):** the generated `bmvr-run.sh` starts `bmvr_xfer_helper --sink xr --eyes 2 --xr-layer projection`
+(override with `BMVR_HELPER_ARGS`, skip with `BMVR_NO_HELPER=1`) in the background, logs to `bmvr_helper_log.txt`, waits 2 s, and keeps the helper
+only if it is still alive (a second helper exits at once on the flock). It no longer `exec`s the game: it waits for it, returns its exit
+status and sends the helper SIGINT only if this script started it. SteamVR must already be running (the helper exits otherwise; the game
+then starts mono-pair as before). Replaces the manual "start the helper in a terminal first" step.

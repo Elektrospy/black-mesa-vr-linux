@@ -156,7 +156,7 @@ if [[ -n "$TARGET" ]]; then  GAME="${TARGET%/}"
   cat > "$GAME/bmvr-run.sh" <<'WRAP'
 #!/bin/sh
 # Black Mesa VR (native Linux), HOST side. Steam launch options:   "<game folder>/bmvr-run.sh" %command%
-# Replaces the ".../bms.sh" argument by ".../bmvr-bms.sh" (see build-linux.sh), then runs the command.
+# Starts the OpenXR helper (see below) and replaces the ".../bms.sh" argument by ".../bmvr-bms.sh" (see build-linux.sh), then runs the command.
 D="$(cd "$(dirname "$0")" && pwd)"
 swapped=0
 n=$#
@@ -171,7 +171,29 @@ while [ "$n" -gt 0 ]; do
   n=$((n - 1))
 done
 { date; echo "stage: host wrapper (outside the container)"; echo "swapped bms.sh -> bmvr-bms.sh: $swapped"; echo "args: $*"; } > "$D/bmvr_run_marker.txt" 2>/dev/null
-exec "$@"
+# Start the 64-bit OpenXR helper (it owns the headset session) unless one is already running (its flock refuses a second) or
+# BMVR_NO_HELPER=1. Stopped again when the game exits, but only if THIS script started it. Log: bmvr_helper_log.txt.
+hpid=""
+if [ -z "$BMVR_NO_HELPER" ] && [ -x "$D/bmvr_xfer_helper" ]; then
+  if [ -n "$BMVR_HELPER_ARGS" ]; then hargs="$BMVR_HELPER_ARGS"; else hargs="--sink xr --eyes 2 --xr-layer projection"; fi
+  # shellcheck disable=SC2086
+  "$D/bmvr_xfer_helper" $hargs > "$D/bmvr_helper_log.txt" 2>&1 &
+  hpid=$!
+  sleep 2
+  kill -0 "$hpid" 2>/dev/null || hpid=""   # exited at once: another helper holds the lock, or the runtime is not up; the game starts anyway
+fi
+"$@"
+rc=$?
+if [ -n "$hpid" ]; then
+  # SIGINT first (the helper ends its XR session cleanly); a background job of a non-interactive shell may have SIGINT ignored, so escalate.
+  kill -INT "$hpid" 2>/dev/null
+  i=0; while kill -0 "$hpid" 2>/dev/null && [ "$i" -lt 15 ]; do sleep 0.2; i=$((i + 1)); done
+  kill -0 "$hpid" 2>/dev/null && kill -TERM "$hpid" 2>/dev/null
+  i=0; while kill -0 "$hpid" 2>/dev/null && [ "$i" -lt 10 ]; do sleep 0.2; i=$((i + 1)); done
+  kill -0 "$hpid" 2>/dev/null && kill -KILL "$hpid" 2>/dev/null
+  wait "$hpid" 2>/dev/null
+fi
+exit "$rc"
 WRAP
   cat > "$GAME/bmvr-bms.sh" <<'INNER'
 #!/bin/sh
@@ -183,9 +205,17 @@ D="$(cd "$(dirname "$0")" && pwd)"
 export LD_LIBRARY_PATH="$D/bin${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export LD_PRELOAD="bmvr_preload32.so${LD_PRELOAD:+:$LD_PRELOAD}"
 { date; echo "stage: inside the container"; echo "LD_PRELOAD=$LD_PRELOAD"; echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH"; } > "$D/bmvr_inner_marker.txt" 2>/dev/null
+# Stereo needs the game to render on the thread that owns the GL context: queued rendering (mat_queue_mode 2) moved
+# RenderView onto a thread without one and the stereo pairs stopped after ~35 frames. BMVR_KEEP_QUEUE=1 leaves the game's own choice.
+if [ -z "$BMVR_KEEP_QUEUE" ]; then set -- "$@" +mat_queue_mode 0; fi
 exec "${BMVR_REAL_BMS:-$D/bms.sh}" "$@"
 INNER
   chmod +x "$GAME/bmvr-run.sh" "$GAME/bmvr-bms.sh"
+  # Working stereo configuration (verified in the headset 2026-11-22). Written only when the file does not exist: an existing one is never touched.
+  if [[ ! -e "$GAME/bmvr_target.txt" ]]; then
+    printf 'target=InternalRT0\nflip=0\nsync=sem\nevery=1\nstereo=1\nstereo_hook=inline\n' > "$GAME/bmvr_target.txt"
+    echo "Wrote default $GAME/bmvr_target.txt (stereo=1, stereo_hook=inline)"
+  fi
   echo "Copied to $GAME/bin/bmvr_preload32.so and wrote bmvr-run.sh + bmvr-bms.sh (bms.sh untouched)"
   if [[ -n "$HELPER" ]]; then cp -f "$HELPER" "$GAME/bmvr_xfer_helper" && chmod +x "$GAME/bmvr_xfer_helper" && echo "Installed $GAME/bmvr_xfer_helper (64-bit, stages 2a-3a)"; fi
 
