@@ -57,6 +57,7 @@ int main(int argc, char **argv) {
         a.input.buttons = 0; a.input.stick[1][1] = 0.0f;
         if (n >= 10) { a.input.stick[0][1] = 1.0f; a.input.trigger[1] = 1.0f; a.input.stick[1][0] = 0.8f; }
         if (n >= 20) a.input.squeeze[1] = 1.0f;
+        if (n >= 30 && n < 34) a.input.buttons |= BMVR_XFER_BTN_MENU;   /* the left Menu/View button, held for four acks: one press */
       }
       a.input.aim[0][3] = a.input.aim[1][3] = a.input.grip[0][3] = a.input.grip[1][3] = 1.0f;
     }

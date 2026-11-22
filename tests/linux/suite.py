@@ -377,6 +377,7 @@ check('right trigger became IN_ATTACK on the same cmds', c and c['attack']>=c['m
 check('keyboard bits the engine put in the cmd survive', c and c['kbd_lost']==0, str(c))
 check('right stick turned the view to the right (yaw below the starting 10)', c and c['turned']>=100 and c['minyaw']<10.0, str(c))
 check('the flashlight squeeze gave exactly one impulse 100', c and c['imp100']==1, str(c))
+check('the Menu button pushed exactly one Escape key press (down, then up) into SDL', tr.count('SDL_PushEvent type=0x300 scancode=41 sym=27')==1 and tr.count('SDL_PushEvent type=0x301 scancode=41 sym=27')==1, tr[-300:])
 check('input flag removed at a clean exit', not os.path.exists(f'{R}/cases/t32/bmvr_in_input.flag'))
 
 print('T33 input=1 with the helper offering no input: nothing is written, nothing breaks')

@@ -122,4 +122,8 @@ void *SDL_GL_GetProcAddress(const char *name)
         if (!strcmp(tab[i].n, name)) return (tab[i].sem && NOSEM) ? NULL : tab[i].f;
     return NULL;
 }
+/* keyboard injection: the shim pushes Escape for the Menu button; recorded in the trace */
+int SDL_PushEvent(void *ev) { uint32_t type; int32_t sc, sym; memcpy(&type, ev, 4); memcpy(&sc, (char *)ev + 16, 4); memcpy(&sym, (char *)ev + 20, 4); T("SDL_PushEvent type=0x%x scancode=%d sym=%d", type, sc, sym); return 1; }
+void *SDL_GetKeyboardFocus(void) { return (void *)1; }
+uint32_t SDL_GetWindowID(void *w) { (void)w; return 7; }
 void *SDL_GL_GetCurrentContext(void) { return getenv("MOCK_NO_CTX") ? NULL : (void *)1; }

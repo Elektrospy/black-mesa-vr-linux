@@ -462,6 +462,7 @@ static int g_ic_class_explicit;
 static int g_ic_probe = 1;                        /* input_probe=0 turns off watching the subclasses' vtables too */
 static int g_ic_slot = 22;                         /* input_slot= */
 static float g_ic_turn_speed = 180.0f;             /* input_turn_speed= degrees per second at full stick (smooth turning) */
+static int g_ic_turn_analog = 1;                   /* input_turn_analog=0: one constant speed past the deadzone; default 1: the speed scales with the stick's deflection */
 static float g_ic_snap = 0.0f;                     /* input_snap= degrees per flick; 0 = smooth turning */
 static volatile int g_st_recenter_req;             /* the right stick click asks the stereo rig to recenter on its next frame */
 
@@ -593,6 +594,7 @@ static void load_cfg_once(void)
             else if (!strncmp(line, "input=", 6)) g_ic_want = line[6] == '1';
             else if (!strncmp(line, "input_module=", 13)) snprintf(g_ic_module, sizeof g_ic_module, "%.95s", line + 13);
             else if (!strncmp(line, "input_class=", 12)) { snprintf(g_ic_class, sizeof g_ic_class, "%.63s", line + 12); g_ic_class_explicit = 1; }
+            else if (!strncmp(line, "input_turn_analog=", 18)) g_ic_turn_analog = line[18] != '0';
             else if (!strncmp(line, "input_probe=", 12)) g_ic_probe = line[12] != '0';
             else if (!strncmp(line, "input_slot=", 11)) {
                 long v = strtol(line + 11, NULL, 10);
@@ -2045,8 +2047,17 @@ static void ic_apply(float dt, struct bmvr_usercmd *cmd)
         if (!bmvr_get_input(&again) || again.seq != in.seq) in = again;
     }
     if (!g_ic_map_ready) { bmvr_input_map_init(&g_ic_map); g_ic_map_ready = 1; }
-    float dt_ms = dt * 1000.0f;
-    if (!(dt_ms > 0.5f && dt_ms < 250.0f)) dt_ms = 11.0f;
+    /* Real time since the previous call, from the wall clock: turning is degrees per SECOND times that time, so the total turn is the same at any frame
+     * rate and under load (the engine's flInputSampleTime is not always the real frame time, and a fixed fallback made the speed follow the frame rate).
+     * Not clamped upwards below a quarter second, so a hitch still turns the view by the time it took; a longer gap (pause, loading) counts as one frame. */
+    float dt_ms;
+    {   static uint64_t last_ns;
+        const uint64_t n = now_ns();
+        dt_ms = last_ns && n >= last_ns ? (float)((double)(n - last_ns) / 1e6) : 11.0f;
+        last_ns = n;
+        if (dt_ms > 250.0f) dt_ms = 11.0f;
+        (void)dt;
+    }
     struct bmvr_cmd c;
     bmvr_input_map_step(&g_ic_map, &in, dt_ms, &c);
 
@@ -2070,14 +2081,17 @@ static void ic_apply(float dt, struct bmvr_usercmd *cmd)
     if (g_ic_snap > 0.0f) {
         if (fabsf(c.turn) < 0.3f) g_ic_snap_latched = 0;
         else if (fabsf(c.turn) > 0.7f && !g_ic_snap_latched) { g_ic_snap_latched = 1; cmd->viewangles[1] -= (c.turn > 0.0f ? 1.0f : -1.0f) * g_ic_snap; }
-    } else cmd->viewangles[1] -= c.turn * g_ic_turn_speed * (dt_ms / 1000.0f);
+    } else {
+        const float dir = g_ic_turn_analog ? c.turn : (c.turn > 0.0f ? 1.0f : c.turn < 0.0f ? -1.0f : 0.0f);   /* constant speed: past the deadzone it is all or nothing */
+        cmd->viewangles[1] -= dir * g_ic_turn_speed * (dt_ms / 1000.0f);
+    }
     while (cmd->viewangles[1] > 180.0f) cmd->viewangles[1] -= 360.0f;
     while (cmd->viewangles[1] < -180.0f) cmd->viewangles[1] += 360.0f;
 
     cmd->buttons |= (int)c.buttons;
     if (c.events & BMVR_EV_FLASHLIGHT) cmd->impulse = 100;
     if (c.events & BMVR_EV_RECENTER) g_st_recenter_req = 1;
-    if (c.events & BMVR_EV_PAUSE) ic_unwired(BMVR_EV_PAUSE, "pause");
+    /* BMVR_EV_PAUSE: handled in ic_menu_tick (Present rate, so it also works while the game is paused or in a menu and CreateMove does not run) */
     if (c.events & (BMVR_EV_WEAPON_PREV | BMVR_EV_WEAPON_NEXT)) ic_unwired(BMVR_EV_WEAPON_NEXT, "previous/next weapon");
     if (c.events & (BMVR_EV_WHEEL_OPEN | BMVR_EV_WHEEL_SELECT)) ic_unwired(BMVR_EV_WHEEL_OPEN, "the weapon wheel");
     g_ic_applied++;
@@ -2212,6 +2226,61 @@ static void ic_try_install(void)
     }
 }
 
+/* The Menu button opens and closes the game menu: Escape is pushed into SDL's event queue (the engine reads its keyboard from there). Runs once per Present, not
+ * from CreateMove, which does not run while a menu is up or the game is paused. */
+typedef int (*PFN_SDL_PushEvent)(void *);
+typedef void *(*PFN_SDL_GetKeyboardFocus)(void);
+typedef unsigned (*PFN_SDL_GetWindowID)(void *);
+static PFN_SDL_PushEvent g_sdl_push;
+static PFN_SDL_GetKeyboardFocus g_sdl_focus;
+static PFN_SDL_GetWindowID g_sdl_winid;
+static int g_sdl_tried;
+static unsigned g_menu_prev_seq, g_menu_prev_down, g_menu_release_tick, g_menu_presses;
+static int g_menu_have_prev;
+
+static void ic_sdl_key(int down)
+{
+    if (!g_sdl_tried) {
+        g_sdl_tried = 1;
+        void *h = NULL;
+        g_sdl_push = (PFN_SDL_PushEvent)dlsym(RTLD_DEFAULT, "SDL_PushEvent");
+        if (!g_sdl_push) { h = find_loaded_lib("libSDL2-2.0.so.0", "libSDL2"); if (h) g_sdl_push = (PFN_SDL_PushEvent)dlsym(h, "SDL_PushEvent"); }
+        if (g_sdl_push) {
+            g_sdl_focus = (PFN_SDL_GetKeyboardFocus)dlsym(h ? h : RTLD_DEFAULT, "SDL_GetKeyboardFocus");
+            g_sdl_winid = (PFN_SDL_GetWindowID)dlsym(h ? h : RTLD_DEFAULT, "SDL_GetWindowID");
+        } else bmvr_log("input: the Menu button cannot open the game menu: SDL_PushEvent was not found");
+    }
+    if (!g_sdl_push) return;
+    unsigned char ev[56];                       /* SDL_Event: 56 bytes; SDL_KeyboardEvent uses the first 32 */
+    memset(ev, 0, sizeof ev);
+    uint32_t type = down ? 0x300u : 0x301u;     /* SDL_KEYDOWN / SDL_KEYUP */
+    uint32_t win = 0;
+    if (g_sdl_focus && g_sdl_winid) { void *w = g_sdl_focus(); if (w) win = g_sdl_winid(w); }
+    int32_t scancode = 41, sym = 27;            /* SDL_SCANCODE_ESCAPE, SDLK_ESCAPE */
+    memcpy(ev + 0, &type, 4);
+    memcpy(ev + 8, &win, 4);
+    ev[12] = down ? 1 : 0;                      /* state */
+    memcpy(ev + 16, &scancode, 4);
+    memcpy(ev + 20, &sym, 4);
+    g_sdl_push(ev);
+}
+
+static void ic_menu_tick(void)
+{
+    if (!g_ic_want) return;
+    if (g_menu_release_tick && g_x_tick >= g_menu_release_tick) { g_menu_release_tick = 0; ic_sdl_key(0); }
+    struct bmvr_xfer_input in;
+    if (!bmvr_get_input(&in) || !(in.flags & BMVR_XFER_INPUT_FOCUSED)) return;
+    const unsigned down = (in.buttons & BMVR_XFER_BTN_MENU) || ((in.buttons >> 8) & BMVR_XFER_BTN_MENU);
+    if (!g_menu_have_prev) { g_menu_have_prev = 1; g_menu_prev_down = down; return; }   /* a button already held at start is not a press */
+    if (down && !g_menu_prev_down && !g_menu_release_tick) {
+        ic_sdl_key(1);
+        g_menu_release_tick = g_x_tick + 2;     /* the key stays down for a couple of frames, like a real press */
+        if (g_menu_presses++ < 5) bmvr_log("input: Menu button -> Escape (game menu)");
+    }
+    g_menu_prev_down = down;
+}
+
 static void ic_status_tick(void)
 {
     if (!g_ic_want || g_ic_state != 1 || g_x_tick == g_ic_hook_tick) return;
@@ -2275,6 +2344,7 @@ static void xfer_tick(void)
     st_status_tick();
     ic_try_install();
     ic_status_tick();
+    ic_menu_tick();
     if (g_x_tick % g_x_every == 0) {
         if (g_st_sent) {
             g_st_sent = 0;   /* stage 4b: the stereo hook already delivered this frame's pair, mid-frame */

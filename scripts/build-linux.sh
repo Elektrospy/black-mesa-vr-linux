@@ -213,8 +213,8 @@ INNER
   chmod +x "$GAME/bmvr-run.sh" "$GAME/bmvr-bms.sh"
   # Working stereo configuration (verified in the headset 2026-11-22). Written only when the file does not exist: an existing one is never touched.
   if [[ ! -e "$GAME/bmvr_target.txt" ]]; then
-    printf 'target=InternalRT0\nflip=0\nsync=sem\nevery=1\nstereo=1\nstereo_hook=inline\n' > "$GAME/bmvr_target.txt"
-    echo "Wrote default $GAME/bmvr_target.txt (stereo=1, stereo_hook=inline)"
+    printf 'target=InternalRT0\nflip=0\nsync=sem\nevery=1\nstereo=1\nstereo_hook=inline\ninput=1\n' > "$GAME/bmvr_target.txt"
+    echo "Wrote default $GAME/bmvr_target.txt (stereo=1, stereo_hook=inline, input=1)"
   fi
   echo "Copied to $GAME/bin/bmvr_preload32.so and wrote bmvr-run.sh + bmvr-bms.sh (bms.sh untouched)"
   if [[ -n "$HELPER" ]]; then cp -f "$HELPER" "$GAME/bmvr_xfer_helper" && chmod +x "$GAME/bmvr_xfer_helper" && echo "Installed $GAME/bmvr_xfer_helper (64-bit, stages 2a-3a)"; fi
