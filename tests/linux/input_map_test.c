@@ -138,6 +138,25 @@ int main(void)
         CHECK(s.stick[1][1] == 1.0f && s.stick[0][0] == 0.5f && s.trigger[1] == 0.7f, "sticks only: the trigger stays on its hand");
     }
 
+    /* aim: the controller's pointing direction as Source angles */
+    {   float ang[2];
+        const float ident[7] = { 0, 0, 0, 0, 0, 0, 1 };                     /* OpenXR forward is -Z = Source +X (yaw 0, pitch 0) */
+        CHECK(bmvr_im_aim_angles(ident, 0.0f, ang) && near(ang[0], 0.0f) && near(ang[1], 0.0f), "aim: identity points straight ahead (%.2f %.2f)", ang[0], ang[1]);
+        const float h = 0.70710678f;
+        const float left90[7] = { 0, 0, 0, 0, h, 0, h };                    /* 90 deg about +Y (up): turns to the left (Source yaw +90) */
+        CHECK(bmvr_im_aim_angles(left90, 0.0f, ang) && near(ang[0], 0.0f) && fabsf(ang[1] - 90.0f) < 0.01f, "aim: 90 deg left = yaw +90 (%.2f %.2f)", ang[0], ang[1]);
+        const float up45[7] = { 0, 0, 0, h * 0.92387953f / h, 0, 0, 0.38268343f };   /* 45 deg about +X (tilts the nose up) */
+        CHECK(bmvr_im_aim_angles(up45, 0.0f, ang) && fabsf(ang[0] + 45.0f) < 0.01f, "aim: nose up 45 = pitch -45 (%.2f)", ang[0]);
+        CHECK(bmvr_im_aim_angles(ident, 30.0f, ang) && fabsf(ang[1] - 30.0f) < 0.01f, "aim: a body turn of 30 rotates the aim yaw by 30 (%.2f)", ang[1]);
+        const float bad[7] = { 0, 0, 0, 0, 0, 0, 0 };
+        CHECK(!bmvr_im_aim_angles(bad, 0.0f, ang), "aim: a zero quaternion is refused");
+        const float vert[7] = { 0, 0, 0, 0.70710678f * 1.0f, 0, 0, 0.70710678f };   /* 90 deg about +X: straight up, pitch clamped to -89 */
+        CHECK(bmvr_im_aim_angles(vert, 0.0f, ang) && near(ang[0], -89.0f), "aim: straight up is clamped to -89 (%.2f)", ang[0]);
+        struct bmvr_xfer_input p = mk(); p.flags |= BMVR_XFER_INPUT_POSE_R;
+        bmvr_im_remap_hands(&p, 1, 0);
+        CHECK((p.flags & BMVR_XFER_INPUT_POSE_L) && !(p.flags & BMVR_XFER_INPUT_POSE_R) && (p.flags & BMVR_XFER_INPUT_FOCUSED), "mirror: the pose-valid flags swap hands too");
+    }
+
     /* no input at all (helper offers none) is a quiet, valid state */
     c = step(&m3, &(struct bmvr_xfer_input){ 0 }, 11.0f);
     struct bmvr_input_map m4; bmvr_input_map_init(&m4); bmvr_input_map_step(&m4, NULL, 11.0f, &c);

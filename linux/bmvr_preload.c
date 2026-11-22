@@ -469,6 +469,12 @@ static int g_ic_move_hand = -1;                    /* input_move_hand=left|right
 static float g_ic_deadzone = 0.15f;                /* input_deadzone= walk stick dead zone, 0.05..0.5 */
 static float g_ic_trigger = 0.55f;                 /* input_trigger= trigger press point, 0.2..0.9 */
 static int g_ic_act[5] = { BMVR_ACT_RELOAD, BMVR_ACT_ATTACK2, BMVR_ACT_JUMP, BMVR_ACT_DUCK, BMVR_ACT_NONE };   /* input_btn_a / b / bumper / x / y */
+static int g_ic_aim;                               /* input_aim=1: shots follow the controller (opt-in, UNVERIFIED in the game) */
+static volatile float g_ic_body_yaw;               /* aim=1: the body yaw the stereo rig must use as the game's yaw */
+static volatile int g_ic_body_valid;
+static float g_ic_last_yaw;                        /* the yaw we wrote into the last cmd */
+static int g_ic_aim_said;
+static int g_ic_armed, g_ic_dead;                  /* defined with their comments further down (tentative definitions; the stereo code reads them) */
 static volatile int g_st_recenter_req;             /* the right stick click asks the stereo rig to recenter on its next frame */
 
 static int game_dir(char *out, size_t cap)
@@ -600,6 +606,7 @@ static void load_cfg_once(void)
             else if (!strncmp(line, "input_module=", 13)) snprintf(g_ic_module, sizeof g_ic_module, "%.95s", line + 13);
             else if (!strncmp(line, "input_class=", 12)) { snprintf(g_ic_class, sizeof g_ic_class, "%.63s", line + 12); g_ic_class_explicit = 1; }
             else if (!strncmp(line, "input_turn_analog=", 18)) g_ic_turn_analog = line[18] != '0';
+            else if (!strncmp(line, "input_aim=", 10)) g_ic_aim = line[10] == '1';
             else if (!strncmp(line, "input_weapon_hand=", 18)) g_ic_weapon_left = !strcmp(line + 18, "left");
             else if (!strncmp(line, "input_move_hand=", 16)) g_ic_move_hand = !strcmp(line + 16, "left") ? 0 : !strcmp(line + 16, "right") ? 1 : -1;
             else if (!strncmp(line, "input_deadzone=", 15)) { float v = (float)atof(line + 15); if (v >= 0.05f && v <= 0.5f) g_ic_deadzone = v; else bmvr_log("input: bad input_deadzone=%s (use 0.05..0.5)", line + 15); }
@@ -1734,7 +1741,7 @@ static int st_try_stereo(void *self, void *view, int clear, int what)
     const uint32_t pose_id = g_x_pose_pending;
     float go[3] = { vs_f(vv, VS_ORIGIN), vs_f(vv, VS_ORIGIN + 4), vs_f(vv, VS_ORIGIN + 8) };
     struct bmvr_view ev[2];
-    if (!bmvr_stereo_eyes(&g_st_rig, &pose, go, vs_f(vv, VS_ANGLES + 4), ev)) { st_note(3, "the pose is unusable (bad quaternion or field of view)"); return 0; }
+    if (!bmvr_stereo_eyes(&g_st_rig, &pose, go, (g_ic_aim && g_ic_body_valid && g_ic_armed && !g_ic_dead) ? g_ic_body_yaw : vs_f(vv, VS_ANGLES + 4), ev)) { st_note(3, "the pose is unusable (bad quaternion or field of view)"); return 0; }
 
     if (!g_st_flag_on && g_st_flag_path[0]) {        /* crash-sticky: present until ST_FLAG_CLEAR_FRAMES good frames or a clean exit */
         int fd = open(g_st_flag_path, O_WRONLY | O_CREAT, 0644);
@@ -2105,21 +2112,53 @@ static void ic_apply(float dt, struct bmvr_usercmd *cmd)
             while (delta < -180.0f) delta += 360.0f;
         }
     }
-    float fm, sm;
-    bmvr_im_move_relative(c.forward, c.side, delta, 450.0f, &fm, &sm);
-    cmd->forwardmove += fm;
-    cmd->sidemove += sm;
+    const float head_rel = delta;   /* head yaw vs the stereo reference, Source degrees (+ = left) */
+
+    /* Yaw bookkeeping. Without aim=1 the game's view yaw IS the body yaw (cmd->viewangles[1]). With aim=1 the cmd's view angles carry the CONTROLLER's aim
+     * (so shots go where the hand points) and the body yaw is kept here instead; the stereo rig reads it back (ic_body_yaw) so the world does not swing
+     * with the hand. Anything that moves the engine's view yaw behind our back (mouse, spawn, teleport) is added to the body yaw. */
+    float yaw = cmd->viewangles[1];
+    if (g_ic_aim) {
+        if (!g_ic_body_valid) { g_ic_body_yaw = yaw; g_ic_last_yaw = yaw; g_ic_body_valid = 1; }
+        float d = yaw - g_ic_last_yaw;
+        while (d > 180.0f) d -= 360.0f;
+        while (d < -180.0f) d += 360.0f;
+        if (fabsf(d) > 25.0f) g_ic_body_yaw = yaw; else g_ic_body_yaw += d;
+        yaw = g_ic_body_yaw;
+    }
 
     /* turning: Source yaw is positive to the LEFT, so a right-stick push SUBTRACTS */
     if (g_ic_snap > 0.0f) {
         if (fabsf(c.turn) < 0.3f) g_ic_snap_latched = 0;
-        else if (fabsf(c.turn) > 0.7f && !g_ic_snap_latched) { g_ic_snap_latched = 1; cmd->viewangles[1] -= (c.turn > 0.0f ? 1.0f : -1.0f) * g_ic_snap; }
+        else if (fabsf(c.turn) > 0.7f && !g_ic_snap_latched) { g_ic_snap_latched = 1; yaw -= (c.turn > 0.0f ? 1.0f : -1.0f) * g_ic_snap; }
     } else {
         const float dir = g_ic_turn_analog ? c.turn : (c.turn > 0.0f ? 1.0f : c.turn < 0.0f ? -1.0f : 0.0f);   /* constant speed: past the deadzone it is all or nothing */
-        cmd->viewangles[1] -= dir * g_ic_turn_speed * (dt_ms / 1000.0f);
+        yaw -= dir * g_ic_turn_speed * (dt_ms / 1000.0f);
     }
-    while (cmd->viewangles[1] > 180.0f) cmd->viewangles[1] -= 360.0f;
-    while (cmd->viewangles[1] < -180.0f) cmd->viewangles[1] += 360.0f;
+    while (yaw > 180.0f) yaw -= 360.0f;
+    while (yaw < -180.0f) yaw += 360.0f;
+    float cmd_yaw = yaw;
+    if (g_ic_aim) {
+        g_ic_body_yaw = yaw;
+        float ang[2];
+        const unsigned want = g_ic_weapon_left ? BMVR_XFER_INPUT_POSE_L : BMVR_XFER_INPUT_POSE_R;
+        if (g_st_rig.have_ref && (in.flags & want) && bmvr_im_aim_angles(in.aim[1], yaw - g_st_rig.ref_yaw, ang)) {
+            cmd->viewangles[0] = ang[0];
+            cmd_yaw = ang[1];
+            if (!g_ic_aim_said++) bmvr_log("input: aim from the %s controller: first aim pitch %.1f yaw %.1f (body yaw %.1f)", g_ic_weapon_left ? "left" : "right", (double)ang[0], (double)ang[1], (double)yaw);
+        }
+    }
+    cmd->viewangles[1] = cmd_yaw;
+    g_ic_last_yaw = cmd_yaw;
+
+    /* movement: the stick is relative to where the HEAD looks. The world direction is body yaw + head_rel; the cmd's moves are relative to cmd_yaw. */
+    {   float d = yaw + head_rel - cmd_yaw, fm, sm;
+        while (d > 180.0f) d -= 360.0f;
+        while (d < -180.0f) d += 360.0f;
+        bmvr_im_move_relative(c.forward, c.side, d, 450.0f, &fm, &sm);
+        cmd->forwardmove += fm;
+        cmd->sidemove += sm;
+    }
 
     cmd->buttons |= (int)c.buttons;
     if (c.events & BMVR_EV_FLASHLIGHT) cmd->impulse = 100;

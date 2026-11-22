@@ -36,6 +36,7 @@
 #include <math.h>
 #include <string.h>
 #include "bmvr_xfer.h"
+#include "bmvr_stereo.h"
 
 /* Same numeric values as the Source engine's IN_* bits (src/sdk/in_buttons.h), so the hook can OR them straight into CUserCmd::buttons. */
 #define BMVR_IN_ATTACK   (1u << 0)
@@ -128,10 +129,30 @@ static inline void bmvr_input_map_init(struct bmvr_input_map *m)
 
 /* Hand assignment: swap_hands mirrors everything (left-handed: weapon in the left hand, walk on the right stick); swap_sticks only exchanges
  * the two sticks (so one hand can both walk and fire). */
+/* The direction a controller points, as Source (pitch, yaw), given its aim pose (pos xyz, quat xyzw, OpenXR LOCAL space) and how far the game's
+ * body yaw is from the stereo reference (the same `turn` the eye views use, so the aim and the picture agree). 0 for an unusable quaternion. */
+static inline int bmvr_im_aim_angles(const float aim[7], float turn_deg, float out[2])
+{
+    float q[4], f[3], t[3], r[3];
+    if (!bmvr_quat_ok(aim + 3, q)) return 0;
+    const float fx[3] = { 0.0f, 0.0f, -1.0f };
+    bmvr_quat_rotate(q, fx, t);
+    bmvr_xr_to_src(t, f);
+    bmvr_rot_z(f, turn_deg, r);
+    const float xy = sqrtf(r[0] * r[0] + r[1] * r[1]);
+    out[0] = atan2f(-r[2], xy) * 180.0f / BMVR_PI_F;
+    out[1] = xy > 0.001f ? atan2f(r[1], r[0]) * 180.0f / BMVR_PI_F : 0.0f;
+    if (out[0] > 89.0f) out[0] = 89.0f;
+    if (out[0] < -89.0f) out[0] = -89.0f;
+    return 1;
+}
+
 static inline void bmvr_im_remap_hands(struct bmvr_xfer_input *in, int swap_hands, int swap_sticks)
 {
     if (swap_hands) {
         float t;
+        { const unsigned p = in->flags & (BMVR_XFER_INPUT_POSE_L | BMVR_XFER_INPUT_POSE_R);
+          in->flags = (in->flags & ~(BMVR_XFER_INPUT_POSE_L | BMVR_XFER_INPUT_POSE_R)) | ((p & BMVR_XFER_INPUT_POSE_L) ? BMVR_XFER_INPUT_POSE_R : 0u) | ((p & BMVR_XFER_INPUT_POSE_R) ? BMVR_XFER_INPUT_POSE_L : 0u); }
         in->buttons = ((in->buttons & 0xffu) << 8) | ((in->buttons >> 8) & 0xffu);
         for (int i = 0; i < 2; i++) { t = in->stick[0][i]; in->stick[0][i] = in->stick[1][i]; in->stick[1][i] = t; }
         t = in->trigger[0]; in->trigger[0] = in->trigger[1]; in->trigger[1] = t;

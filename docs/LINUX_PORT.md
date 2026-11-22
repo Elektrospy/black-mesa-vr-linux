@@ -746,5 +746,26 @@ Slice 3's `CreateMove` hook (movement, turning, buttons, flashlight, recenter) w
 - **Tests:** `input_map_test` has new checks for the remap and the hand mirror (52 checks pass); the host-native suite passes (T1-T36).
   Fixed two compiler warnings (`g_menu_prev_seq` unused; `h->cls` too small for a 79-byte mangled name).
 
-**Still open (next slice):** aim from the right controller, hands / viewmodel at the controller pose, a wheel graphic with the player's real weapon list,
+**Still open (next slice):** hands / viewmodel at the controller pose, a wheel graphic with the player's real weapon list,
 and pointing at menus with a controller ray instead of the stick cursor.
+
+## Stage 5, slice 4: aim from the weapon controller (opt-in `input_aim=1`; compiled + unit tested; NOT run in the game)
+
+Shots follow the weapon hand's pointing direction instead of the head's.
+
+- **How.** With `input_aim=1` the cmd's `viewangles` (pitch, yaw) carry the controller's aim, so the engine fires along it (the shot still starts at the head,
+  not the hand, so there is parallax at close range). The aim is the controller's `aim` pose rotated by `body_yaw - ref_yaw`, the same turn the eye views use
+  (`bmvr_im_aim_angles`, `linux/bmvr_input_map.h`), so the pointing direction and the picture agree. It needs the stereo rig's head reference (`stereo=1`);
+  without one the cmd keeps the body yaw.
+- **Body yaw.** The game's view yaw is now the AIM yaw, so the body yaw (what turning changes and what the camera is built on) is tracked in the shim
+  (`g_ic_body_yaw`). The stereo rig takes it as the game yaw while aim is on, so the world does not swing with the hand. A change of the engine's view yaw
+  that we did not make (mouse, small push) is added to the body yaw; a jump of more than 25 degrees (spawn, teleport, level change) resets it to the new yaw.
+- **Walking** is rotated into the cmd's yaw frame: world direction = body yaw + head yaw offset, expressed relative to the aim yaw.
+- **Hand.** `input_weapon_hand=left` aims with the left controller (the pose-valid flags are swapped with the hands).
+- **Not verified:** everything in the game. Risks: view angles other than the cmd's drive something else in the engine (viewmodel / crosshair); the engine
+  may clamp or smooth the view; the yaw reset threshold may misfire on a fast flick. If the world swings or turning breaks, remove `input_aim=1`: the default
+  path is unchanged (the full host-native suite passes, aim off).
+- **Tests:** `input_map_test` aim checks (identity, 90 deg left, nose up 45, body turn, zero quaternion, clamp, flag swap): 59 checks pass.
+
+**Still open:** hands / viewmodel at the controller pose (the weapon is still drawn where the engine draws it, in front of the head), a wheel graphic with the
+real weapon list, pointing at menus with a controller ray.
