@@ -321,7 +321,7 @@ check('unknown class: 0 primary vtables, the existing ViewRender classes are lis
 log,tr,out,ex=run('t28b',['--sem','--eyes','2','--poses'],ST.replace('stereo=1','stereo=1\nstereo_slot=40')+'sync=sem\nevery=1\n',('FAKE_STEREO=1',),'100 40')
 check('slot beyond the vtable: refused (not executable code), no hook', 'is not executable code' in log and 'hooked' not in log and 'exit=0' in ex)
 log,tr,out,ex=run('t28c',['--sem','--eyes','2','--poses'],ST.replace('stereo_module=exe','stereo_module=/nothing.so')+'sync=sem\nevery=1\n',('FAKE_STEREO=1',),'100 40')
-check('module not loaded: stereo off, says which key to fix', 'no readable mapping of a module matching' in log and 'hooked' not in log and 'exit=0' in ex)
+check('module not loaded: stereo off, says which key to fix', 'no readable mapping of a module matching' in log and 'trying again' in log and 'hooked' not in log and 'exit=0' in ex)
 log,tr,out,ex=run('t28d',['--sem','--eyes','2','--poses'],ST+'sync=sem\nevery=1\n',('FAKE_STEREO=1','FAKE_BAD_VIEW=1'),'100 40')
 check('a view that does not look like a CViewSetup (fov 5) is never rewritten', 'does not look like a CViewSetup' in log and not [x for x in rvs(out) if x['offc']==1] and 'exit=0' in ex)
 log,tr,out,ex=run('t28e',['--sem','--eyes','2','--poses'],'target=window\nstereo=1\nstereo_module=exe\n',('FAKE_STEREO=1',),'100 40')

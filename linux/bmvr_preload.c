@@ -1499,6 +1499,7 @@ static unsigned g_st_calls, g_st_nested, g_st_top, g_st_dumped;   /* detour entr
 static unsigned g_st_why_cnt[8];                                   /* per st_note() reason: how many views were let through */
 static unsigned g_st_hook_tick;                                    /* g_x_tick when the vtable slot was patched */
 static int g_st_never_warned;
+static unsigned g_st_next_try;                                     /* g_x_tick before which st_try_install does not look for the module again */
 
 static float vs_f(const unsigned char *v, unsigned off) { float f; memcpy(&f, v + off, sizeof f); return f; }
 static int vs_i(const unsigned char *v, unsigned off) { int i; memcpy(&i, v + off, sizeof i); return i; }
@@ -1708,7 +1709,7 @@ static void st_list_cb(const char *mangled, uintptr_t addr, void *ud)
 /* Find the vtable, validate it, patch the RenderView slot. Every refusal says why and leaves the game untouched. */
 static void st_try_install(void)
 {
-    if (!g_st_want || g_st_state != 0) return;
+    if (!g_st_want || g_st_state != 0 || g_x_tick < g_st_next_try) return;
     g_st_state = -1;
     char dir[400];
     if (game_dir(dir, sizeof dir)) snprintf(g_st_flag_path, sizeof g_st_flag_path, "%s/bmvr_in_stereo.flag", dir);
@@ -1722,7 +1723,14 @@ static void st_try_install(void)
     snprintf(mangled, sizeof mangled, "%u%s", (unsigned)strlen(g_st_class), g_st_class);
     struct bmvr_map mod[BMVR_RTTI_MAX_RANGES];
     int nm = bmvr_maps_module(g_st_module, mod, BMVR_RTTI_MAX_RANGES);
-    if (!nm) { bmvr_log("stereo: no readable mapping of a module matching '%s'; stereo is off (stereo_module=)", g_st_module); return; }
+    if (!nm) {
+        /* The helper connects at the first Present, long before the engine has loaded client.so: look again every 60 frames. */
+        static int said;
+        if (!said) { said = 1; bmvr_log("stereo: no readable mapping of a module matching '%s' yet; trying again every 60 frames (a wrong stereo_module= never matches)", g_st_module); }
+        g_st_state = 0;
+        g_st_next_try = g_x_tick + 60;
+        return;
+    }
     struct bmvr_vt_hit h[8];
     int n = bmvr_rtti_find(g_st_module, mangled, h, 8), prim = -1, nprim = 0;
     for (int i = 0; i < n; i++) {
