@@ -692,7 +692,7 @@ static int serve_xr(const char *gamedir, struct bmvr_xr_sink *sink)
             }
             int use_sem = (fr.flags & BMVR_XFER_FLAG_SEMAPHORE) != 0;
             if (use_sem && !info.semaphores) { LOG("frame wants semaphore sync but none were offered; dropping the game connection"); break; }
-            if (bmvr_xr_sink_pair(sink, fr.tick, (int)fr.eye_count, use_sem, fr.pose_id) < 0) { LOG("ERROR: the GPU copy of the pair failed; stopping"); fatal = 1; break; }
+            if (bmvr_xr_sink_pair(sink, fr.tick, (int)fr.eye_count, use_sem, fr.pose_id, fr.src_w, fr.src_h) < 0) { LOG("ERROR: the GPU copy of the pair failed; stopping"); fatal = 1; break; }
             struct bmvr_xfer_ack ack = { .magic = BMVR_XFER_MAGIC_ACK, .status = 0 };
             bmvr_xr_sink_latest_pose(sink, &ack.pose);   /* v5: the newest pose rides on the ack (pose_id 0 when none / not offered) */
             if (send(cl, &ack, sizeof ack, MSG_NOSIGNAL) != (ssize_t)sizeof ack) break;

@@ -1,8 +1,8 @@
 import subprocess, re, os, sys
 R=os.environ['B']; RUN=os.path.join(os.path.dirname(os.path.abspath(__file__)),'run_case.sh')
 fails=0
-def run(name, helper, cfg, env=(), game_args='300 500'):
-    subprocess.run([RUN, name, *helper, '--', cfg, '--', 'X=1', *env], check=True, env=dict(os.environ, GAME_ARGS=game_args))
+def run(name, helper, cfg, env=(), game_args='300 500', fake_bin=None):
+    subprocess.run([RUN, name, *helper, '--', cfg, '--', 'X=1', *env], check=True, env=dict(os.environ, GAME_ARGS=game_args, **({'FAKE_BIN': fake_bin} if fake_bin else {})))
     d=f'{R}/cases/{name}'
     rd=lambda f: open(f'{d}/{f}', errors='replace').read() if os.path.exists(f'{d}/{f}') else ''
     return rd('bmvr_linux_log.txt'), rd('trace.txt').splitlines(), rd('game.out'), rd('exit.txt')
@@ -326,6 +326,9 @@ log,tr,out,ex=run('t28d',['--sem','--eyes','2','--poses'],ST+'sync=sem\nevery=1\
 check('a view that does not look like a CViewSetup (fov 5) is never rewritten', 'does not look like a CViewSetup' in log and not [x for x in rvs(out) if x['offc']==1] and 'exit=0' in ex)
 log,tr,out,ex=run('t28e',['--sem','--eyes','2','--poses'],'target=window\nstereo=1\nstereo_module=exe\n',('FAKE_STEREO=1',),'100 40')
 check('target=window with stereo: refused with a reason', 'the target is the window' in log and 'hooked' not in log and 'exit=0' in ex)
+log,tr,out,ex=run('t28f',['--sem','--eyes','2','--poses'],ST.replace('stereo=1','stereo=1\nstereo_class=CNoSuchView')+'sync=sem\nevery=1\n',('FAKE_STEREO=1',),'100 40')
+fr=frames(tr)
+check('stereo requested but the hook is refused: the mono pairs carry NO pose (they were not rendered with one), so the headset shows them flat, not world-anchored', len(fr)>=10 and all(int(field(l,'pose'))==0 for l in fr) and 'exit=0' in ex, str([field(l,'pose') for l in fr][:6]))
 
 print('T29 crash-sticky flag: a launch that died with stereo active turns stereo off for the next launch only')
 d=f'{R}/cases/t29'
@@ -339,6 +342,14 @@ log,tr,out,ex=run('t30',['--sem','--eyes','2','--poses','--die-idle-after','5'],
 v=rvs(out)
 check('game finishes, clean GL state, loss noticed, no GL wait/blit after the death', 'exit=0' in ex and 'gl_state_violations=0' in out and ("helper's socket is closed" in log or 'lost the helper' in log))
 check('after the helper is gone the game draws its own view again (plain views at the end)', bool(v) and v[-1]['offc']==0 and v[-2]['offc']==0)
+
+print('T31 the view class has another name: used only when it is the one usable *ViewRender class; diagnostics say what happened')
+log,tr,out,ex=run('t31a',['--sem','--eyes','2','--poses'],ST+'sync=sem\nevery=1\n',('FAKE_STEREO=1',),'100 700',fake_bin='fake_game_bm')
+check('default CViewRender missing -> CBMViewRender picked and hooked, game draws two eyes', "using the only usable *ViewRender class 13CBMViewRender" in log and 'hooked 13CBMViewRender' in log and [x for x in rvs(out) if x['offc']==1] and 'exit=0' in ex)
+check('first call of the slot is logged, and so is the raw view dump', 'the hooked slot was called for the first time' in log and 'raw view' in log)
+check('periodic status line reports calls and pairs', 'stereo: status tick' in log and 'stereo pairs' in log)
+log,tr,out,ex=run('t31b',['--sem','--eyes','2','--poses'],ST.replace('stereo=1','stereo=1\nstereo_class=CViewRender')+'sync=sem\nevery=1\n',('FAKE_STEREO=1',),'100 40',fake_bin='fake_game_bm')
+check('stereo_class= given explicitly and absent: never substituted', 'has 0 primary vtables' in log and 'hooked' not in log and 'using the only usable' not in log and 'exit=0' in ex)
 
 print()
 print('FAILED: %d'%fails if fails else 'ALL CHECKS PASSED')

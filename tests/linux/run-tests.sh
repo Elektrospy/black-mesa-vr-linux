@@ -24,6 +24,7 @@ gcc $M32 -shared -fPIC -O2 -Wall -Wextra -fvisibility=hidden -fno-stack-protecto
 gcc $M32 -shared -fPIC -O1 -Wall -o "$B/libSDL2-2.0.so.0" "$T/mock_gl.c"
 g++ $M32 -shared -fPIC -I"$T" -o "$B/libtogl.so" "$T/fake_togl.cpp" -L"$B" -l:libSDL2-2.0.so.0 -Wl,-rpath,'$ORIGIN'
 g++ $M32 -I"$T" -o "$B/fake_game" "$T/fake_game.cpp" -L"$B" -ltogl -Wl,--no-as-needed -l:libSDL2-2.0.so.0 -Wl,-rpath,'$ORIGIN'
+g++ $M32 -I"$T" -DVR_CLASS_NAME=CBMViewRender -o "$B/fake_game_bm" "$T/fake_game.cpp" -L"$B" -ltogl -Wl,--no-as-needed -l:libSDL2-2.0.so.0 -Wl,-rpath,'$ORIGIN'
 gcc -Wall -I"$ROOT/linux" -o "$B/mock_helper" "$T/mock_helper.c"
 
 echo "== the shim exports exactly what libtogl must see replaced (names the fake libtogl also exports)"
@@ -57,7 +58,7 @@ python3 "$T/suite.py"
 # Optional: the real helper against a real (possibly software) Vulkan device.
 if echo '#include <vulkan/vulkan.h>' | cc -E -x c - >/dev/null 2>&1; then
   echo "== real helper (protocol v5 client; skipped if there is no Vulkan device)"
-  cc -O2 -Wall -Wextra -std=gnu11 -I"$ROOT/third_party/openxr/include" -I"$ROOT/linux" -o "$B/bmvr_xfer_helper" "$ROOT/linux/bmvr_xfer_helper.c" "$ROOT/linux/bmvr_xr_sink.c" -pthread -ldl
+  cc -O2 -Wall -Wextra -std=gnu11 -I"$ROOT/third_party/openxr/include" -I"$ROOT/linux" -o "$B/bmvr_xfer_helper" "$ROOT/linux/bmvr_xfer_helper.c" "$ROOT/linux/bmvr_xr_sink.c" -pthread -ldl -lm
   cc -Wall -I"$ROOT/linux" -o "$B/client" "$T/client.c"
   if timeout 40 "$B/bmvr_xfer_helper" --selftest-sync > "$B/selftest.txt" 2>&1; then
     grep -E "opaque-fd semaphore|selftest:" "$B/selftest.txt" | sed 's/^\[helper\] /  /'

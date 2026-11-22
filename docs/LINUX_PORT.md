@@ -596,6 +596,29 @@ pre-existing T1-T23 are unchanged and pass (139 checks in total).
 4. In the headset: depth when you look at a nearby object, head turn direction, and whether the picture is the right size. `touch
    "$GAME/bmvr_recenter"` re-centres on the current head pose.
 
+### Stage 4b first real run (2026-11-22): no stereo, no head tracking
+
+Symptoms: both eyes show a picture but the overlap is wrong (no depth), and the picture stays fixed to the headset. The helper log
+(`--sink xr --eyes 2 --xr-layer projection`) shows a healthy display path (about 90 xr frames/s, 30 pairs/s from the game, nothing dropped
+in steady state) but cannot say whether the engine drew two views: **the game-side log (`bmvr_linux_log.txt` in the game folder, the
+`stereo:` lines) was not part of the report**, so which stage of the hook stops is still unknown. Both symptoms are what a mono pair
+looks like on a projection layer, so the working assumption is "the hook is not drawing eyes". Not verified.
+
+What changed (all stand-in tested only, T31 + the T28f check; nothing here was run against the real `client.so` or a headset):
+
+- The shim now says where the hook stops: it logs the first call of the patched slot, a raw dump of the first three top-level views
+  (to read the real `CViewSetup` layout if `st_view_sane()` refuses), a status line every 600 frames (calls, nested, top-level, pairs,
+  and how many views were let through per reason) and a WARNING when the slot has not been called once 1800 frames after patching.
+- If the default class `CViewRender` has no RTTI vtable, the shim uses another class only when exactly one `*ViewRender` class is usable
+  (not `I...`, not an interface of identical stubs). `stereo_class=` in `bmvr_target.txt` is never overridden.
+- Pairs the hook did not draw now carry pose id 0 when `stereo=1` is requested. The helper shows such pairs as a flat head-locked picture
+  with the SAME orientation and the SAME symmetric field of view (80 degrees wide, aspect of the engine target) in both eyes, instead of
+  through the runtime's asymmetric per-eye frusta. Seeing this flat picture means the hook is not drawing eyes; seeing depth means it is.
+- The helper now links `-lm` (`scripts/build-linux.sh`, `tests/linux/run-tests.sh`).
+
+Open: if the log says the slot is never called, the engine may reach `RenderView` without the vtable (the Windows build detours the function's
+code, not a vtable slot); an inline detour would be the next step, and it needs the real prologue bytes from the log's slot dump.
+
 ## Plan (not implemented)
 
 1. ~~Read the milestone-1 log; confirm eye-target candidates and driver extensions.~~ Done.

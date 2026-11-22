@@ -18,6 +18,7 @@
 #include <openxr/openxr_platform.h>
 
 #include <dlfcn.h>
+#include <math.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -1305,6 +1306,7 @@ struct bmvr_xr_sink {
     void *chk_map;
     struct bmvr_ring ring;
     struct bmvr_pose_store poses; /* X4: poses by id (put by the XR thread, read by both threads) */
+    float slot_aspect[BMVR_RING_SLOTS];  /* width / height of eye 0's source (the engine target), for the flat (pose-less) layer */
     uint32_t slot_pose[BMVR_RING_SLOTS]; /* X4: the pose id each ring slot's pair was rendered with (written by the transport before end_write) */
     int poses_on;                 /* X4: poses are generated and offered (projection layer and a LOCAL space) */
     pthread_mutex_t qmu;          /* the one queue: vkQueueSubmit (both threads) and the xr calls that may use it (XR thread) */
@@ -1603,7 +1605,7 @@ static void *sk_thread(void *arg)
     int last_fidx = -1;
     double win_start = now_ms();
     uint64_t xr_frames = 0, empty_frames = 0;
-    int view_fallback_logged = 0;
+    int view_fallback_logged = 0, flat_logged = 0;
 
     while (!atomic_load_explicit(&k->stop, memory_order_acquire)) {
         if (st_events(s, NULL)) { sk_fail(k, "the OpenXR runtime ended the session (state %s)", session_state_name(s->state)); break; }
@@ -1678,7 +1680,19 @@ static void *sk_thread(void *arg)
                             if ((pp.flags & BMVR_XFER_POSE_LOCAL) && k->world_space) lspace = k->world_space;
                         } else usable = 0;
                     } else {
+                        /* A pair the game did not render from a head pose (mono): the same picture in both eyes. Showing it through the runtime's
+                         * own eye frusta (asymmetric, different per eye) overlaps the two images wrongly; instead both eyes get the SAME orientation
+                         * and the SAME symmetric field of view, so the picture is a flat screen at infinity, undistorted (the shim's squash blit is
+                         * undone by choosing the frustum's aspect = the source's aspect). Head-locked: there is no pose to anchor it to. */
                         sk_locate_views(k, s->view_space, fs.predictedDisplayTime, views, &view_fallback_logged);
+                        float asp = k->slot_aspect[slot];
+                        if (!(asp > 0.5f && asp < 3.0f)) asp = 16.0f / 9.0f;
+                        const float tx = tanf(40.0f * 3.14159265f / 180.0f), ty = tx / asp;   /* 80 degrees wide */
+                        for (int e = 0; e < 2; e++) {
+                            views[e].pose.orientation = (XrQuaternionf){ 0, 0, 0, 1 };
+                            views[e].fov = (XrFovf){ -atanf(tx), atanf(tx), atanf(ty), -atanf(ty) };
+                        }
+                        if (!flat_logged) { XLOG("xr-sink[projection]: pairs without a game pose are shown as a flat head-locked picture, same in both eyes (the game is not rendering from the headset pose: stereo and head tracking need the stereo hook, see the shim log)"); flat_logged = 1; }
                     }
                     if (usable) {
                         for (int e = 0; e < 2; e++)
@@ -1924,7 +1938,7 @@ int bmvr_xr_sink_latest_pose(struct bmvr_xr_sink *k, struct bmvr_xfer_pose *out)
     return k->poses_on ? bmvr_pose_store_latest(&k->poses, out) : 0;
 }
 
-int bmvr_xr_sink_pair(struct bmvr_xr_sink *k, uint32_t tick, int eyes, int use_sem, uint32_t pose_id)
+int bmvr_xr_sink_pair(struct bmvr_xr_sink *k, uint32_t tick, int eyes, int use_sem, uint32_t pose_id, uint32_t src_w, uint32_t src_h)
 {
     VkDevice d = k->st.c.dev;
     if (k->stuck || eyes < 1 || eyes > k->eyes) return -1;
@@ -1936,6 +1950,7 @@ int bmvr_xr_sink_pair(struct bmvr_xr_sink *k, uint32_t tick, int eyes, int use_s
     if (slot >= 0) {
         fence = k->tfence[slot];
         cb = k->tcb[slot];
+        k->slot_aspect[slot] = (src_w && src_h) ? (float)src_w / (float)src_h : 1.0f;
         k->slot_pose[slot] = k->poses_on ? pose_id : 0;   /* published to the reader by bmvr_ring_end_write */
         vkResetFences_(d, 1, &fence);          /* a slot handed out by the ring has a signalled fence */
         sk_record_copy(k, cb, slot, eyes);

@@ -86,7 +86,7 @@ int bmvr_xr_sink_client_begin(struct bmvr_xr_sink *k, int fds[4], int *nfds);
 /* One complete pair is in the shared images (rendered with pose `pose_id`, 0 = none). Submits the GPU copy into a ring slot (wait gl_ready / signal vk_done when use_sem)
  * and returns right after vkQueueSubmit, which is what the ack promises. Without use_sem it returns after the copy finished.
  * Returns 0, or -1 on a fatal Vulkan failure (the caller drops the game and exits with the reason). */
-int bmvr_xr_sink_pair(struct bmvr_xr_sink *k, uint32_t tick, int eyes, int use_sem, uint32_t pose_id);
+int bmvr_xr_sink_pair(struct bmvr_xr_sink *k, uint32_t tick, int eyes, int use_sem, uint32_t pose_id, uint32_t src_w, uint32_t src_h);
 
 /* X4: the newest pose the XR thread located (for the ack). 1 and *out filled, 0 when none yet or poses are not offered. */
 int bmvr_xr_sink_latest_pose(struct bmvr_xr_sink *k, struct bmvr_xfer_pose *out);

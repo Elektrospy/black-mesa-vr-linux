@@ -93,7 +93,7 @@ if ! echo '#include <vulkan/vulkan.h>' | cc -E -x c - >/dev/null 2>&1; then
 fi
 if echo '#include <vulkan/vulkan.h>' | cc $VKINC -E -x c - >/dev/null 2>&1; then
   # bmvr_xr_sink.c (stage 4a, OpenXR) needs the OpenXR headers vendored in third_party/openxr; the loader itself is dlopen'd.
-  if cc -O2 -Wall -Wextra -std=gnu11 $VKINC -I"$ROOT/third_party/openxr/include" -I"$ROOT/linux" -o "$BUILD/bmvr_xfer_helper" "$ROOT/linux/bmvr_xfer_helper.c" "$ROOT/linux/bmvr_xr_sink.c" -pthread -ldl; then
+  if cc -O2 -Wall -Wextra -std=gnu11 $VKINC -I"$ROOT/third_party/openxr/include" -I"$ROOT/linux" -o "$BUILD/bmvr_xfer_helper" "$ROOT/linux/bmvr_xfer_helper.c" "$ROOT/linux/bmvr_xr_sink.c" -pthread -ldl -lm; then
     HELPER="$BUILD/bmvr_xfer_helper"; echo "Built $HELPER (64-bit)"
   else
     echo "WARNING: could not build the 64-bit helper (stage 2a test unavailable)." >&2

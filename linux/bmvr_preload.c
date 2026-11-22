@@ -445,6 +445,7 @@ static int g_cfg_loaded;
 static int g_st_want;                              /* config: stereo=1 (BMVR_STEREO=1) */
 static char g_st_module[96] = "/client.so";        /* stereo_module=: which loaded module holds the view class ("exe" = the main program) */
 static char g_st_class[64] = "CViewRender";        /* stereo_class=: class whose vtable holds RenderView (plain name; mangled here) */
+static int g_st_class_explicit;                    /* stereo_class= was given: never substitute another class */
 static int g_st_slot = 6;                          /* stereo_slot=: vtable slot of RenderView. 6 on the Windows build (IViewRender); UNVERIFIED on Linux */
 static float g_st_scale = BMVR_STEREO_DEFAULT_SCALE; /* stereo_scale=: Source units per metre */
 
@@ -561,7 +562,7 @@ static void load_cfg_once(void)
             else if (!strncmp(line, "sync=", 5)) parse_sync(line + 5);
             else if (!strncmp(line, "stereo=", 7)) g_st_want = line[7] == '1';
             else if (!strncmp(line, "stereo_module=", 14)) snprintf(g_st_module, sizeof g_st_module, "%.95s", line + 14);
-            else if (!strncmp(line, "stereo_class=", 13)) snprintf(g_st_class, sizeof g_st_class, "%.63s", line + 13);
+            else if (!strncmp(line, "stereo_class=", 13)) { snprintf(g_st_class, sizeof g_st_class, "%.63s", line + 13); g_st_class_explicit = 1; }
             else if (!strncmp(line, "stereo_slot=", 12)) {
                 long v = strtol(line + 12, NULL, 10);
                 if (v >= 0 && v < 256) g_st_slot = (int)v;
@@ -1317,7 +1318,7 @@ static void xfer_snapshot_window(void)
     memset(ei, 0, sizeof ei);
     ei[0].w = (unsigned)sw; ei[0].h = (unsigned)sh; ei[0].flags = BMVR_XFER_FLAG_FLIPPED | BMVR_XFER_FLAG_WINDOW;
     snprintf(ei[0].name, sizeof ei[0].name, "%s", "window");
-    xfer_send_frame(1, ei, semflag, g_x_pose_used);
+    xfer_send_frame(1, ei, semflag, g_st_want ? 0 : g_x_pose_used);
 }
 
 /* Loading screen / menu: the armed frame never switched render targets, so nothing was "left" for this eye. Reuse the
@@ -1439,7 +1440,7 @@ static void xfer_snapshot_target(void)
     unsigned semflag = ok ? xfer_sync_publish() : 0u;   /* ONE signal (or one glFinish) for the whole pair */
     xfer_gl_restore(&gs);
     if (!ok) return;
-    if (xfer_send_frame(neyes, ei, semflag, g_x_pose_used)) {
+    if (xfer_send_frame(neyes, ei, semflag, g_st_want ? 0 : g_x_pose_used)) {   /* stereo requested: a pair the hook did not draw carries no pose (it was not rendered with one) */
         for (unsigned e = 0; e < neyes; e++) {
             if (from_fallback[e]) continue;
             g_last_good[e] = cap[e];
@@ -1493,6 +1494,11 @@ static int g_st_sent;                   /* this frame's pair was delivered from 
 static unsigned g_st_frames, g_st_fails, g_st_consec_fail, g_st_pass_main;
 static int g_st_flag_on;
 static char g_st_flag_path[512];
+/* Diagnostics: the hook is stand-in tested only, so a real run must say WHERE it stops. */
+static unsigned g_st_calls, g_st_nested, g_st_top, g_st_dumped;   /* detour entries / nested / top-level / raw view dumps written */
+static unsigned g_st_why_cnt[8];                                   /* per st_note() reason: how many views were let through */
+static unsigned g_st_hook_tick;                                    /* g_x_tick when the vtable slot was patched */
+static int g_st_never_warned;
 
 static float vs_f(const unsigned char *v, unsigned off) { float f; memcpy(&f, v + off, sizeof f); return f; }
 static int vs_i(const unsigned char *v, unsigned off) { int i; memcpy(&i, v + off, sizeof i); return i; }
@@ -1531,6 +1537,7 @@ static void st_apply(unsigned char *v, const struct bmvr_view *e)
 static void st_note(unsigned reason, const char *why)
 {
     static unsigned seen;
+    if (reason < 8) g_st_why_cnt[reason]++;
     if (seen & (1u << reason)) return;
     seen |= 1u << reason;
     bmvr_log("stereo: drawing the game's own view: %s (logged once)", why);
@@ -1562,6 +1569,29 @@ static void st_fail_eye(unsigned e)
     } else if (g_st_fails <= 3) {
         bmvr_log("stereo: eye %u: no render target matching the spec was left or is bound after the pass; the pair is dropped", e);
     }
+}
+
+/* The first top-level views, raw: if st_view_sane() refuses, this is what the real CViewSetup layout looks like. */
+static void st_dump_view(const unsigned char *v)
+{
+    if (g_st_dumped >= 3) return;
+    g_st_dumped++;
+    bmvr_log("stereo: top-level RenderView #%u raw view (0x150 bytes, hex words, then the words that read as plausible floats):", g_st_dumped);
+    for (unsigned off = 0; off < 0x150; off += 32) {
+        char line[200];
+        int n = snprintf(line, sizeof line, "stereo:   +%03x:", off);
+        for (unsigned i = 0; i < 8 && off + 4 * i < 0x150; i++) {
+            unsigned w; memcpy(&w, v + off + 4 * i, 4);
+            n += snprintf(line + n, sizeof line - (size_t)n, " %08x", w);
+        }
+        bmvr_log("%s", line);
+    }
+    char fl[900]; int n = 0;
+    for (unsigned off = 0; off < 0x150 && n < (int)sizeof fl - 40; off += 4) {
+        const float f = vs_f(v, off);
+        if (f == f && fabsf(f) > 0.01f && fabsf(f) < 1e5f) n += snprintf(fl + n, sizeof fl - (size_t)n, " %x=%.3g", off, (double)f);
+    }
+    bmvr_log("stereo:   floats:%s", fl);
 }
 
 /* Draw the pair. Returns 1 when the game's own RenderView must NOT be called afterwards (the eyes were drawn). */
@@ -1644,9 +1674,12 @@ static void st_detour(void *self, void *view, int clear, int what)
 {
     PFN_RenderView orig = g_st_orig;
     const long tid = (long)syscall(SYS_gettid);
-    if (g_st_depth > 0) { orig(self, view, clear, what); return; }   /* nested view (water, monitor, cubemap), or another thread */
+    if (++g_st_calls == 1) bmvr_log("stereo: the hooked slot was called for the first time (tick %u, this=%p view=%p clear=%#x what=%#x); whether it really is RenderView is decided by the view layout check below", g_x_tick, self, view, (unsigned)clear, (unsigned)what);
+    if (g_st_depth > 0) { g_st_nested++; orig(self, view, clear, what); return; }   /* nested view (water, monitor, cubemap), or another thread */
     g_st_depth = 1;
     g_st_tid = tid;
+    g_st_top++;
+    st_dump_view((const unsigned char *)view);
     if (!st_try_stereo(self, view, clear, what)) orig(self, view, clear, what);
     g_st_depth = 0;
 }
@@ -1657,6 +1690,15 @@ static void __attribute__((destructor)) st_atexit(void)
 }
 
 struct st_list { unsigned n; };
+/* Candidate view classes: every "<len>...ViewRender" name in the module, deduplicated. */
+struct st_cands { char name[6][64]; int n; };
+static void st_cand_cb(const char *mangled, uintptr_t addr, void *ud)
+{
+    (void)addr;
+    struct st_cands *c = (struct st_cands *)ud;
+    for (int i = 0; i < c->n; i++) if (!strcmp(c->name[i], mangled)) return;
+    if (c->n < 6) snprintf(c->name[c->n++], sizeof c->name[0], "%.63s", mangled);
+}
 static void st_list_cb(const char *mangled, uintptr_t addr, void *ud)
 {
     struct st_list *l = (struct st_list *)ud;
@@ -1688,6 +1730,39 @@ static void st_try_install(void)
                  (unsigned long)(h[i].vtable - mod[0].lo), h[i].primary ? "primary" : "secondary");
         if (h[i].primary) { prim = i; nprim++; }
     }
+    if (nprim != 1 && !g_st_class_explicit) {
+        /* The default name is a guess (Black Mesa may call its class something else). Use another class only when it is unambiguous:
+         * exactly one "*ViewRender" class that is not an interface (its slots are not all the same pure-virtual stub) and has one primary vtable. */
+        struct st_cands cc; cc.n = 0;
+        bmvr_rtti_list(g_st_module, "ViewRender", st_cand_cb, &cc);
+        int pick = -1, ok = 0;
+        struct bmvr_vt_hit ch[8];
+        for (int ci = 0; ci < cc.n; ci++) {
+            int m = bmvr_rtti_find(g_st_module, cc.name[ci], ch, 8), np = 0, pi = -1;
+            for (int i = 0; i < m; i++) if (ch[i].primary) { np++; pi = i; }
+            if (np != 1) continue;
+            const uintptr_t *v = (const uintptr_t *)ch[pi].vtable;
+            int usable = bmvr_addr_executable(v[g_st_slot]) && bmvr_addr_executable(v[g_st_slot - 1 >= 0 ? g_st_slot - 1 : 0]);
+            if (usable && g_st_slot > 0 && v[g_st_slot] == v[g_st_slot - 1]) usable = 0;   /* identical neighbours: an interface of pure virtuals */
+            const char *id = cc.name[ci];
+            while (*id >= '0' && *id <= '9') id++;
+            if (id[0] == 'I' && id[1] >= 'A' && id[1] <= 'Z') usable = 0;                    /* Source naming: IViewRender is the interface, not the implementation */
+            bmvr_log("stereo: candidate class %s: %d vtable(s), %s", cc.name[ci], m, usable ? "usable" : "not usable (interface or short vtable)");
+            if (usable) { ok++; pick = ci; }
+        }
+        if (ok == 1) {
+            bmvr_log("stereo: '%s' not found; using the only usable *ViewRender class %s (set stereo_class= to override)", g_st_class, cc.name[pick]);
+            snprintf(mangled, sizeof mangled, "%s", cc.name[pick]);
+            n = bmvr_rtti_find(g_st_module, mangled, h, 8); prim = -1; nprim = 0;
+            for (int i = 0; i < n; i++) {
+                bmvr_log("stereo: RTTI %s: type_info %#lx vtable %#lx (module offset %#lx) %s", mangled, (unsigned long)h[i].typeinfo, (unsigned long)h[i].vtable,
+                         (unsigned long)(h[i].vtable - mod[0].lo), h[i].primary ? "primary" : "secondary");
+                if (h[i].primary) { prim = i; nprim++; }
+            }
+        } else if (cc.n) {
+            bmvr_log("stereo: %d usable *ViewRender classes; not guessing (set stereo_class= to one of the names above, without the length prefix)", ok);
+        }
+    }
     if (nprim != 1) {
         struct st_list l = { 0 };
         bmvr_log("stereo: class '%s' has %d primary vtables in '%s' (need exactly 1); stereo is off. Classes whose name ends in ViewRender:", g_st_class, nprim, g_st_module);
@@ -1705,8 +1780,22 @@ static void st_try_install(void)
     g_st_orig = (PFN_RenderView)vt[g_st_slot];
     if (!bmvr_vtable_patch(&vt[g_st_slot], (uintptr_t)st_detour, &old)) { bmvr_log("stereo: could not patch the vtable slot (mprotect refused); stereo is off"); g_st_orig = NULL; return; }
     g_st_state = 1;
+    g_st_hook_tick = g_x_tick;
     bmvr_log("stereo: hooked %s vtable slot %d (was %#lx). Each delivery frame now draws two eyes from the helper's pose. UNVERIFIED on this game build: "
              "check the 'frame 0' line below and the picture in the headset.", mangled, g_st_slot, (unsigned long)old);
+}
+
+/* Once per ~10 s at 60 fps while stereo is requested: where things stand, and a loud warning when the slot is never called. */
+static void st_status_tick(void)
+{
+    if (!g_st_want || g_st_state != 1 || g_x_tick == g_st_hook_tick || (g_x_tick - g_st_hook_tick) % 600) return;
+    bmvr_log("stereo: status tick %u: RenderView calls %u (nested %u, top-level %u); stereo pairs %u (%u dropped); let through because: no pose %u, head-locked pose %u, "
+             "view layout refused %u, bad pose %u", g_x_tick, g_st_calls, g_st_nested, g_st_top, g_st_frames, g_st_fails, g_st_why_cnt[0], g_st_why_cnt[1], g_st_why_cnt[2], g_st_why_cnt[3]);
+    if (!g_st_calls && !g_st_never_warned && g_x_tick - g_st_hook_tick >= 1800) {
+        g_st_never_warned = 1;
+        bmvr_log("stereo: WARNING: the hooked vtable slot has not been called once in %u frames. If a map is loaded, the engine does not reach RenderView through this "
+                 "slot: wrong class or stereo_slot= (compare the slot dump above), or the engine calls RenderView directly (inlined). The game is drawing mono.", g_x_tick - g_st_hook_tick);
+    }
 }
 
 /* Is the helper still connected? The kernel closes the socket when the helper process dies, so a non-blocking
@@ -1777,6 +1866,7 @@ static void xfer_tick(void)
         return; /* first snapshot on the next period */
     }
     st_try_install();
+    st_status_tick();
     if (g_x_tick % g_x_every == 0) {
         if (g_st_sent) {
             g_st_sent = 0;   /* stage 4b: the stereo hook already delivered this frame's pair, mid-frame */

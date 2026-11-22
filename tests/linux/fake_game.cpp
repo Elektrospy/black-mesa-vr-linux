@@ -15,7 +15,10 @@ struct IViewRender { virtual void Init() {} virtual void LevelInit() {} virtual 
                      virtual void RenderView(const CVS &v, int clear, int what) = 0; virtual void Tail() {} };
 static unsigned char g_main_raw[0x148];   // the engine builds nested views (water) from its own state, not from the view it was handed
 static IDirect3DDevice9 *g_dev; static IDirect3DSurface9 *g_back; static IDirect3DTexture9 *g_tx[5]; static int g_switches = 60, g_nest;
-struct CViewRender : IViewRender {
+#ifndef VR_CLASS_NAME
+#define VR_CLASS_NAME CViewRender   // -DVR_CLASS_NAME=CBMViewRender builds a game whose view class has another name (T31)
+#endif
+struct VR_CLASS_NAME : IViewRender {
   void RenderView(const CVS &v, int clear, int what) override {
     int n = g_nest++;
     printf("RV nest=%d w=%d h=%d fov=%.3f asp=%.4f offc=%d l=%.4f r=%.4f b=%.4f t=%.4f o=%.3f,%.3f,%.3f a=%.3f,%.3f,%.3f what=%d clear=%d\n", n, *(int*)(v.raw+0x10), *(int*)(v.raw+0x18),
@@ -30,7 +33,7 @@ struct CViewRender : IViewRender {
     g_nest--;
   }
 };
-__attribute__((noinline)) static IViewRender *make_view_render() { return new CViewRender(); }   // opaque: the compiler must emit the vtable and call through it
+__attribute__((noinline)) static IViewRender *make_view_render() { return new VR_CLASS_NAME(); }   // opaque: the compiler must emit the vtable and call through it
 int main(int argc, char **argv) {
   int loading = argc > 1 ? atoi(argv[1]) : 300, play = argc > 2 ? atoi(argv[2]) : 500, tail = argc > 3 ? atoi(argv[3]) : 0, switches = 60;
   IDirect3D9 *d3d = Direct3DCreate9(32); IDirect3DDevice9 *dev = 0; _D3DPRESENT_PARAMETERS_ pp{1};

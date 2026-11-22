@@ -8,7 +8,7 @@ helper_args=(); while [ "${1:-}" != "--" ]; do helper_args+=("$1"); shift; done;
 cfg=$1; shift; shift
 envs=("$@")
 D=$B/cases/$name; rm -rf "$D"; mkdir -p "$D"
-cp "$B/fake_game" "$B/libtogl.so" "$B/libSDL2-2.0.so.0" "$D/"
+cp "$B/${FAKE_BIN:-fake_game}" "$D/fake_game"; cp "$B/libtogl.so" "$B/libSDL2-2.0.so.0" "$D/"
 [ -n "${PRE_FLAG:-}" ] && : > "$D/bmvr_in_stereo.flag"   # T29: a previous launch died with stereo active
 [ -n "$cfg" ] && printf '%b' "$cfg" > "$D/bmvr_target.txt"
 export MOCK_TRACE="$D/trace.txt"; : > "$MOCK_TRACE"
