@@ -464,6 +464,11 @@ static int g_ic_slot = 22;                         /* input_slot= */
 static float g_ic_turn_speed = 180.0f;             /* input_turn_speed= degrees per second at full stick (smooth turning) */
 static int g_ic_turn_analog = 1;                   /* input_turn_analog=0: one constant speed past the deadzone; default 1: the speed scales with the stick's deflection */
 static float g_ic_snap = 0.0f;                     /* input_snap= degrees per flick; 0 = smooth turning */
+static int g_ic_weapon_left;                       /* input_weapon_hand=left: mirror the controllers (weapon in the left hand, walk on the right stick) */
+static int g_ic_move_hand = -1;                    /* input_move_hand=left|right; -1 = the hand opposite the weapon hand */
+static float g_ic_deadzone = 0.15f;                /* input_deadzone= walk stick dead zone, 0.05..0.5 */
+static float g_ic_trigger = 0.55f;                 /* input_trigger= trigger press point, 0.2..0.9 */
+static int g_ic_act[5] = { BMVR_ACT_RELOAD, BMVR_ACT_ATTACK2, BMVR_ACT_JUMP, BMVR_ACT_DUCK, BMVR_ACT_NONE };   /* input_btn_a / b / bumper / x / y */
 static volatile int g_st_recenter_req;             /* the right stick click asks the stereo rig to recenter on its next frame */
 
 static int game_dir(char *out, size_t cap)
@@ -595,6 +600,23 @@ static void load_cfg_once(void)
             else if (!strncmp(line, "input_module=", 13)) snprintf(g_ic_module, sizeof g_ic_module, "%.95s", line + 13);
             else if (!strncmp(line, "input_class=", 12)) { snprintf(g_ic_class, sizeof g_ic_class, "%.63s", line + 12); g_ic_class_explicit = 1; }
             else if (!strncmp(line, "input_turn_analog=", 18)) g_ic_turn_analog = line[18] != '0';
+            else if (!strncmp(line, "input_weapon_hand=", 18)) g_ic_weapon_left = !strcmp(line + 18, "left");
+            else if (!strncmp(line, "input_move_hand=", 16)) g_ic_move_hand = !strcmp(line + 16, "left") ? 0 : !strcmp(line + 16, "right") ? 1 : -1;
+            else if (!strncmp(line, "input_deadzone=", 15)) { float v = (float)atof(line + 15); if (v >= 0.05f && v <= 0.5f) g_ic_deadzone = v; else bmvr_log("input: bad input_deadzone=%s (use 0.05..0.5)", line + 15); }
+            else if (!strncmp(line, "input_trigger=", 14)) { float v = (float)atof(line + 14); if (v >= 0.2f && v <= 0.9f) g_ic_trigger = v; else bmvr_log("input: bad input_trigger=%s (use 0.2..0.9)", line + 14); }
+            else if (!strncmp(line, "input_turn=", 11)) { if (!strcmp(line + 11, "smooth")) g_ic_snap = 0.0f; else if (!strcmp(line + 11, "snap") && g_ic_snap <= 0.0f) g_ic_snap = 30.0f; }
+            else if (!strncmp(line, "input_btn_", 10)) {
+                static const char *const nm[5] = { "a=", "b=", "bumper=", "x=", "y=" };
+                static const char *const act[] = { "none", "reload", "jump", "duck", "attack2", "use", "attack" };
+                int bi = -1;
+                for (int i = 0; i < 5; i++) if (!strncmp(line + 10, nm[i], strlen(nm[i]))) bi = i;
+                if (bi >= 0) {
+                    const char *v = strchr(line + 10, '=') + 1;
+                    int ai = -1;
+                    for (int i = 0; i < 7; i++) if (!strcmp(v, act[i])) ai = i;
+                    if (ai >= 0) g_ic_act[bi] = ai; else bmvr_log("input: bad %s (use none|reload|jump|duck|attack2|use|attack)", line);
+                } else bmvr_log("input: unknown button in '%s' (use input_btn_a|b|bumper|x|y=)", line);
+            }
             else if (!strncmp(line, "input_probe=", 12)) g_ic_probe = line[12] != '0';
             else if (!strncmp(line, "input_slot=", 11)) {
                 long v = strtol(line + 11, NULL, 10);
@@ -2014,7 +2036,6 @@ static int g_ic_flag_on;
 static struct bmvr_input_map g_ic_map;
 static int g_ic_map_ready;
 static int g_ic_snap_latched;
-static unsigned g_ic_unwired_seen;
 
 static int ic_cmd_sane(const struct bmvr_usercmd *c)
 {
@@ -2031,12 +2052,11 @@ static int ic_cmd_sane(const struct bmvr_usercmd *c)
     return 1;
 }
 
-static void ic_unwired(unsigned ev, const char *what)
-{
-    if (g_ic_unwired_seen & ev) return;
-    g_ic_unwired_seen |= ev;
-    bmvr_log("input: %s pressed; not wired yet (needs the engine's weapon / menu state, a later slice). Logged once.", what);
-}
+/* Weapon switching goes through SDL like the menu does (defined with the menu code below): prev / next = mouse wheel, wheel pick = number keys 1-6 */
+#define IC_KEY_SLOT0 6
+static void ic_menu_key_pulse(int key);
+static void ic_sdl_wheel(int dir);
+static float g_ic_wheel_x, g_ic_wheel_y;   /* right stick while the weapon wheel is open */
 
 /* Write the controllers into one cmd. Everything the keyboard and mouse already put there stays: ours is added on top. */
 static void ic_apply(float dt, struct bmvr_usercmd *cmd)
@@ -2046,7 +2066,20 @@ static void ic_apply(float dt, struct bmvr_usercmd *cmd)
     {   struct bmvr_xfer_input again;   /* the render thread may be writing it: take it only if it did not move while we copied */
         if (!bmvr_get_input(&again) || again.seq != in.seq) in = again;
     }
-    if (!g_ic_map_ready) { bmvr_input_map_init(&g_ic_map); g_ic_map_ready = 1; }
+    if (!g_ic_map_ready) {
+        bmvr_input_map_init(&g_ic_map);
+        g_ic_map.cfg.walk_dead = g_ic_deadzone;
+        g_ic_map.cfg.trigger_on = g_ic_trigger;
+        g_ic_map.cfg.trigger_off = g_ic_trigger - 0.2f;
+        g_ic_map.cfg.act_a = g_ic_act[0]; g_ic_map.cfg.act_b = g_ic_act[1]; g_ic_map.cfg.act_bumper = g_ic_act[2];
+        g_ic_map.cfg.act_x = g_ic_act[3]; g_ic_map.cfg.act_y = g_ic_act[4];
+        g_ic_map_ready = 1;
+    }
+    {   /* hands: weapon_hand=left mirrors everything; move_hand equal to the weapon hand puts walking and firing on one hand */
+        const int weapon = g_ic_weapon_left ? 0 : 1;
+        const int move = g_ic_move_hand >= 0 ? g_ic_move_hand : 1 - weapon;
+        bmvr_im_remap_hands(&in, g_ic_weapon_left, move == weapon);
+    }
     /* Real time since the previous call, from the wall clock: turning is degrees per SECOND times that time, so the total turn is the same at any frame
      * rate and under load (the engine's flInputSampleTime is not always the real frame time, and a fixed fallback made the speed follow the frame rate).
      * Not clamped upwards below a quarter second, so a hitch still turns the view by the time it took; a longer gap (pause, loading) counts as one frame. */
@@ -2092,8 +2125,21 @@ static void ic_apply(float dt, struct bmvr_usercmd *cmd)
     if (c.events & BMVR_EV_FLASHLIGHT) cmd->impulse = 100;
     if (c.events & BMVR_EV_RECENTER) g_st_recenter_req = 1;
     /* BMVR_EV_PAUSE: handled in ic_menu_tick (Present rate, so it also works while the game is paused or in a menu and CreateMove does not run) */
-    if (c.events & (BMVR_EV_WEAPON_PREV | BMVR_EV_WEAPON_NEXT)) ic_unwired(BMVR_EV_WEAPON_NEXT, "previous/next weapon");
-    if (c.events & (BMVR_EV_WHEEL_OPEN | BMVR_EV_WHEEL_SELECT)) ic_unwired(BMVR_EV_WHEEL_OPEN, "the weapon wheel");
+    if (c.events & BMVR_EV_WEAPON_PREV) ic_sdl_wheel(1);      /* wheel up = invprev */
+    if (c.events & BMVR_EV_WEAPON_NEXT) ic_sdl_wheel(-1);     /* wheel down = invnext */
+    if (c.wheel_open || (c.events & BMVR_EV_WHEEL_OPEN)) { g_ic_wheel_x = in.stick[1][0]; g_ic_wheel_y = in.stick[1][1]; }
+    if (c.events & BMVR_EV_WHEEL_OPEN) { static int said; if (!said++) bmvr_log("input: weapon wheel: hold the right stick click, push the stick toward a slot, release to pick (6 sectors, clockwise from the top = slots 1-6; no wheel graphic yet)"); }
+    if (c.events & BMVR_EV_WHEEL_SELECT) {
+        const float m = sqrtf(g_ic_wheel_x * g_ic_wheel_x + g_ic_wheel_y * g_ic_wheel_y);
+        if (m > 0.5f) {
+            float a = atan2f(g_ic_wheel_x, g_ic_wheel_y) * 180.0f / BMVR_PI_F;   /* 0 = up, clockwise */
+            if (a < 0.0f) a += 360.0f;
+            int slot = (int)((a + 30.0f) / 60.0f) % 6;
+            ic_menu_key_pulse(IC_KEY_SLOT0 + slot);
+            bmvr_log("input: weapon wheel -> slot %d", slot + 1);
+        }
+        g_ic_wheel_x = g_ic_wheel_y = 0.0f;
+    }
     g_ic_applied++;
 }
 
@@ -2252,10 +2298,11 @@ static int g_sdl_tried;
 #define MENU_STALL 6                 /* Presents without a CreateMove call before the controllers drive the menu */
 #define MENU_REPEAT_DELAY 30
 #define MENU_REPEAT_EVERY 8
-#define MENU_KEYS 6
+#define MENU_KEYS 12
 enum { MK_ESC, MK_ENTER, MK_UP, MK_DOWN, MK_LEFT, MK_RIGHT };
 static const struct { int scan; int sym; } g_menu_key_tab[MENU_KEYS] = {
     { 41, 27 }, { 40, 13 }, { 82, 0x40000052 }, { 81, 0x40000051 }, { 80, 0x40000050 }, { 79, 0x4000004F },
+    { 30, '1' }, { 31, '2' }, { 32, '3' }, { 33, '4' }, { 34, '5' }, { 35, '6' },
 };
 static unsigned g_menu_release_tick[MENU_KEYS];   /* 0 = key is up */
 static unsigned g_menu_hold_since[MENU_KEYS], g_menu_next_rep[MENU_KEYS];
@@ -2349,6 +2396,19 @@ static void ic_sdl_mouse(int down_edge, int up_edge)
         memcpy(ev + 20, &xx, 4); memcpy(ev + 24, &yy, 4);
         g_sdl_push(ev);
     }
+}
+
+static void ic_sdl_wheel(int dir)
+{
+    ic_sdl_init();
+    if (!g_sdl_push) return;
+    unsigned char ev[56]; memset(ev, 0, sizeof ev);
+    uint32_t type = 0x403u, win = 0;                       /* SDL_MOUSEWHEEL */
+    void *w = ic_sdl_window();
+    if (w && g_sdl_winid) win = g_sdl_winid(w);
+    int32_t y = dir;
+    memcpy(ev + 0, &type, 4); memcpy(ev + 8, &win, 4); memcpy(ev + 20, &y, 4);
+    g_sdl_push(ev);
 }
 
 /* one controller direction as a key with initial delay and repeat */

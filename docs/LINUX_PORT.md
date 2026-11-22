@@ -728,3 +728,23 @@ Next run: send the helper log; the rejected paths tell which names to correct.
 and change in the shim log. Rejected: `/user/hand/left/input/x/click` and `y/click`: on this controller x/y are on the RIGHT hand (with a/b); the left hand has the d-pad and
 `view`. Remapped (compiled, not run): left primary/secondary = `dpad_down` / `dpad_up`; right x/y = new `BMVR_XFER_BTN_EXTRA1/2`. No trigger/squeeze/button
 change lines were in that log; whether they were pressed is unknown, so triggers, squeeze, bumper and the face buttons are still unconfirmed.
+
+## Stage 5, slice 3 (rest): game menu, weapon switching, input options (compiled + stand-in tested; NOT run on a headset)
+
+Slice 3's `CreateMove` hook (movement, turning, buttons, flashlight, recenter) was already in `bmvr_preload.c`. What was missing is added now:
+
+- **Game menu with the controllers.** The Menu / view button pushes Escape (as before). While the game has stopped calling `CreateMove` for 6 Presents
+  (pause, main menu, loading screen) the controllers drive the menu through SDL's event queue: left stick / d-pad = arrow keys (with repeat),
+  A = Enter, B = Escape, right stick = mouse cursor (`SDL_WarpMouseInWindow`), either trigger = left click. The log says `input: game menu control ON/off`.
+  Not verified: whether the old game UI takes the injected keys and mouse events, and whether the cursor is visible in the headset.
+- **Previous / next weapon**: left d-pad down / up send a mouse-wheel event (up = `invprev`, Black Mesa default bindings assumed).
+- **Weapon wheel (minimal)**: hold the right stick click, push the stick, release: the stick direction picks slot 1-6 (6 sectors clockwise from the top) and
+  sends the number key. No wheel graphic and no inventory check; the Windows wheel (`src/vr_weapon_menu.cpp`, D3D9) is not ported.
+- **Options** in `bmvr_target.txt`: `input_weapon_hand=left|right` (left mirrors both controllers), `input_move_hand=left|right` (equal to the weapon hand: one hand walks and fires),
+  `input_deadzone=0.05..0.5`, `input_trigger=0.2..0.9` (press point), `input_turn=smooth|snap` (with `input_snap=`, `input_turn_speed=`), and
+  `input_btn_a|b|bumper|x|y=none|reload|jump|duck|attack2|use|attack` (defaults: a reload, b attack2, bumper jump, x duck, y none).
+- **Tests:** `input_map_test` has new checks for the remap and the hand mirror (52 checks pass); the host-native suite passes (T1-T36).
+  Fixed two compiler warnings (`g_menu_prev_seq` unused; `h->cls` too small for a 79-byte mangled name).
+
+**Still open (next slice):** aim from the right controller, hands / viewmodel at the controller pose, a wheel graphic with the player's real weapon list,
+and pointing at menus with a controller ray instead of the stick cursor.

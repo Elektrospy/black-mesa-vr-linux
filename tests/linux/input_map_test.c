@@ -117,6 +117,27 @@ int main(void)
     q.buttons = RB(BMVR_XFER_BTN_PRIMARY); c = step(&m3, &q, 11.0f);
     CHECK(c.events == BMVR_EV_MENU_SELECT, "menu: A confirms");
 
+    /* options: button remap, left-handed mirror, one hand walks and fires */
+    {   struct bmvr_input_map mr; bmvr_input_map_init(&mr);
+        mr.cfg.act_a = BMVR_ACT_JUMP; mr.cfg.act_y = BMVR_ACT_USE; mr.cfg.act_bumper = BMVR_ACT_NONE;
+        struct bmvr_xfer_input r = mk(); struct bmvr_cmd rc = step(&mr, &r, 11.0f);
+        r.buttons = RB(BMVR_XFER_BTN_PRIMARY | BMVR_XFER_BTN_EXTRA2); rc = step(&mr, &r, 11.0f);
+        CHECK((rc.buttons & BMVR_IN_JUMP) && (rc.buttons & BMVR_IN_USE) && !(rc.buttons & BMVR_IN_RELOAD), "remap: A = jump, Y = use, A no longer reloads");
+        r.buttons = RB(BMVR_XFER_BTN_BUMPER); rc = step(&mr, &r, 11.0f);
+        CHECK(rc.buttons == 0, "remap: bumper set to none does nothing");
+
+        struct bmvr_xfer_input l = mk();
+        l.buttons = LB(BMVR_XFER_BTN_MENU) | RB(BMVR_XFER_BTN_STICK);
+        l.stick[0][1] = 0.9f; l.stick[1][0] = -0.4f; l.trigger[0] = 0.9f; l.trigger[1] = 0.2f; l.aim[0][0] = 1.0f; l.aim[1][0] = 2.0f;
+        bmvr_im_remap_hands(&l, 1, 0);
+        CHECK(l.stick[1][1] == 0.9f && l.stick[0][0] == -0.4f && l.trigger[1] == 0.9f && l.trigger[0] == 0.2f, "mirror: sticks and triggers swap hands");
+        CHECK((l.buttons & 0xffu) == BMVR_XFER_BTN_STICK && ((l.buttons >> 8) & 0xffu) == BMVR_XFER_BTN_MENU, "mirror: buttons swap bytes");
+        CHECK(l.aim[0][0] == 2.0f && l.aim[1][0] == 1.0f, "mirror: poses swap hands");
+        struct bmvr_xfer_input s = mk(); s.stick[0][1] = 1.0f; s.stick[1][0] = 0.5f; s.trigger[1] = 0.7f;
+        bmvr_im_remap_hands(&s, 0, 1);
+        CHECK(s.stick[1][1] == 1.0f && s.stick[0][0] == 0.5f && s.trigger[1] == 0.7f, "sticks only: the trigger stays on its hand");
+    }
+
     /* no input at all (helper offers none) is a quiet, valid state */
     c = step(&m3, &(struct bmvr_xfer_input){ 0 }, 11.0f);
     struct bmvr_input_map m4; bmvr_input_map_init(&m4); bmvr_input_map_step(&m4, NULL, 11.0f, &c);

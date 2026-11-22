@@ -59,6 +59,27 @@
 #define BMVR_EV_MENU_UP       512u
 #define BMVR_EV_MENU_DOWN     1024u
 
+/* What a face button can do (input_btn_*= in bmvr_target.txt). */
+#define BMVR_ACT_NONE    0
+#define BMVR_ACT_RELOAD  1
+#define BMVR_ACT_JUMP    2
+#define BMVR_ACT_DUCK    3
+#define BMVR_ACT_ATTACK2 4
+#define BMVR_ACT_USE     5
+#define BMVR_ACT_ATTACK  6
+static inline unsigned bmvr_im_act_bits(int act)
+{
+    switch (act) {
+    case BMVR_ACT_RELOAD:  return BMVR_IN_RELOAD;
+    case BMVR_ACT_JUMP:    return BMVR_IN_JUMP;
+    case BMVR_ACT_DUCK:    return BMVR_IN_DUCK;
+    case BMVR_ACT_ATTACK2: return BMVR_IN_ATTACK2;
+    case BMVR_ACT_USE:     return BMVR_IN_USE;
+    case BMVR_ACT_ATTACK:  return BMVR_IN_ATTACK;
+    default: return 0;
+    }
+}
+
 struct bmvr_cmd {
     float forward, side;        /* -1..1, +forward, +right; dead zone applied and rescaled */
     float turn;                 /* -1..1, +right; 0 while the wheel is open or the menu owns the stick */
@@ -74,6 +95,7 @@ struct bmvr_input_map_cfg {
     float wheel_hold_ms;        /* default 180, the Windows value */
     int   turn_blocks_jump_crouch;   /* default 1 */
     int   menu_open;            /* set by the caller every step */
+    int   act_a, act_b, act_bumper, act_x, act_y;   /* BMVR_ACT_*: the right hand's face buttons and bumper (after the hand swap) */
 };
 
 struct bmvr_input_map {
@@ -97,6 +119,29 @@ static inline void bmvr_input_map_init(struct bmvr_input_map *m)
     m->cfg.stick_jump_crouch = 0.75f;
     m->cfg.wheel_hold_ms = 180.0f;
     m->cfg.turn_blocks_jump_crouch = 1;
+    m->cfg.act_a = BMVR_ACT_RELOAD;
+    m->cfg.act_b = BMVR_ACT_ATTACK2;
+    m->cfg.act_bumper = BMVR_ACT_JUMP;
+    m->cfg.act_x = BMVR_ACT_DUCK;
+    m->cfg.act_y = BMVR_ACT_NONE;
+}
+
+/* Hand assignment: swap_hands mirrors everything (left-handed: weapon in the left hand, walk on the right stick); swap_sticks only exchanges
+ * the two sticks (so one hand can both walk and fire). */
+static inline void bmvr_im_remap_hands(struct bmvr_xfer_input *in, int swap_hands, int swap_sticks)
+{
+    if (swap_hands) {
+        float t;
+        in->buttons = ((in->buttons & 0xffu) << 8) | ((in->buttons >> 8) & 0xffu);
+        for (int i = 0; i < 2; i++) { t = in->stick[0][i]; in->stick[0][i] = in->stick[1][i]; in->stick[1][i] = t; }
+        t = in->trigger[0]; in->trigger[0] = in->trigger[1]; in->trigger[1] = t;
+        t = in->squeeze[0]; in->squeeze[0] = in->squeeze[1]; in->squeeze[1] = t;
+        for (int i = 0; i < 7; i++) {
+            t = in->aim[0][i]; in->aim[0][i] = in->aim[1][i]; in->aim[1][i] = t;
+            t = in->grip[0][i]; in->grip[0][i] = in->grip[1][i]; in->grip[1][i] = t;
+        }
+    }
+    if (swap_sticks) for (int i = 0; i < 2; i++) { const float t = in->stick[0][i]; in->stick[0][i] = in->stick[1][i]; in->stick[1][i] = t; }
 }
 
 static inline float bmvr_im_dead(float v, float dz)
@@ -216,10 +261,13 @@ static inline void bmvr_input_map_step(struct bmvr_input_map *m, const struct bm
     unsigned btn = 0;
     if (m->atk_on) btn |= BMVR_IN_ATTACK;
     if (m->use_on) btn |= BMVR_IN_USE;
-    if (DOWN(R, BMVR_XFER_BTN_SECONDARY)) btn |= BMVR_IN_ATTACK2;
-    if (DOWN(R, BMVR_XFER_BTN_PRIMARY)) btn |= BMVR_IN_RELOAD;
-    if (DOWN(R, BMVR_XFER_BTN_BUMPER) || stick_jump) btn |= BMVR_IN_JUMP;
-    if (DOWN(R, BMVR_XFER_BTN_EXTRA1) || stick_crouch) btn |= BMVR_IN_DUCK;
+    if (DOWN(R, BMVR_XFER_BTN_SECONDARY)) btn |= bmvr_im_act_bits(m->cfg.act_b);
+    if (DOWN(R, BMVR_XFER_BTN_PRIMARY)) btn |= bmvr_im_act_bits(m->cfg.act_a);
+    if (DOWN(R, BMVR_XFER_BTN_BUMPER)) btn |= bmvr_im_act_bits(m->cfg.act_bumper);
+    if (DOWN(R, BMVR_XFER_BTN_EXTRA1)) btn |= bmvr_im_act_bits(m->cfg.act_x);
+    if (DOWN(R, BMVR_XFER_BTN_EXTRA2)) btn |= bmvr_im_act_bits(m->cfg.act_y);
+    if (stick_jump) btn |= BMVR_IN_JUMP;
+    if (stick_crouch) btn |= BMVR_IN_DUCK;
     if (DOWN(L, BMVR_XFER_BTN_STICK)) btn |= BMVR_IN_SPEED;
     out->buttons = btn;
 
