@@ -22,7 +22,11 @@ struct BarViewRender : IView {
     int RenderView(int a, int b) override { return a * b; }
     int Other() override { return 8; }
 };
-struct ViewRenderer { virtual void f() {} };           // a name that merely CONTAINS ViewRender: must not be listed
+struct ViewRenderer { virtual void f() {} };
+struct SubFoo : FooViewRender { int RenderView(int a, int b) override { return a - b; } };      // single inheritance: found without its name
+struct SubSubFoo : SubFoo { void Init() override {} };
+__attribute__((noinline)) static IView *make_sub() { return new SubFoo(); }
+__attribute__((noinline)) static IView *make_subsub() { return new SubSubFoo(); }           // a name that merely CONTAINS ViewRender: must not be listed
 struct A { virtual void a() {} int x = 1; };
 struct B { virtual void b() {} int y = 2; };
 struct C : A, B { void a() override {} void b() override {} };   // C has a primary vtable and a secondary one for B
@@ -46,6 +50,22 @@ int main()
     C *c = make_c();
     ViewRenderer *vr = make_vr();
     (void)vr;
+
+    // 0. subclasses are found from the base's type_info alone, with their own primary vtables (what the CreateMove hook needs)
+    {
+        IView *sub = make_sub(), *subsub = make_subsub();
+        struct bmvr_vt_hit b[8], d[8];
+        int nb = bmvr_rtti_find("exe", typeid(FooViewRender).name(), b, 8), pb = -1;
+        for (int i = 0; i < nb; i++) if (b[i].primary) pb = i;
+        CHECK(pb >= 0, "base not found");
+        int nd = pb >= 0 ? bmvr_rtti_derived("exe", b[pb].typeinfo, d, 8) : 0, got_sub = 0, got_subsub = 0;
+        for (int i = 0; i < nd; i++) { if (d[i].vtable == *(uintptr_t *)sub) got_sub = 1; if (d[i].vtable == *(uintptr_t *)subsub) got_subsub = 1; }
+        CHECK(nd == 2, "derived classes: %d, want exactly SubFoo and SubSubFoo", nd);
+        CHECK(got_sub && got_subsub, "derived vtables match the objects' vptrs (sub %d, subsub %d)", got_sub, got_subsub);
+        int nb2 = bmvr_rtti_find("exe", typeid(BarViewRender).name(), b, 8), pb2 = -1;
+        for (int i = 0; i < nb2; i++) if (b[i].primary) pb2 = i;
+        CHECK(pb2 >= 0 && bmvr_rtti_derived("exe", b[pb2].typeinfo, d, 8) == 0, "a class with no subclass reports none");
+    }
 
     // 1. the primary vtable of a class is found, and it is the one the object's vptr holds
     {

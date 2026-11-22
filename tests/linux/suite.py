@@ -403,6 +403,18 @@ del os.environ['PRE_FLAG_INPUT']
 c=cm(out) or {}
 check('crash-sticky flag present at start: input OFF for this launch, flag consumed', 'bmvr_in_input.flag exists' in log and 'hooked 16' not in log and c and c['moved']==0 and not os.path.exists(f'{R}/cases/t35d/bmvr_in_input.flag'), str(c))
 
+print('T36 the game instantiates a SUBCLASS of ClientModeShared (own vtable copy): the base hook sees nothing, the probe finds the subclass')
+log,tr,out,ex=run('t36a',['--sem','--drive'],IN+'sync=sem\nevery=1\n',('FAKE_INPUT=1','FAKE_INPUT_DERIVED=1'),'100 200')
+c=cm(out) or {}
+check('subclass found as a candidate, watched, proved itself; others put back', 'exit=0' in ex and 'candidate class 19ClientModeBMSNormal' in log and 'looks like CreateMove' in log and 'of 19ClientModeBMSNormal looks like CreateMove' in log, log[-700:])
+check('controllers drive the subclass: moved, attack, kbd bits kept', c and c['moved']>=100 and abs(c['maxfwd']-450.0)<0.01 and c['attack']>=100 and c['kbd_lost']==0, str(c))
+log,tr,out,ex=run('t36b',['--sem','--drive'],IN+'input_probe=0\nsync=sem\nevery=1\n',('FAKE_INPUT=1','FAKE_INPUT_DERIVED=1'),'100 100')
+c=cm(out) or {}
+check('input_probe=0: only the base vtable, never called, nothing written (the failure mode seen on the real game)', 'exit=0' in ex and 'looks like CreateMove' not in log and c and c['moved']==0, str(c))
+log,tr,out,ex=run('t36c',['--sem','--drive'],IN+'sync=sem\nevery=1\n',('FAKE_INPUT=1','FAKE_INPUT_DERIVED=2'),'100 200')
+c=cm(out) or {}
+check('a subclass that overrides CreateMove and calls the base directly: its own slot is hooked, written exactly once per cmd', 'exit=0' in ex and c and c['moved']>=100 and abs(c['maxfwd']-450.0)<0.01, str(c)+log[-500:])
+
 print()
 print('FAILED: %d'%fails if fails else 'ALL CHECKS PASSED')
 sys.exit(1 if fails else 0)

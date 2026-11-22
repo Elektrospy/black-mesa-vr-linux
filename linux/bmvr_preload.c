@@ -459,6 +459,7 @@ static int g_ic_want;                              /* config: input=1 (BMVR_INPU
 static char g_ic_module[96] = "/client.so";        /* input_module= */
 static char g_ic_class[64] = "ClientModeShared";   /* input_class=: class whose vtable holds CreateMove (plain name; mangled here) */
 static int g_ic_class_explicit;
+static int g_ic_probe = 1;                        /* input_probe=0 turns off watching the subclasses' vtables too */
 static int g_ic_slot = 22;                         /* input_slot= */
 static float g_ic_turn_speed = 180.0f;             /* input_turn_speed= degrees per second at full stick (smooth turning) */
 static float g_ic_snap = 0.0f;                     /* input_snap= degrees per flick; 0 = smooth turning */
@@ -592,6 +593,7 @@ static void load_cfg_once(void)
             else if (!strncmp(line, "input=", 6)) g_ic_want = line[6] == '1';
             else if (!strncmp(line, "input_module=", 13)) snprintf(g_ic_module, sizeof g_ic_module, "%.95s", line + 13);
             else if (!strncmp(line, "input_class=", 12)) { snprintf(g_ic_class, sizeof g_ic_class, "%.63s", line + 12); g_ic_class_explicit = 1; }
+            else if (!strncmp(line, "input_probe=", 12)) g_ic_probe = line[12] != '0';
             else if (!strncmp(line, "input_slot=", 11)) {
                 long v = strtol(line + 11, NULL, 10);
                 if (v >= 0 && v < 256) g_ic_slot = (int)v;
@@ -1993,20 +1995,24 @@ struct bmvr_usercmd {            /* mirrors src/sdk/usercmd.h: virtual destructo
 #define IC_FLAG_CLEAR_CALLS 1800
 typedef int (*PFN_CreateMove)(void *, float, void *);
 static int g_ic_state;                 /* 0 = not tried, 1 = hooked, -1 = refused / failed */
-static PFN_CreateMove g_ic_orig;
-static uintptr_t *g_ic_vt_slot;
+#define IC_MAXH 8
+/* One entry per patched vtable slot: the base class and every derived "ClientMode*" class that shares its layout. A derived class keeps its OWN copy
+ * of the vtable, so patching only ClientModeShared's vtable is never seen when the game instantiates ClientModeBMSNormal or similar. */
+struct ic_hook { uintptr_t *slot; PFN_CreateMove orig; unsigned calls, sane_run, insane, bad_run; int last_cmd; char cls[64]; };
+static struct ic_hook g_ic_h[IC_MAXH];
+static int g_ic_nh;
+static int g_ic_junk_said;
+static int g_ic_win = -1;              /* the hook that proved to be CreateMove */
 static unsigned g_ic_next_try, g_ic_hook_tick;
-static unsigned g_ic_calls, g_ic_sane_run, g_ic_insane, g_ic_applied, g_ic_nocmd;
+static unsigned g_ic_calls, g_ic_applied, g_ic_nocmd;
 static int g_ic_armed;                 /* the learning phase passed: values are written */
 static int g_ic_dead;                  /* armed, then a cmd failed the check: never write again */
-static int g_ic_last_cmdnum = -1;
 static char g_ic_flag_path[512];
 static int g_ic_flag_on;
 static struct bmvr_input_map g_ic_map;
 static int g_ic_map_ready;
 static int g_ic_snap_latched;
 static unsigned g_ic_unwired_seen;
-static unsigned g_ic_bad_run;          /* consecutive implausible cmds while armed */
 
 static int ic_cmd_sane(const struct bmvr_usercmd *c)
 {
@@ -2077,36 +2083,46 @@ static void ic_apply(float dt, struct bmvr_usercmd *cmd)
     g_ic_applied++;
 }
 
-static int ic_detour(void *self, float t, void *cmdp)
+static int ic_detour_n(int i, void *self, float t, void *cmdp)
 {
+    struct ic_hook *h = &g_ic_h[i];
     struct bmvr_usercmd *cmd = (struct bmvr_usercmd *)cmdp;
+    h->calls++;
     g_ic_calls++;
     const int sane = ic_cmd_sane(cmd);
-    if (g_ic_armed && !g_ic_dead && sane && cmd->command_number != 0) {
-        if (cmd->command_number >= g_ic_last_cmdnum) g_ic_last_cmdnum = cmd->command_number;
+    const int mine = g_ic_armed && g_ic_win == i;
+    if (mine && !g_ic_dead && sane && cmd->command_number != 0) {
+        if (cmd->command_number >= h->last_cmd) h->last_cmd = cmd->command_number;
         ic_apply(t, cmd);
     }
-    const int r = g_ic_orig(self, t, cmdp);
+    const int r = h->orig(self, t, cmdp);
     if (!g_ic_armed) {
         /* learning: judge the cmd AFTER the original ran, and never write */
-        if (sane && cmd->command_number >= g_ic_last_cmdnum && cmd->command_number != 0) {
-            g_ic_last_cmdnum = cmd->command_number;
-            if (++g_ic_sane_run == IC_LEARN) {
+        if (sane && cmd->command_number >= h->last_cmd && cmd->command_number != 0) {
+            h->last_cmd = cmd->command_number;
+            if (++h->sane_run == IC_LEARN) {
+                g_ic_win = i;
                 g_ic_armed = 1;
-                bmvr_log("input: the hooked slot %d looks like CreateMove (%d consecutive calls with a plausible, increasing CUserCmd). Controller input is now written "
-                         "into the game: left stick walks, right stick turns, right trigger fires.", g_ic_slot, IC_LEARN);
+                bmvr_log("input: the hooked slot %d of %s looks like CreateMove (%d consecutive calls with a plausible, increasing CUserCmd). Controller input is now written "
+                         "into the game: left stick walks, right stick turns, right trigger fires.", g_ic_slot, h->cls, IC_LEARN);
+                for (int j = 0; j < g_ic_nh; j++)   /* the others were only watching: put their slots back */
+                    if (j != i && g_ic_h[j].slot) { uintptr_t old; bmvr_vtable_patch(g_ic_h[j].slot, (uintptr_t)g_ic_h[j].orig, &old); g_ic_h[j].slot = NULL; }
                 if (g_ic_flag_path[0]) { int fd = open(g_ic_flag_path, O_WRONLY | O_CREAT, 0644); if (fd >= 0) { close(fd); g_ic_flag_on = 1; } }
             }
-        } else if (cmd && cmd->command_number != 0 && g_ic_sane_run) { g_ic_sane_run = 0; g_ic_insane++; }
-        else if (!sane && !g_ic_insane++) bmvr_log("input: the second argument of the hooked slot's calls does not look like a CUserCmd yet (watching; nothing is written)");
-    } else if (!g_ic_dead && sane) {
-        g_ic_bad_run = 0;
-    } else if (!g_ic_dead && ++g_ic_bad_run >= 3) {
-        g_ic_dead = 1;
-        bmvr_log("input: a call of the hooked slot no longer looks like CreateMove; input is OFF for the rest of this launch (wrong input_slot=?)");
+        } else if (cmd && cmd->command_number != 0 && h->sane_run) { h->sane_run = 0; h->insane++; }
+        else if (!sane && !h->insane++ && !g_ic_junk_said++) bmvr_log("input: the second argument of the hooked slot's calls does not look like a CUserCmd yet (watching; nothing is written)");
+    } else if (mine && !g_ic_dead) {
+        if (sane) h->bad_run = 0;
+        else if (++h->bad_run >= 3) {
+            g_ic_dead = 1;
+            bmvr_log("input: a call of the hooked slot no longer looks like CreateMove; input is OFF for the rest of this launch (wrong input_slot=?)");
+        }
     }
     return r;
 }
+#define IC_TR(n) static int ic_tr##n(void *s, float t, void *c) { return ic_detour_n(n, s, t, c); }
+IC_TR(0) IC_TR(1) IC_TR(2) IC_TR(3) IC_TR(4) IC_TR(5) IC_TR(6) IC_TR(7)
+static const PFN_CreateMove g_ic_tr[IC_MAXH] = { ic_tr0, ic_tr1, ic_tr2, ic_tr3, ic_tr4, ic_tr5, ic_tr6, ic_tr7 };
 
 static void __attribute__((destructor)) ic_atexit(void)
 {
@@ -2156,14 +2172,44 @@ static void ic_try_install(void)
         bmvr_log("input:   slot %2d -> %#lx (module offset %#lx)%s", i, (unsigned long)vt[i], (unsigned long)(vt[i] - mod[0].lo), i == g_ic_slot ? "   <- CreateMove?" : "");
     for (int i = 0; i <= g_ic_slot; i++)
         if (!bmvr_addr_executable(vt[i])) { bmvr_log("input: vtable slot %d is not executable code: the vtable is shorter than input_slot=%d; input is off", i, g_ic_slot); return; }
-    uintptr_t old = 0;
-    g_ic_orig = (PFN_CreateMove)vt[g_ic_slot];
     g_ic_state = 1;
     g_ic_hook_tick = g_x_tick;
-    if (!bmvr_vtable_patch(&vt[g_ic_slot], (uintptr_t)ic_detour, &old)) { bmvr_log("input: could not patch the vtable slot (mprotect refused); input is off"); g_ic_orig = NULL; g_ic_state = -1; return; }
-    g_ic_vt_slot = &vt[g_ic_slot];
+    uintptr_t old = 0;
+    {   struct ic_hook *h = &g_ic_h[0];
+        h->orig = (PFN_CreateMove)vt[g_ic_slot];
+        snprintf(h->cls, sizeof h->cls, "%s", mangled);
+        if (!bmvr_vtable_patch(&vt[g_ic_slot], (uintptr_t)g_ic_tr[0], &old)) { bmvr_log("input: could not patch the vtable slot (mprotect refused); input is off"); g_ic_state = -1; return; }
+        h->slot = &vt[g_ic_slot];
+        g_ic_nh = 1;
+    }
     bmvr_log("input: hooked %s vtable slot %d (was %#lx). WATCHING ONLY until %d consecutive calls look like CreateMove; then the controllers are written into the game. "
              "UNVERIFIED on this build.", mangled, g_ic_slot, (unsigned long)old, IC_LEARN);
+
+    /* Derived classes. The engine instantiates a subclass (ClientModeHL2MPNormal and the like), whose vtable is a separate copy: the base class's patched
+     * slot is then never called. Also watch the same slot of every other "ClientMode" class whose vtable has the base layout (most slots identical). */
+    if (g_ic_probe) {
+        struct bmvr_vt_hit dh[IC_MAXH];
+        const int nd = bmvr_rtti_derived(g_ic_module, h[prim].typeinfo, dh, IC_MAXH);
+        if (!nd) bmvr_log("input: no subclass of %s found in '%s' (the game instantiates the base class itself)", mangled, g_ic_module);
+        for (int ci = 0; ci < nd && g_ic_nh < IC_MAXH; ci++) {
+            const char *dname = (const char *)((const uintptr_t *)dh[ci].typeinfo)[1];
+            struct { char name[64]; } cc1; snprintf(cc1.name, sizeof cc1.name, "%.63s", dname);
+            uintptr_t *dv = (uintptr_t *)dh[ci].vtable;
+            int ok = 1, same = 0;
+            for (int i = 0; i <= g_ic_slot; i++) { if (!bmvr_addr_executable(dv[i])) ok = 0; else if (dv[i] == (i == g_ic_slot ? (uintptr_t)g_ic_h[0].orig : vt[i])) same++; }   /* the base slot now holds our detour */
+            const int total = g_ic_slot + 1;
+            bmvr_log("input: candidate class %s: vtable %#lx, %d of %d slots identical to %s, slot %d -> %#lx%s", cc1.name, (unsigned long)dv, same, total, mangled, g_ic_slot,
+                     (unsigned long)dv[g_ic_slot], dv[g_ic_slot] == (uintptr_t)g_ic_h[0].orig ? " (same function as the base)" : " (its own override)");
+            if (!ok || same * 5 < total * 2) { bmvr_log("input:   not watched (%s)", !ok ? "vtable too short" : "layout differs from the base: not a subclass"); continue; }
+            struct ic_hook *ih = &g_ic_h[g_ic_nh];
+            ih->orig = (PFN_CreateMove)dv[g_ic_slot];
+            snprintf(ih->cls, sizeof ih->cls, "%s", cc1.name);
+            if (!bmvr_vtable_patch(&dv[g_ic_slot], (uintptr_t)g_ic_tr[g_ic_nh], &old)) { bmvr_log("input:   could not patch (mprotect refused); not watched"); continue; }
+            ih->slot = &dv[g_ic_slot];
+            g_ic_nh++;
+            bmvr_log("input:   watched as well (hook %d)", g_ic_nh - 1);
+        }
+    }
 }
 
 static void ic_status_tick(void)
@@ -2171,8 +2217,12 @@ static void ic_status_tick(void)
     if (!g_ic_want || g_ic_state != 1 || g_x_tick == g_ic_hook_tick) return;
     if (g_ic_flag_on && g_ic_applied >= IC_FLAG_CLEAR_CALLS && g_ic_flag_path[0]) { unlink(g_ic_flag_path); g_ic_flag_on = 0; }
     if ((g_x_tick - g_ic_hook_tick) % 600) return;
-    bmvr_log("input: status tick %u: CreateMove calls %u, plausible-cmd run %u (need %d), implausible %u, armed %d%s, cmds written %u, no input yet %u",
-             g_x_tick, g_ic_calls, g_ic_sane_run, IC_LEARN, g_ic_insane, g_ic_armed, g_ic_dead ? " (DEAD)" : "", g_ic_applied, g_ic_nocmd);
+    {   unsigned run = 0, ins = 0;
+        for (int i = 0; i < g_ic_nh; i++) { if (g_ic_h[i].sane_run > run) run = g_ic_h[i].sane_run; ins += g_ic_h[i].insane; }
+        bmvr_log("input: status tick %u: CreateMove calls %u, plausible-cmd run %u (need %d), implausible %u, armed %d%s, cmds written %u, no input yet %u",
+                 g_x_tick, g_ic_calls, run, IC_LEARN, ins, g_ic_armed, g_ic_dead ? " (DEAD)" : "", g_ic_applied, g_ic_nocmd);
+        if (g_ic_nh > 1) for (int i = 0; i < g_ic_nh; i++) bmvr_log("input:   hook %d %s: %u calls%s", i, g_ic_h[i].cls, g_ic_h[i].calls, g_ic_win == i ? " (CreateMove)" : "");
+    }
     if (!g_ic_calls && g_x_tick - g_ic_hook_tick >= 1800) {
         static int warned;
         if (!warned) { warned = 1; bmvr_log("input: WARNING: the hooked slot has not been called once in %u frames. If a map is loaded this is the wrong class or input_slot= "

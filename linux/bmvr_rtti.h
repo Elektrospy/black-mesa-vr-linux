@@ -216,6 +216,66 @@ static inline int bmvr_rtti_find(const char *module, const char *mangled, struct
     return count;
 }
 
+/*
+ * Every class that derives from the class whose std::type_info is `base` through SINGLE inheritance (a __si_class_type_info: { vptr, name, base_type }),
+ * transitively (three levels), with its primary vtable. A derived class has a vtable of its own, so a patch of the base class's vtable slot is never seen
+ * when the program instantiates the subclass: this is how those subclasses are found without knowing their names. out[].typeinfo is the subclass's
+ * type_info (its name is the second word). Returns how many were stored.
+ */
+static inline int bmvr_rtti_derived(const char *module, uintptr_t base, struct bmvr_vt_hit *out, int max)
+{
+    struct bmvr_map mod[BMVR_RTTI_MAX_RANGES];
+    const int nm = bmvr_maps_module(module, mod, BMVR_RTTI_MAX_RANGES);
+    if (!nm) return 0;
+    const size_t w = sizeof(uintptr_t);
+#define BMVR_IN_MOD(a, len, r) ({ int _in = 0; for (int _i = 0; _i < nm; _i++) if ((a) >= mod[_i].lo && (a) + (len) <= mod[_i].hi) _in = 1; _in; })
+    uintptr_t level[16], seen[32];
+    int nl = 1, nseen = 0, count = 0;
+    level[0] = base;
+    seen[nseen++] = base;
+    for (int depth = 0; depth < 3 && nl; depth++) {
+        uintptr_t next[16];
+        int nn = 0;
+        for (int li = 0; li < nl; li++) {
+            struct bmvr_word_hits bh;
+            bh.n = 0;
+            for (int i = 0; i < nm; i++) bmvr_scan_word(mod[i].lo, mod[i].hi, level[li], &bh);
+            for (int hi = 0; hi < bh.n; hi++) {
+                if (bh.addr[hi] < 2 * w) continue;
+                const uintptr_t der = bh.addr[hi] - 2 * w;                  /* the base pointer is the THIRD word of a __si_class_type_info */
+                if (!BMVR_IN_MOD(der, 3 * w, 0)) continue;
+                const uintptr_t name = *(const uintptr_t *)(der + w);
+                if (!name || !BMVR_IN_MOD(name, 2, 0) || *(const char *)name < '0' || *(const char *)name > '9') continue;   /* a vtable's offset_to_top is not a name */
+                if (!*(const uintptr_t *)der) continue;
+                int dup = 0;
+                for (int k = 0; k < nseen; k++) if (seen[k] == der) dup = 1;
+                if (dup || nseen >= 32) continue;
+                seen[nseen++] = der;
+                if (nn < 16) next[nn++] = der;
+                struct bmvr_word_hits vh;
+                vh.n = 0;
+                for (int i = 0; i < nm; i++) bmvr_scan_word(mod[i].lo, mod[i].hi, der, &vh);
+                for (int vi = 0; vi < vh.n && count < max; vi++) {
+                    const uintptr_t at = vh.addr[vi];
+                    if (!BMVR_IN_MOD(at - w, 3 * w, 0)) continue;
+                    const intptr_t ott = *(const intptr_t *)(at - w);
+                    const uintptr_t slot0 = *(const uintptr_t *)(at + w);
+                    if (ott != 0 || !bmvr_addr_executable(slot0)) continue;
+                    out[count].typeinfo = der;
+                    out[count].vtable = at + w;
+                    out[count].offset_to_top = 0;
+                    out[count].primary = 1;
+                    count++;
+                }
+            }
+        }
+        for (int i = 0; i < nn; i++) level[i] = next[i];
+        nl = nn;
+    }
+#undef BMVR_IN_MOD
+    return count;
+}
+
 /* Every class in `module` whose Itanium name is "<len><identifier>" and ends with `suffix` ("ViewRender"): the diagnostic that
  * tells which class names exist when the configured one is not found. cb(mangled name, address of the string). */
 typedef void (*bmvr_rtti_cb)(const char *mangled, uintptr_t name_addr, void *ud);

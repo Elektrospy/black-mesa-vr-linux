@@ -24,7 +24,10 @@ struct IClientMode { virtual ~IClientMode() {}
   virtual bool CreateMove(float flInputSampleTime, FUserCmd *cmd) = 0; };
 static int g_cm_calls;
 struct ClientModeShared : IClientMode { bool CreateMove(float, FUserCmd *c) override { g_cm_calls++; c->buttons |= 0x10000; c->tick_count = c->command_number; return true; } };
-__attribute__((noinline)) static IClientMode *make_client_mode() { return new ClientModeShared(); }
+// FAKE_INPUT_DERIVED=1: the engine instantiates a subclass (own vtable copy, inherits CreateMove), as the real game does: a hook on the base vtable alone is never called.
+struct ClientModeBMSNormal : ClientModeShared { void f3() override {} };
+struct ClientModeOwn : ClientModeShared { bool CreateMove(float t, FUserCmd *c) override { return ClientModeShared::CreateMove(t, c); } };   // overrides and calls the base directly
+__attribute__((noinline)) static IClientMode *make_client_mode() { const char *d = getenv("FAKE_INPUT_DERIVED"); if (d && d[0] == '2') return new ClientModeOwn(); if (d) return new ClientModeBMSNormal(); return new ClientModeShared(); }
 static unsigned char g_main_raw[0x148];   // the engine builds nested views (water) from its own state, not from the view it was handed
 static IDirect3DDevice9 *g_dev; static IDirect3DSurface9 *g_back; static IDirect3DTexture9 *g_tx[5]; static int g_switches = 60, g_nest;
 #ifndef VR_CLASS_NAME
