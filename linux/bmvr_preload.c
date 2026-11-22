@@ -2000,7 +2000,7 @@ static int g_ic_state;                 /* 0 = not tried, 1 = hooked, -1 = refuse
 #define IC_MAXH 8
 /* One entry per patched vtable slot: the base class and every derived "ClientMode*" class that shares its layout. A derived class keeps its OWN copy
  * of the vtable, so patching only ClientModeShared's vtable is never seen when the game instantiates ClientModeBMSNormal or similar. */
-struct ic_hook { uintptr_t *slot; PFN_CreateMove orig; unsigned calls, sane_run, insane, bad_run; int last_cmd; char cls[64]; };
+struct ic_hook { uintptr_t *slot; PFN_CreateMove orig; unsigned calls, sane_run, insane, bad_run; int last_cmd; char cls[96]; };
 static struct ic_hook g_ic_h[IC_MAXH];
 static int g_ic_nh;
 static int g_ic_junk_said;
@@ -2226,37 +2226,79 @@ static void ic_try_install(void)
     }
 }
 
-/* The Menu button opens and closes the game menu: Escape is pushed into SDL's event queue (the engine reads its keyboard from there). Runs once per Present, not
- * from CreateMove, which does not run while a menu is up or the game is paused. */
+/* Game menu control. Everything goes through SDL's event queue (the engine reads keyboard and mouse from there). Runs once per Present, not from CreateMove,
+ * which does not run while a menu is up or the game is paused.
+ *   Menu / view button : Escape (open / close the game menu, always)
+ * While a menu owns the screen (CreateMove has stopped being called for MENU_STALL Presents, which also covers the main menu and loading screens):
+ *   left stick / d-pad : arrow keys (with key repeat)
+ *   right stick        : moves the mouse cursor
+ *   either trigger     : left mouse button (hold to drag sliders)
+ *   A                  : Enter
+ *   B                  : Escape (back) */
 typedef int (*PFN_SDL_PushEvent)(void *);
 typedef void *(*PFN_SDL_GetKeyboardFocus)(void);
+typedef void *(*PFN_SDL_GetMouseFocus)(void);
 typedef unsigned (*PFN_SDL_GetWindowID)(void *);
+typedef void (*PFN_SDL_GetWindowSize)(void *, int *, int *);
+typedef void (*PFN_SDL_WarpMouseInWindow)(void *, int, int);
 static PFN_SDL_PushEvent g_sdl_push;
 static PFN_SDL_GetKeyboardFocus g_sdl_focus;
+static PFN_SDL_GetMouseFocus g_sdl_mfocus;
 static PFN_SDL_GetWindowID g_sdl_winid;
+static PFN_SDL_GetWindowSize g_sdl_winsize;
+static PFN_SDL_WarpMouseInWindow g_sdl_warp;
 static int g_sdl_tried;
-static unsigned g_menu_prev_seq, g_menu_prev_down, g_menu_release_tick, g_menu_presses;
-static int g_menu_have_prev;
 
-static void ic_sdl_key(int down)
+#define MENU_STALL 6                 /* Presents without a CreateMove call before the controllers drive the menu */
+#define MENU_REPEAT_DELAY 30
+#define MENU_REPEAT_EVERY 8
+#define MENU_KEYS 6
+enum { MK_ESC, MK_ENTER, MK_UP, MK_DOWN, MK_LEFT, MK_RIGHT };
+static const struct { int scan; int sym; } g_menu_key_tab[MENU_KEYS] = {
+    { 41, 27 }, { 40, 13 }, { 82, 0x40000052 }, { 81, 0x40000051 }, { 80, 0x40000050 }, { 79, 0x4000004F },
+};
+static unsigned g_menu_release_tick[MENU_KEYS];   /* 0 = key is up */
+static unsigned g_menu_hold_since[MENU_KEYS], g_menu_next_rep[MENU_KEYS];
+static unsigned g_menu_prev_down, g_menu_presses, g_menu_prev_calls, g_menu_stalled;
+static int g_menu_have_prev, g_menu_active, g_menu_mouse_down, g_menu_logged_on;
+static float g_menu_mx = -1.0f, g_menu_my;
+static uint64_t g_menu_last_ns;
+
+static void ic_sdl_init(void)
 {
-    if (!g_sdl_tried) {
-        g_sdl_tried = 1;
-        void *h = NULL;
-        g_sdl_push = (PFN_SDL_PushEvent)dlsym(RTLD_DEFAULT, "SDL_PushEvent");
-        if (!g_sdl_push) { h = find_loaded_lib("libSDL2-2.0.so.0", "libSDL2"); if (h) g_sdl_push = (PFN_SDL_PushEvent)dlsym(h, "SDL_PushEvent"); }
-        if (g_sdl_push) {
-            g_sdl_focus = (PFN_SDL_GetKeyboardFocus)dlsym(h ? h : RTLD_DEFAULT, "SDL_GetKeyboardFocus");
-            g_sdl_winid = (PFN_SDL_GetWindowID)dlsym(h ? h : RTLD_DEFAULT, "SDL_GetWindowID");
-        } else bmvr_log("input: the Menu button cannot open the game menu: SDL_PushEvent was not found");
-    }
-    if (!g_sdl_push) return;
+    if (g_sdl_tried) return;
+    g_sdl_tried = 1;
+    void *h = NULL;
+    g_sdl_push = (PFN_SDL_PushEvent)dlsym(RTLD_DEFAULT, "SDL_PushEvent");
+    if (!g_sdl_push) { h = find_loaded_lib("libSDL2-2.0.so.0", "libSDL2"); if (h) g_sdl_push = (PFN_SDL_PushEvent)dlsym(h, "SDL_PushEvent"); }
+    if (g_sdl_push) {
+        void *d = h ? h : RTLD_DEFAULT;
+        g_sdl_focus = (PFN_SDL_GetKeyboardFocus)dlsym(d, "SDL_GetKeyboardFocus");
+        g_sdl_mfocus = (PFN_SDL_GetMouseFocus)dlsym(d, "SDL_GetMouseFocus");
+        g_sdl_winid = (PFN_SDL_GetWindowID)dlsym(d, "SDL_GetWindowID");
+        g_sdl_winsize = (PFN_SDL_GetWindowSize)dlsym(d, "SDL_GetWindowSize");
+        g_sdl_warp = (PFN_SDL_WarpMouseInWindow)dlsym(d, "SDL_WarpMouseInWindow");
+    } else bmvr_log("input: the controllers cannot drive the game menu: SDL_PushEvent was not found");
+}
+
+static void *ic_sdl_window(void)
+{
+    void *w = g_sdl_focus ? g_sdl_focus() : NULL;
+    if (!w && g_sdl_mfocus) w = g_sdl_mfocus();
+    return w;
+}
+
+static void ic_sdl_key(int key, int down)
+{
+    ic_sdl_init();
+    if (!g_sdl_push || key < 0 || key >= MENU_KEYS) return;
     unsigned char ev[56];                       /* SDL_Event: 56 bytes; SDL_KeyboardEvent uses the first 32 */
     memset(ev, 0, sizeof ev);
     uint32_t type = down ? 0x300u : 0x301u;     /* SDL_KEYDOWN / SDL_KEYUP */
     uint32_t win = 0;
-    if (g_sdl_focus && g_sdl_winid) { void *w = g_sdl_focus(); if (w) win = g_sdl_winid(w); }
-    int32_t scancode = 41, sym = 27;            /* SDL_SCANCODE_ESCAPE, SDLK_ESCAPE */
+    void *w = ic_sdl_window();
+    if (w && g_sdl_winid) win = g_sdl_winid(w);
+    int32_t scancode = g_menu_key_tab[key].scan, sym = g_menu_key_tab[key].sym;
     memcpy(ev + 0, &type, 4);
     memcpy(ev + 8, &win, 4);
     ev[12] = down ? 1 : 0;                      /* state */
@@ -2265,20 +2307,124 @@ static void ic_sdl_key(int down)
     g_sdl_push(ev);
 }
 
+/* a key press that stays down for a couple of frames, like a real one */
+static void ic_menu_key_pulse(int key)
+{
+    if (g_menu_release_tick[key]) return;
+    ic_sdl_key(key, 1);
+    g_menu_release_tick[key] = g_x_tick + 2;
+}
+
+static void ic_sdl_mouse(int down_edge, int up_edge)
+{
+    ic_sdl_init();
+    void *w = ic_sdl_window();
+    if (!g_sdl_push || !w) return;
+    int ww = 0, wh = 0;
+    if (g_sdl_winsize) g_sdl_winsize(w, &ww, &wh);
+    if (ww <= 0 || wh <= 0) return;
+    if (g_menu_mx < 0.0f) { g_menu_mx = ww * 0.5f; g_menu_my = wh * 0.5f; }
+    if (g_menu_mx > ww - 1) g_menu_mx = (float)(ww - 1);
+    if (g_menu_my > wh - 1) g_menu_my = (float)(wh - 1);
+    if (g_menu_mx < 0.0f) g_menu_mx = 0.0f;
+    if (g_menu_my < 0.0f) g_menu_my = 0.0f;
+    const int x = (int)g_menu_mx, y = (int)g_menu_my;
+    const uint32_t win = g_sdl_winid ? g_sdl_winid(w) : 0;
+    if (g_sdl_warp) g_sdl_warp(w, x, y);        /* SDL itself queues the SDL_MOUSEMOTION for a warp */
+    else {
+        unsigned char ev[56]; memset(ev, 0, sizeof ev);
+        uint32_t type = 0x400u, st = g_menu_mouse_down ? 1u : 0u;   /* SDL_MOUSEMOTION */
+        int32_t xx = x, yy = y;
+        memcpy(ev + 0, &type, 4); memcpy(ev + 8, &win, 4); memcpy(ev + 16, &st, 4); memcpy(ev + 20, &xx, 4); memcpy(ev + 24, &yy, 4);
+        g_sdl_push(ev);
+    }
+    if (down_edge || up_edge) {
+        unsigned char ev[56]; memset(ev, 0, sizeof ev);
+        uint32_t type = down_edge ? 0x401u : 0x402u;                /* SDL_MOUSEBUTTONDOWN / UP */
+        int32_t xx = x, yy = y;
+        memcpy(ev + 0, &type, 4); memcpy(ev + 8, &win, 4);
+        ev[16] = 1;                                                 /* SDL_BUTTON_LEFT */
+        ev[17] = down_edge ? 1 : 0;                                 /* state */
+        ev[18] = 1;                                                 /* clicks */
+        memcpy(ev + 20, &xx, 4); memcpy(ev + 24, &yy, 4);
+        g_sdl_push(ev);
+    }
+}
+
+/* one controller direction as a key with initial delay and repeat */
+static void ic_menu_dir(int key, int on)
+{
+    if (!on) { g_menu_hold_since[key] = 0; return; }
+    if (!g_menu_hold_since[key]) { g_menu_hold_since[key] = g_x_tick; g_menu_next_rep[key] = g_x_tick + MENU_REPEAT_DELAY; ic_menu_key_pulse(key); return; }
+    if (g_x_tick >= g_menu_next_rep[key]) { g_menu_next_rep[key] = g_x_tick + MENU_REPEAT_EVERY; ic_menu_key_pulse(key); }
+}
+
+static void ic_menu_release_all(void)
+{
+    for (int k = 0; k < MENU_KEYS; k++) { if (g_menu_release_tick[k]) { g_menu_release_tick[k] = 0; ic_sdl_key(k, 0); } g_menu_hold_since[k] = 0; }
+    if (g_menu_mouse_down) { g_menu_mouse_down = 0; ic_sdl_mouse(0, 1); }
+}
+
 static void ic_menu_tick(void)
 {
     if (!g_ic_want) return;
-    if (g_menu_release_tick && g_x_tick >= g_menu_release_tick) { g_menu_release_tick = 0; ic_sdl_key(0); }
+    for (int k = 0; k < MENU_KEYS; k++)
+        if (g_menu_release_tick[k] && g_x_tick >= g_menu_release_tick[k]) { g_menu_release_tick[k] = 0; ic_sdl_key(k, 0); }
+
+    /* is a menu (or the pause screen, main menu, loading screen) up? Then the game stopped calling CreateMove. */
+    if (g_ic_calls != g_menu_prev_calls) { g_menu_prev_calls = g_ic_calls; g_menu_stalled = 0; }
+    else if (g_menu_stalled < 1000000) g_menu_stalled++;
+    const int active = g_ic_state != -1 && g_menu_stalled >= MENU_STALL;
+    if (active != g_menu_active) {
+        g_menu_active = active;
+        if (!active) ic_menu_release_all();
+        if (g_menu_logged_on++ < 6) bmvr_log("input: game menu control %s (CreateMove %s)", active ? "ON" : "off", active ? "stopped" : "running");
+    }
+
     struct bmvr_xfer_input in;
-    if (!bmvr_get_input(&in) || !(in.flags & BMVR_XFER_INPUT_FOCUSED)) return;
-    const unsigned down = (in.buttons & BMVR_XFER_BTN_MENU) || ((in.buttons >> 8) & BMVR_XFER_BTN_MENU);
+    if (!bmvr_get_input(&in) || !(in.flags & BMVR_XFER_INPUT_FOCUSED)) { if (g_menu_mouse_down) { g_menu_mouse_down = 0; ic_sdl_mouse(0, 1); } return; }
+    const unsigned L = in.buttons & 0xffu, R = (in.buttons >> 8) & 0xffu;
+    const unsigned down = ((L | R) & BMVR_XFER_BTN_MENU) ? 1u : 0u;
     if (!g_menu_have_prev) { g_menu_have_prev = 1; g_menu_prev_down = down; return; }   /* a button already held at start is not a press */
-    if (down && !g_menu_prev_down && !g_menu_release_tick) {
-        ic_sdl_key(1);
-        g_menu_release_tick = g_x_tick + 2;     /* the key stays down for a couple of frames, like a real press */
+    if (down && !g_menu_prev_down) {
+        ic_menu_key_pulse(MK_ESC);
         if (g_menu_presses++ < 5) bmvr_log("input: Menu button -> Escape (game menu)");
     }
     g_menu_prev_down = down;
+    if (!active) return;
+
+    /* keys: left stick and d-pad */
+    const float sx = in.stick[0][0], sy = in.stick[0][1];
+    ic_menu_dir(MK_UP,    sy > 0.6f  || (L & BMVR_XFER_BTN_SECONDARY));
+    ic_menu_dir(MK_DOWN,  sy < -0.6f || (L & BMVR_XFER_BTN_PRIMARY));
+    ic_menu_dir(MK_LEFT,  sx < -0.6f);
+    ic_menu_dir(MK_RIGHT, sx > 0.6f);
+    {   static unsigned prev_ab;
+        const unsigned ab = R & (BMVR_XFER_BTN_PRIMARY | BMVR_XFER_BTN_SECONDARY);
+        const unsigned edge = ab & ~prev_ab;
+        prev_ab = ab;
+        if (edge & BMVR_XFER_BTN_PRIMARY) ic_menu_key_pulse(MK_ENTER);
+        if (edge & BMVR_XFER_BTN_SECONDARY) ic_menu_key_pulse(MK_ESC);
+    }
+
+    /* mouse: right stick moves the cursor, a trigger clicks */
+    const uint64_t n = now_ns();
+    float dt = g_menu_last_ns && n >= g_menu_last_ns ? (float)((double)(n - g_menu_last_ns) / 1e9) : 0.011f;
+    g_menu_last_ns = n;
+    if (dt > 0.1f) dt = 0.011f;
+    float cx = in.stick[1][0], cy = -in.stick[1][1];
+    const float mag = sqrtf(cx * cx + cy * cy);
+    int moved = 0;
+    if (mag > 0.2f) {
+        const float k = (mag - 0.2f) / 0.8f, speed = 1100.0f;              /* pixels per second at full deflection, with a gentle curve */
+        g_menu_mx += cx / mag * k * k * speed * dt;
+        g_menu_my += cy / mag * k * k * speed * dt;
+        moved = 1;
+    }
+    const int trig = (g_menu_mouse_down ? 0.3f : 0.6f) < (in.trigger[0] > in.trigger[1] ? in.trigger[0] : in.trigger[1]);
+    const int dn = trig && !g_menu_mouse_down, up = !trig && g_menu_mouse_down;
+    g_menu_mouse_down = trig;
+    if (moved || dn || up || g_menu_mx < 0.0f) ic_sdl_mouse(dn, up);
 }
 
 static void ic_status_tick(void)
