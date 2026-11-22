@@ -37,6 +37,7 @@
 #include "bmvr_xfer.h"
 #include "bmvr_stereo.h"
 #include "bmvr_rtti.h"
+#include "bmvr_inline.h"
 
 /* Portability: this library is loaded into the game, which Steam may run inside an OLDER
  * glibc (Steam Linux Runtime). Built on a modern distro it would require dlsym@GLIBC_2.34
@@ -447,6 +448,7 @@ static char g_st_module[96] = "/client.so";        /* stereo_module=: which load
 static char g_st_class[64] = "CViewRender";        /* stereo_class=: class whose vtable holds RenderView (plain name; mangled here) */
 static int g_st_class_explicit;                    /* stereo_class= was given: never substitute another class */
 static int g_st_slot = 6;                          /* stereo_slot=: vtable slot of RenderView. 6 on the Windows build (IViewRender); UNVERIFIED on Linux */
+static int g_st_hook_mode;                         /* stereo_hook=: 0 auto (vtable slot, then an inline detour if the slot is never called), 1 vtable only, 2 inline only */
 static float g_st_scale = BMVR_STEREO_DEFAULT_SCALE; /* stereo_scale=: Source units per metre */
 
 static int game_dir(char *out, size_t cap)
@@ -563,6 +565,7 @@ static void load_cfg_once(void)
             else if (!strncmp(line, "stereo=", 7)) g_st_want = line[7] == '1';
             else if (!strncmp(line, "stereo_module=", 14)) snprintf(g_st_module, sizeof g_st_module, "%.95s", line + 14);
             else if (!strncmp(line, "stereo_class=", 13)) { snprintf(g_st_class, sizeof g_st_class, "%.63s", line + 13); g_st_class_explicit = 1; }
+            else if (!strncmp(line, "stereo_hook=", 12)) g_st_hook_mode = !strcmp(line + 12, "vtable") ? 1 : !strcmp(line + 12, "inline") ? 2 : 0;
             else if (!strncmp(line, "stereo_slot=", 12)) {
                 long v = strtol(line + 12, NULL, 10);
                 if (v >= 0 && v < 256) g_st_slot = (int)v;
@@ -1496,9 +1499,14 @@ static int g_st_flag_on;
 static char g_st_flag_path[512];
 /* Diagnostics: the hook is stand-in tested only, so a real run must say WHERE it stops. */
 static unsigned g_st_calls, g_st_nested, g_st_top, g_st_dumped;   /* detour entries / nested / top-level / raw view dumps written */
+static unsigned g_st_silent[6];                                    /* silent exits: 0 not armed, 1 no GL context on this thread, 2 small view, 3 helper gone, 4 blit failed, 5 send failed */
+static long g_st_ctx_tid;                                          /* thread that last drew a stereo pair */
 static unsigned g_st_why_cnt[8];                                   /* per st_note() reason: how many views were let through */
 static unsigned g_st_hook_tick;                                    /* g_x_tick when the vtable slot was patched */
 static int g_st_never_warned;
+static uintptr_t *g_st_vt_slot;                                    /* the patched vtable slot (NULL in inline-only mode) */
+static uintptr_t g_st_vt_old;                                      /* what the slot held: the real RenderView entry */
+static int g_st_inline_tried;                                      /* the inline detour was attempted (once) */
 static unsigned g_st_next_try;                                     /* g_x_tick before which st_try_install does not look for the module again */
 
 static float vs_f(const unsigned char *v, unsigned off) { float f; memcpy(&f, v + off, sizeof f); return f; }
@@ -1598,14 +1606,20 @@ static void st_dump_view(const unsigned char *v)
 /* Draw the pair. Returns 1 when the game's own RenderView must NOT be called afterwards (the eyes were drawn). */
 static int st_try_stereo(void *self, void *view, int clear, int what)
 {
-    if (g_st_state != 1 || g_x_state != 1 || g_x_neyes != 2 || !g_x_armed) return 0;   /* the common case: not a delivery frame */
+    if (g_st_state != 1 || g_x_state != 1 || g_x_neyes != 2) return 0;
+    if (!g_x_armed) { g_st_silent[0]++; return 0; }   /* the common case: not a delivery frame */
     if (!g_x_poses_on || !g_x_pose_pending) { st_note(0, "the helper has sent no pose yet"); return 0; }
     if (!(g_x_pose_pending_data.flags & BMVR_XFER_POSE_LOCAL)) { st_note(1, "the helper's poses are head-locked (VIEW space), not room-fixed (LOCAL)"); return 0; }
-    if (g_spec[0].kind == SPEC_WINDOW || !xfer_gl_usable()) return 0;
+    if (g_spec[0].kind == SPEC_WINDOW) return 0;
+    if (!xfer_gl_usable()) {
+        if (!g_st_silent[1]++) bmvr_log("stereo: RenderView runs on thread %ld, which has no current GL context (the engine renders on another thread: mat_queue_mode). "
+                                        "Mid-frame eye capture is impossible there; try `+mat_queue_mode 0` in the Steam launch options.", (long)syscall(SYS_gettid));
+        return 0;
+    }
     const unsigned char *vv = (const unsigned char *)view;
-    if (vs_i(vv, VS_W) < 640 || vs_i(vv, VS_H) < 360) { g_st_pass_main++; return 0; }   /* small views: reflections, monitors */
+    if (vs_i(vv, VS_W) < 640 || vs_i(vv, VS_H) < 360) { g_st_pass_main++; g_st_silent[2]++; return 0; }   /* small views: reflections, monitors */
     if (!st_view_sane(vv)) { st_note(2, "the view does not look like a CViewSetup with the expected layout (size, fov, aspect, near/far, origin)"); return 0; }
-    if (!xfer_peer_alive()) return 0;     /* before any GPU wait: a dead helper never signals (see xfer_peer_alive) */
+    if (!xfer_peer_alive()) { g_st_silent[3]++; return 0; }     /* before any GPU wait: a dead helper never signals (see xfer_peer_alive) */
 
     /* the recenter trigger: touch <game folder>/bmvr_recenter */
     if ((g_st_frames % 30) == 0) {
@@ -1653,6 +1667,7 @@ static int st_try_stereo(void *self, void *view, int clear, int what)
         xfer_gl_restore(&gs);
     }
     g_x_armed = 0;
+    if (!ok) g_st_silent[4]++;
     if (ok) {
         unsigned semflag = xfer_sync_publish();
         if (xfer_send_frame(2, ei, semflag, pose_id)) {
@@ -1661,6 +1676,7 @@ static int st_try_stereo(void *self, void *view, int clear, int what)
             g_st_sent = 1;
             g_st_consec_fail = 0;
             g_st_frames++;
+            g_st_ctx_tid = (long)syscall(SYS_gettid);
             if (g_st_frames == ST_FLAG_CLEAR_FRAMES && g_st_flag_on) { unlink(g_st_flag_path); g_st_flag_on = 0; }
             if (g_st_frames % 600 == 0) bmvr_log("stereo: %u stereo pairs delivered (%u dropped)", g_st_frames, g_st_fails);
         }
@@ -1704,6 +1720,29 @@ static void st_list_cb(const char *mangled, uintptr_t addr, void *ud)
 {
     struct st_list *l = (struct st_list *)ud;
     if (l->n++ < 12) bmvr_log("stereo:   class name in the module: %s (string at %#lx)", mangled, (unsigned long)addr);
+}
+
+/* Detour the function's own first instructions: reaches RenderView however the engine calls it (vtable, direct call, inlined caller
+ * that still calls the function). 32-bit only. g_st_orig becomes a trampoline holding the stolen instructions. */
+static int st_install_inline(void)
+{
+    g_st_inline_tried = 1;
+#if defined(__i386__)
+    struct bmvr_map m;
+    uintptr_t tramp = 0;
+    if (!bmvr_maps_find(g_st_vt_old, &m) || m.perms[0] != 'r' || m.perms[2] != 'x') { bmvr_log("stereo: inline detour refused: the entry %#lx is not readable code", (unsigned long)g_st_vt_old); return 0; }
+    if (!bmvr_inline_hook(g_st_vt_old, (uintptr_t)st_detour, m.perms, &tramp)) {
+        bmvr_log("stereo: inline detour refused: the entry's first bytes (logged above) hold an instruction the decoder does not know to be position-independent "
+                 "(a call/jump, or an unusual opcode). Send those bytes; the game is untouched and draws mono.");
+        return 0;
+    }
+    g_st_orig = (PFN_RenderView)tramp;   /* after this, both the vtable slot and direct calls reach st_detour, and st_detour runs the original through the trampoline */
+    bmvr_log("stereo: inline detour installed at %#lx (trampoline %#lx)", (unsigned long)g_st_vt_old, (unsigned long)tramp);
+    return 1;
+#else
+    bmvr_log("stereo: the inline detour exists for the 32-bit game only; not available in this build");
+    return 0;
+#endif
 }
 
 /* Find the vtable, validate it, patch the RenderView slot. Every refusal says why and leaves the game untouched. */
@@ -1786,9 +1825,23 @@ static void st_try_install(void)
     uintptr_t old = 0;
     bmvr_stereo_rig_init(&g_st_rig, g_st_scale);
     g_st_orig = (PFN_RenderView)vt[g_st_slot];
-    if (!bmvr_vtable_patch(&vt[g_st_slot], (uintptr_t)st_detour, &old)) { bmvr_log("stereo: could not patch the vtable slot (mprotect refused); stereo is off"); g_st_orig = NULL; return; }
+    g_st_vt_old = vt[g_st_slot];
+    {   /* the real entry's first bytes: needed to write an inline detour for this build if the decoder refuses them */
+        const uint8_t *c = (const uint8_t *)vt[g_st_slot];
+        bmvr_log("stereo: RenderView entry %#lx bytes: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x", (unsigned long)vt[g_st_slot],
+                 c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7], c[8], c[9], c[10], c[11], c[12], c[13], c[14], c[15]);
+        struct st_list l = { 0 };
+        bmvr_rtti_list(g_st_module, "ViewRender", st_list_cb, &l);   /* a derived class that overrides RenderView would never use this vtable */
+    }
     g_st_state = 1;
     g_st_hook_tick = g_x_tick;
+    if (g_st_hook_mode == 2) {
+        if (!st_install_inline()) { g_st_state = -1; g_st_orig = NULL; return; }
+        bmvr_log("stereo: inline detour on RenderView installed (stereo_hook=inline); the vtable slot is left alone");
+        return;
+    }
+    if (!bmvr_vtable_patch(&vt[g_st_slot], (uintptr_t)st_detour, &old)) { bmvr_log("stereo: could not patch the vtable slot (mprotect refused); stereo is off"); g_st_orig = NULL; g_st_state = -1; return; }
+    g_st_vt_slot = &vt[g_st_slot];
     bmvr_log("stereo: hooked %s vtable slot %d (was %#lx). Each delivery frame now draws two eyes from the helper's pose. UNVERIFIED on this game build: "
              "check the 'frame 0' line below and the picture in the headset.", mangled, g_st_slot, (unsigned long)old);
 }
@@ -1796,9 +1849,16 @@ static void st_try_install(void)
 /* Once per ~10 s at 60 fps while stereo is requested: where things stand, and a loud warning when the slot is never called. */
 static void st_status_tick(void)
 {
+    /* auto mode: the slot was patched but nothing called it for 300 frames (10 s at 30 fps): the engine does not go through the vtable. */
+    if (g_st_want && g_st_state == 1 && g_st_hook_mode == 0 && !g_st_inline_tried && !g_st_calls && g_x_tick - g_st_hook_tick >= 300) {
+        bmvr_log("stereo: the patched slot was not called in %u frames; trying an inline detour on the function itself (stereo_hook=vtable turns this off)", g_x_tick - g_st_hook_tick);
+        if (st_install_inline()) g_st_hook_tick = g_x_tick;
+    }
     if (!g_st_want || g_st_state != 1 || g_x_tick == g_st_hook_tick || (g_x_tick - g_st_hook_tick) % 600) return;
     bmvr_log("stereo: status tick %u: RenderView calls %u (nested %u, top-level %u); stereo pairs %u (%u dropped); let through because: no pose %u, head-locked pose %u, "
              "view layout refused %u, bad pose %u", g_x_tick, g_st_calls, g_st_nested, g_st_top, g_st_frames, g_st_fails, g_st_why_cnt[0], g_st_why_cnt[1], g_st_why_cnt[2], g_st_why_cnt[3]);
+    bmvr_log("stereo:   silent exits: not armed %u, no GL context %u, small view %u, helper gone %u, blit failed %u; last pair drawn on thread %ld, RenderView thread now %ld",
+             g_st_silent[0], g_st_silent[1], g_st_silent[2], g_st_silent[3], g_st_silent[4], g_st_ctx_tid, g_st_tid);
     if (!g_st_calls && !g_st_never_warned && g_x_tick - g_st_hook_tick >= 1800) {
         g_st_never_warned = 1;
         bmvr_log("stereo: WARNING: the hooked vtable slot has not been called once in %u frames. If a map is loaded, the engine does not reach RenderView through this "

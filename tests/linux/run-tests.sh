@@ -47,6 +47,8 @@ cc -O2 -Wall -Wextra -std=gnu11 -pthread -I"$ROOT/linux" -o "$B/pose_test" "$T/p
 echo "== stereo math (stage 4b; no GPU, no game)"
 cc -O2 -Wall -Wextra -std=gnu11 -I"$ROOT/linux" -o "$B/stereo_test" "$T/stereo_test.c" -lm
 "$B/stereo_test" | sed 's/^/  /'
+cc -O2 -Wall -Wextra -std=gnu11 -I"$ROOT/linux" -o "$B/inline_test" "$T/inline_test.c"
+"$B/inline_test" | sed 's/^/  /'
 
 echo "== RTTI vtable finder and slot patcher (stage 4b; real g++ RTTI as ground truth)"
 g++ -O0 -Wall -Wextra -I"$ROOT/linux" -o "$B/rtti_test" "$T/rtti_test.cpp"

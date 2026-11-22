@@ -632,3 +632,14 @@ code, not a vtable slot); an inline detour would be the next step, and it needs 
    slot shift in vtables, stripped code -> anchor/RTTI scanning).
 5. Port hands / weapon wheel / HUD drawing off D3D9-on-DXVK.
 6. Introduce a platform layer so shared code stops depending on `windows.h`, MinHook and SEH.
+
+### Stage 4b second real run (2026-11-22): hook installed, slot never called
+
+Log (`bmvr_linux_log.txt`, RTX 3080, map loaded, 30 fps): `CViewRender` found by RTTI (one primary vtable), slot 6 = module offset 0x714870 (slots 0-6 in
+0x6e9100-0x714870, slot 7 at 0x3ac1b0: consistent with `IViewRender` where slot 7 is the trivial `GetDrawFlags`), patched; then
+`RenderView calls 0` at ticks 662 / 1262 / 1862 / 2462 and the WARNING. So the class and slot look right, but the engine does not reach
+`RenderView` through that vtable slot (direct/devirtualised call from `CViewRender::Render`, or an override in a derived class).
+Added: `stereo_hook=auto|vtable|inline` in `bmvr_target.txt` (default auto = vtable first, inline detour on the function entry after 300
+frames without a call), `linux/bmvr_inline.h` (small position-independence-checking prologue decoder + trampoline; 32-bit only; refuses
+and logs rather than guesses), the entry's first 16 bytes and all `*ViewRender` class names in the log. `tests/linux/inline_test.c` pins the
+decoder (12 checks). The i386 patching code itself has NOT been compiled or run (no 32-bit toolchain where this was written).
