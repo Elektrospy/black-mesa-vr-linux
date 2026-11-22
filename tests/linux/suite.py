@@ -258,6 +258,88 @@ log,tr,out,ex=run('t23',['--poses'],'every=2\n')
 fr=frames(tr)
 check('single-eye frames still carry the pose id', len(fr)>=20 and all(field(l,'eyes')=='1' for l in fr) and max(int(field(l,'pose')) for l in fr)>0 and 'exit=0' in ex, str(len(fr)))
 
+# ---------------------------------------------------------------------------- stage 4b: stereo views
+import math
+ST='target=_rt_fullframefb\nstereo=1\nstereo_module=exe\nflip=0\n'
+def rvs(out):
+    r=[]
+    for l in out.splitlines():
+        m=re.match(r'RV nest=(\d+) w=(\d+) h=(\d+) fov=(\S+) asp=(\S+) offc=(\d+) l=(\S+) r=(\S+) b=(\S+) t=(\S+) o=(\S+),(\S+),(\S+) a=(\S+),(\S+),(\S+) what=(\d+) clear=(\d+)', l)
+        if m:
+            g=m.groups(); r.append(dict(nest=int(g[0]),w=int(g[1]),h=int(g[2]),fov=float(g[3]),asp=float(g[4]),offc=int(g[5]),fr=[float(x) for x in g[6:10]],o=[float(x) for x in g[10:13]],a=[float(x) for x in g[13:16]],what=int(g[16]),clear=int(g[17])))
+    return r
+
+print('T24 stereo=1: the game draws two eyes from the helper pose, each blitted mid-frame, published as ONE pair')
+log,tr,out,ex=run('t24',['--sem','--eyes','2','--poses'],ST+'sync=sem\nevery=1\n',('FAKE_STEREO=1',),'100 60')
+check('game ran clean, GL bindings preserved', 'gl_state_violations=0' in out and 'exit=0' in ex)
+check('class found by RTTI alone, slot 6 hooked', 'RTTI 11CViewRender' in log and 'hooked 11CViewRender vtable slot 6' in log)
+v=rvs(out); main=[x for x in v if x['nest']==0]; eyes=[x for x in main if x['offc']==1]; plain=[x for x in main if x['offc']==0]
+check('before the first pose the game draws its own view; then every frame draws eyes', len(plain)>=1 and len(eyes)>=40 and len(eyes)%2==0, f'plain={len(plain)} eyes={len(eyes)}')
+check('the nested (water) views are never touched', all(x['offc']==0 and x['w']==1024 and x['what']==0 for x in v if x['nest']==1) and any(x['nest']==1 for x in v))
+check('eye passes carry no HUD flag (what 3 -> 1), the game views keep 3', all(x['what']==1 for x in eyes) and all(x['what']==3 for x in plain))
+prs=[(eyes[i],eyes[i+1]) for i in range(0,len(eyes)-1,2)]
+sep=[math.dist(a['o'],b['o']) for a,b in prs]
+check('left/right eyes are 64 mm apart (2.52 units) and share one orientation', bool(sep) and all(abs(d-2.5197)<0.02 for d in sep) and all(a['a']==b['a'] for a,b in prs), str(sep[:3]))
+check('left eye is on the left of a player facing yaw 45 (x smaller, y larger than the right eye)', all(a['o'][0]<b['o'][0] and a['o'][1]>b['o'][1] for a,b in prs))
+tl,tr_,tu,td=math.tan(-0.8),math.tan(0.7),math.tan(0.75),math.tan(-0.85)
+ux,uy=max(-tl,tr_),max(-td,tu)
+exp=[0.5+0.5*tl/ux,0.5+0.5*tr_/ux,0.5+0.5*td/uy,0.5+0.5*tu/uy]
+check('off-centre fractions are the helper fov (asymmetric), aspect and fov from the centred frustum', all(all(abs(a-b)<2e-4 for a,b in zip(x['fr'],exp)) and abs(x['asp']-ux/uy)<2e-3 and abs(x['fov']-2*math.degrees(math.atan(ux)))<2e-3 for x in eyes), str(eyes[0]['fr'])+' want '+str(exp))
+n=len(frames(tr))
+check('every stereo pair is one frame message with two eyes', n>=40 and all(field(l,'eyes')=='2' for l in frames(tr)), str(n))
+sq=seq(tr)
+check('the stereo pairs are WAIT BLIT BLIT SIGNAL FLUSH frame ack (one wait, one signal per pair)', sq.count('WAIT BLIT BLIT SIGNAL FLUSH frame ack')>=len(eyes)//2-1, sq[:200])
+check('exactly one signal per pair: signals == frames, waits == frames-1', len(gl(tr,'SignalSemaphore'))==n and len(gl(tr,'WaitSemaphore'))==n-1, f"sig={len(gl(tr,'SignalSemaphore'))} wait={len(gl(tr,'WaitSemaphore'))} frames={n}")
+bi=blit_info(tr)
+check('two blits per pair into two different shared images', len(bi)==2*n and all(bi[i][2]!=bi[i+1][2] for i in range(0,len(bi)-1,2)), f'{len(bi)} blits / {n} pairs')
+ids=[int(field(l,'pose')) for l in frames(tr)]
+stereo_ids=[int(m) for m in re.findall(r'stereo: frame \d+ pose (\d+)',log)]
+check('frames are stamped with the pose they were rendered with (the ids the log shows are in the stamps)', all(i in ids for i in stereo_ids) and stereo_ids==sorted(stereo_ids) and len(stereo_ids)>=2, f'{stereo_ids} vs {ids[:8]}')
+check('stamps never go backwards and never name a pose that has not been sent yet', ids==sorted(ids) and all(i<=k+1 for k,i in enumerate(ids)))
+check('crash-sticky flag removed at a clean exit', not os.path.exists(f'{R}/cases/t24/bmvr_in_stereo.flag'))
+check('no frame is delivered twice for one Present (the Present-time snapshot is skipped after a stereo pair)', n<=60+40+2, str(n))
+
+print('T25 every=3: only delivery frames are drawn twice')
+log,tr,out,ex=run('t25',['--sem','--eyes','2','--poses'],ST+'sync=sem\nevery=3\n',('FAKE_STEREO=1',),'100 90')
+v=rvs(out); main=[x for x in v if x['nest']==0]; eyes=[x for x in main if x['offc']==1]; plain=[x for x in main if x['offc']==0]
+check('game clean, eyes drawn on delivery frames only (about a third of 90 frames)', 'gl_state_violations=0' in out and 8<=len(eyes)//2<=34 and len(plain)>=50, f'pairs={len(eyes)//2} plain={len(plain)}')
+check('every eye pass is still a whole pair', len(eyes)%2==0 and all(f_.startswith('HELPER frame') for f_ in frames(tr)) and all(field(l,'eyes')=='2' for l in frames(tr)))
+
+print('T26 stereo requested but the helper sends no poses: the game keeps drawing its own view, flat pairs still flow')
+log,tr,out,ex=run('t26',['--sem','--eyes','2'],ST+'sync=sem\nevery=1\n',('FAKE_STEREO=1',),'100 40')
+v=rvs(out)
+check('hooked, but no eye pass is ever made, reason logged once', 'hooked 11CViewRender' in log and log.count('the helper has sent no pose yet')==1 and not [x for x in v if x['offc']==1], str([x for x in v if x['offc']==1][:1]))
+check('flat pairs keep arriving, game clean', len(frames(tr))>=20 and 'gl_state_violations=0' in out and 'exit=0' in ex)
+
+print('T27 stereo requested with a one-eye helper: nothing is drawn twice')
+log,tr,out,ex=run('t27',['--sem','--eyes','1','--poses'],ST+'sync=sem\nevery=1\n',('FAKE_STEREO=1',),'100 40')
+check('no eye pass, game clean, single-eye frames', not [x for x in rvs(out) if x['offc']==1] and 'exit=0' in ex and all(field(l,'eyes')=='1' for l in frames(tr)) and len(frames(tr))>=20)
+
+print('T28 refusals leave the game untouched and say why')
+log,tr,out,ex=run('t28a',['--sem','--eyes','2','--poses'],ST.replace('stereo=1','stereo=1\nstereo_class=CNoSuchView')+'sync=sem\nevery=1\n',('FAKE_STEREO=1',),'100 40')
+check('unknown class: 0 primary vtables, the existing ViewRender classes are listed, no hook, game clean', 'has 0 primary vtables' in log and 'class name in the module: 11IViewRender' in log and 'hooked' not in log and not [x for x in rvs(out) if x['offc']==1] and 'exit=0' in ex)
+log,tr,out,ex=run('t28b',['--sem','--eyes','2','--poses'],ST.replace('stereo=1','stereo=1\nstereo_slot=40')+'sync=sem\nevery=1\n',('FAKE_STEREO=1',),'100 40')
+check('slot beyond the vtable: refused (not executable code), no hook', 'is not executable code' in log and 'hooked' not in log and 'exit=0' in ex)
+log,tr,out,ex=run('t28c',['--sem','--eyes','2','--poses'],ST.replace('stereo_module=exe','stereo_module=/nothing.so')+'sync=sem\nevery=1\n',('FAKE_STEREO=1',),'100 40')
+check('module not loaded: stereo off, says which key to fix', 'no readable mapping of a module matching' in log and 'hooked' not in log and 'exit=0' in ex)
+log,tr,out,ex=run('t28d',['--sem','--eyes','2','--poses'],ST+'sync=sem\nevery=1\n',('FAKE_STEREO=1','FAKE_BAD_VIEW=1'),'100 40')
+check('a view that does not look like a CViewSetup (fov 5) is never rewritten', 'does not look like a CViewSetup' in log and not [x for x in rvs(out) if x['offc']==1] and 'exit=0' in ex)
+log,tr,out,ex=run('t28e',['--sem','--eyes','2','--poses'],'target=window\nstereo=1\nstereo_module=exe\n',('FAKE_STEREO=1',),'100 40')
+check('target=window with stereo: refused with a reason', 'the target is the window' in log and 'hooked' not in log and 'exit=0' in ex)
+
+print('T29 crash-sticky flag: a launch that died with stereo active turns stereo off for the next launch only')
+d=f'{R}/cases/t29'
+os.environ['PRE_FLAG']='1'      # run_case.sh creates bmvr_in_stereo.flag in the case dir before the game starts
+log,tr,out,ex=run('t29',['--sem','--eyes','2','--poses'],ST+'sync=sem\nevery=1\n',('FAKE_STEREO=1',),'100 40')
+del os.environ['PRE_FLAG']
+check('flag present at start: stereo OFF for this launch, flag consumed, no eye pass', 'bmvr_in_stereo.flag exists' in log and 'hooked' not in log and not os.path.exists(d+'/bmvr_in_stereo.flag') and not [x for x in rvs(out) if x['offc']==1] and 'exit=0' in ex)
+
+print('T30 the helper dies in the middle of a stereo session')
+log,tr,out,ex=run('t30',['--sem','--eyes','2','--poses','--die-idle-after','5'],ST+'sync=sem\nevery=1\n',('FAKE_STEREO=1',),'100 60')
+v=rvs(out)
+check('game finishes, clean GL state, loss noticed, no GL wait/blit after the death', 'exit=0' in ex and 'gl_state_violations=0' in out and ("helper's socket is closed" in log or 'lost the helper' in log))
+check('after the helper is gone the game draws its own view again (plain views at the end)', bool(v) and v[-1]['offc']==0 and v[-2]['offc']==0)
+
 print()
 print('FAILED: %d'%fails if fails else 'ALL CHECKS PASSED')
 sys.exit(1 if fails else 0)

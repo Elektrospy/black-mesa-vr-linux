@@ -13,7 +13,7 @@ must not repeat). How to try it in the game: the end of the "Stage 3d" section o
 | Shim -> helper transport of ONE render target, GPU semaphores, helper-death guard, reconnect | verified in the real game (3a, 3b kill loop) |
 | One helper per game folder (`flock`) | 3c, unit-tested; real-helper check pending |
 | **Two eye images in the transport, a pair as one atomic publication** | **3d, this document; stand-in tested; real game verified (transport); eye-1 content pending** |
-| Engine rendering a separate left/right view | **does not exist on Linux**: needs the game-hook port (plan item 4: Itanium-ABI hooks, vtable slot shift, signature/RTTI scanning) |
+| Engine rendering a separate left/right view | **stage 4b: implemented and stand-in tested, not run in the real game** (`docs/LINUX_PORT.md` "Stage 4b": RTTI-found `RenderView` vtable slot, two views from the pose channel, per-eye mid-frame blit, one pair). Still open: the real `client.so` (class, slot, `CViewSetup` layout) |
 | A native OpenXR consumer | **does not exist**: `OpenXRHelper64/` is Windows-only (`XR_USE_GRAPHICS_API_D3D11`, `<Windows.h>`, 10k lines). A Linux consumer is a new program, not a port |
 
 On the real game a pair is currently two *existing* render targets (or one target twice): that proves the plumbing, the

@@ -518,6 +518,84 @@ Other Steam library: adjust the path (check `steamxr_linux64.json` exists first)
 `XR_RUNTIME_JSON=<SteamVR dir>/steamxr_linux64.json`. Not tested: Flatpak, per-launch override. Needs a headset (or null
 driver) connected to SteamVR, otherwise a "no system" error can follow once the runtime loads.
 
+## Stage 4b: stereo views (implemented, compiled, stand-in tested; NOT run in the real game)
+
+The engine renders one view per frame, so until now both eyes of a pair carried the same picture. Stage 4b makes the game draw a
+left and a right view from the pose the OpenXR sink sends (protocol v5, X4) and delivers them as one pair. **Opt-in**: nothing
+changes unless `bmvr_target.txt` says `stereo=1`.
+
+```
+bmvr_target.txt          target=_rt_fullframefb   (any target= that works for the mono hand-off; no target2 needed)
+                         stereo=1
+                         every=1   sync=sem
+                         optional: stereo_module=/client.so  stereo_class=CViewRender  stereo_slot=6  stereo_scale=39
+helper                   bmvr_xfer_helper --sink xr --eyes 2 --xr-layer projection      (poses need the projection layer)
+```
+
+How it works (code: `linux/bmvr_preload.c`, section "stage 4b"; math `linux/bmvr_stereo.h`; vtable finder `linux/bmvr_rtti.h`):
+
+1. **Finding `RenderView` without offsets.** `client.so` is stripped, but its RTTI names survive. At the first tick after the helper
+   connects, the shim reads `/proc/self/maps`, finds the string `11CViewRender`, the `type_info` that points at it, then the vtable that
+   points at that (Itanium ABI: `{offset_to_top, type_info*, fn0, ...}`), and patches **slot 6** (`stereo_slot`) with `mprotect` (the page is
+   RELRO; protection is restored exactly as the kernel reported it). If the class is not found it logs every class whose name ends in
+   `ViewRender`, so a wrong `stereo_class=` can be fixed from the log. It also dumps the first slots with module offsets.
+2. **Two views.** For a *delivery* frame (the one before a `every=N` delivery) with a pose and a sane main view the detour copies the
+   engine's `CViewSetup`, writes origin / angles / fov / aspect / off-centre fractions for the left eye, calls the original
+   `RenderView` (without the HUD flag, as the Windows build does), blits the target the engine just drew into eye 0's shared image,
+   repeats for the right eye, then publishes ONE pair (one GPU wait before the first blit, one signal after the second, one frame
+   message, one ack). Every other call (not a delivery frame, nested water/monitor/cubemap views, views under 640x360, no pose yet,
+   a view that fails the layout check, a dead helper) goes straight to the game's own `RenderView`.
+3. **Pose to view** (`bmvr_stereo.h`, pinned by `stereo_test.c`): OpenXR (+X right, +Y up, -Z forward, metres) to Source (+X forward,
+   +Y left, +Z up, `stereo_scale` units/m, default 39.37 = the Windows VR scale). The first pose after start (or after `touch
+   <game>/bmvr_recenter`) is the reference: an eye sits at *the game's own camera origin + its offset from the reference head
+   position, turned by (game yaw - reference yaw)*; pitch and roll are the headset's, yaw is the game's plus the head's turn since
+   the reference. So walking, crouching and mouse-turning stay the game's, room-scale motion and head rotation are the headset's.
+   The frustum mapping (`fov` + `aspect` + four 0..1 fractions of the centred frustum) is exactly `VR::EyeOffCenterView` from the
+   Windows build, which was verified in a headset. The engine target keeps its own size; the full-rect blit squashes it into the
+   eye image (the Windows "squash blit"), so the picture spans exactly the frustum the compositor was told about.
+4. **Pose id.** A pair delivered from inside the hook is stamped with the pose it was rendered with (`g_x_pose_pending`, with its data
+   kept in `g_x_pose_pending_data`). `bmvr_get_render_pose()` now returns that pose, not the newest one: the newest one is one ack
+   *newer* than the id that gets stamped, which would have made the compositor reproject from the wrong pose.
+5. **Safety.** A wrong guess must leave the game running: every refusal is logged and leaves the vtable alone (class not found or
+   not exactly one primary vtable; slot not executable code; mprotect refused; no pose; head-locked (VIEW) poses; CViewSetup fields
+   out of range; eye capture failing 5 times in a row switches stereo off). `bmvr_in_stereo.flag` (project convention, AGENTS.md rule 20)
+   is created before the first stereo frame and removed after 600 good frames or a clean exit; if it exists at start the previous
+   launch died with stereo active and stereo is off for this launch only.
+
+**Verified (stand-in, `tests/linux`, host-native build; the 32-bit run on your machine is the authoritative one):**
+`stereo_test.c` 39 checks (axis map, angle conversion against Source's `AngleVectors`, look-left = +yaw, look-up = negative pitch,
+room-scale steps with a turned game, frustum round trip, bad input refused). `rtti_test.cpp` 27 checks against real g++ RTTI (primary
+and secondary vtables, name lister, a stray-byte-prefixed name, patching a genuinely read-only vtable page and restoring it).
+Suite T24-T30 (29 checks): a fake `CViewRender` (vtable slot 6, 0x148-byte view) is found, hooked and drawn twice per delivery frame; eye
+origins 64 mm apart; the asymmetric mock FOV arrives as the expected fractions; nested views untouched; HUD flag removed from eye
+passes; pairs are `WAIT BLIT BLIT SIGNAL FLUSH frame ack` with one signal per pair; stamps are the pose rendered with and never ahead
+of what the helper sent; `every=3` draws eyes only on delivery frames; no poses / one-eye helper / unknown class / bad slot / unloaded
+module / insane view / `target=window` / stale flag all leave the game untouched; helper death returns the game to its own view. The
+pre-existing T1-T23 are unchanged and pass (139 checks in total).
+
+**Not verified, and why it matters (nothing here has touched the real `client.so`):**
+- That `CViewRender` (or whatever class the log lists) exists with RTTI, that `RenderView` really is slot 6 on Linux (the Windows slot is
+  6 on `IViewRender`; an Itanium vtable has two destructor slots, so a class with a virtual destructor before it would shift it), and that
+  the Linux `CViewSetup` has the Windows layout (fields at 0xB4 fov, 0xBC origin, 0xC8 angles, 0xE8 aspect, 0xEC off-centre flag...).
+  The layout is *checked* on every view, not assumed, but a passing check does not prove the off-centre fields are where they should be.
+- Whether the target is complete at the end of `RenderView` (post-processing, viewmodel, the engine's resolve), whether the nested
+  water views inherit our off-centre eye setup (the fake builds them independently), and whether a blit in the middle of the
+  engine's frame disturbs ToGL's cached GL state (the save/restore is the same one the Present-time blit uses, which is verified).
+- The sign and scale of everything against a real headset (does turning your head turn the world the right way; is the IPD right).
+  The math is pinned by tests, the integration is not.
+- GPU copy cost: stereo adds one extra full-scene render and one extra blit per delivery.
+- HUD, viewmodel hands and the weapon wheel are plan item 5; the HUD is simply absent in the eyes.
+
+**To try it (stop at the first thing that does not match, and send `bmvr_linux_log.txt`):**
+1. Build and install as usual (`scripts/build-linux.sh`; shim and helper together), start SteamVR with the headset awake, then
+   `"$GAME/bmvr_xfer_helper" --sink xr --eyes 2 --xr-layer projection`.
+2. `bmvr_target.txt` as above, start the game, load a map.
+3. In the log look for: `stereo: RTTI 11CViewRender ... primary` and the slot dump (is slot 6 the function you expect?), then
+   `stereo: hooked ...`, then `stereo: frame 0 pose N: game view WxH fov ... -> left eye origin ...`. A `drawing the game's own view: ...`
+   line says which check failed. If the class is not found, the log lists the `*ViewRender` classes that exist.
+4. In the headset: depth when you look at a nearby object, head turn direction, and whether the picture is the right size. `touch
+   "$GAME/bmvr_recenter"` re-centres on the current head pose.
+
 ## Plan (not implemented)
 
 1. ~~Read the milestone-1 log; confirm eye-target candidates and driver extensions.~~ Done.
@@ -527,7 +605,7 @@ driver) connected to SteamVR, otherwise a "no system" error can follow once the 
    Then (design in `docs/LINUX_STEREO_HANDOFF.md`): render a *separate* stereo pair into two eye targets (the engine renders one view today) and
    hand both to a 64-bit native OpenXR helper. Which targets and sizes to use is decided by the
    `rt-trace` output.
-4. Find and port the ~100 game hooks (Itanium ABI: cdecl with `this` first, destructor
+4. (First hook done: stage 4b hooks `RenderView` and draws two eyes; stand-in tested, not yet run in the game.) Find and port the ~100 game hooks (Itanium ABI: cdecl with `this` first, destructor
    slot shift in vtables, stripped code -> anchor/RTTI scanning).
 5. Port hands / weapon wheel / HUD drawing off D3D9-on-DXVK.
 6. Introduce a platform layer so shared code stops depending on `windows.h`, MinHook and SEH.

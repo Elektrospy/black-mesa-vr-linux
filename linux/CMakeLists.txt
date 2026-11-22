@@ -25,7 +25,7 @@ set_target_properties(bmvr_preload32 PROPERTIES
 # an older glibc (Steam Linux Runtime) may lack. See the portability note in bmvr_preload.c.
 target_compile_options(bmvr_preload32 PRIVATE -Wall -Wextra -fno-strict-aliasing
                        -fno-stack-protector -U_FORTIFY_SOURCE)
-target_link_libraries(bmvr_preload32 PRIVATE ${CMAKE_DL_LIBS})
+target_link_libraries(bmvr_preload32 PRIVATE ${CMAKE_DL_LIBS} m)
 
 # Optional: cmake --install build_linux_native --prefix "<Black Mesa folder>"
 install(TARGETS bmvr_preload32 LIBRARY DESTINATION .)

@@ -33,7 +33,10 @@
 #include <errno.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <sys/syscall.h>
 #include "bmvr_xfer.h"
+#include "bmvr_stereo.h"
+#include "bmvr_rtti.h"
 
 /* Portability: this library is loaded into the game, which Steam may run inside an OLDER
  * glibc (Steam Linux Runtime). Built on a modern distro it would require dlsym@GLIBC_2.34
@@ -418,6 +421,7 @@ static unsigned g_x_rfbo;                    /* private FBO used as the blit SOU
 static int g_sync_want;                      /* config: 0 = glFinish + ack (default, verified), 1 = GPU semaphores */
 static int g_x_poses_on;                     /* v5: the helper offers poses (its acks carry one) */
 static struct bmvr_xfer_pose g_x_pose_latest;/* the pose of the newest ack that had one (pose_id 0 = none yet) */
+static struct bmvr_xfer_pose g_x_pose_pending_data; /* the pose data of g_x_pose_pending (g_x_pose_latest moves on with every ack) */
 static uint32_t g_x_pose_pending, g_x_pose_used;   /* pose id for the NEXT frame / for the frame being delivered now (see xfer_tick) */
 static int g_x_sem_on;                       /* semaphores imported and in use for this connection */
 static int g_x_sem_inflight;                 /* a frame was published: the next blit must first wait for vk_done */
@@ -436,6 +440,13 @@ static int g_spec2_on;           /* target2 configured */
 static int g_flip_mode = 2;      /* 0 / 1 = fixed, 2 = alternate per snapshot */
 static int g_flip2_mode = -1;    /* eye 1: -1 = same as eye 0, else as g_flip_mode */
 static int g_cfg_loaded;
+
+/* Stage 4b: stereo views (docs/LINUX_PORT.md, "Stage 4b"). All opt-in: nothing below does anything unless "stereo=1" is set. */
+static int g_st_want;                              /* config: stereo=1 (BMVR_STEREO=1) */
+static char g_st_module[96] = "/client.so";        /* stereo_module=: which loaded module holds the view class ("exe" = the main program) */
+static char g_st_class[64] = "CViewRender";        /* stereo_class=: class whose vtable holds RenderView (plain name; mangled here) */
+static int g_st_slot = 6;                          /* stereo_slot=: vtable slot of RenderView. 6 on the Windows build (IViewRender); UNVERIFIED on Linux */
+static float g_st_scale = BMVR_STEREO_DEFAULT_SCALE; /* stereo_scale=: Source units per metre */
 
 static int game_dir(char *out, size_t cap)
 {
@@ -548,6 +559,19 @@ static void load_cfg_once(void)
             else if (!strncmp(line, "flip=", 5)) parse_flip(line + 5);
             else if (!strncmp(line, "flip2=", 6)) parse_flip2(line + 6);
             else if (!strncmp(line, "sync=", 5)) parse_sync(line + 5);
+            else if (!strncmp(line, "stereo=", 7)) g_st_want = line[7] == '1';
+            else if (!strncmp(line, "stereo_module=", 14)) snprintf(g_st_module, sizeof g_st_module, "%.95s", line + 14);
+            else if (!strncmp(line, "stereo_class=", 13)) snprintf(g_st_class, sizeof g_st_class, "%.63s", line + 13);
+            else if (!strncmp(line, "stereo_slot=", 12)) {
+                long v = strtol(line + 12, NULL, 10);
+                if (v >= 0 && v < 256) g_st_slot = (int)v;
+                else bmvr_log("stereo: bad stereo_slot=%s (use 0..255); keeping %d", line + 12, g_st_slot);
+            }
+            else if (!strncmp(line, "stereo_scale=", 13)) {
+                long v = strtol(line + 13, NULL, 10);
+                if (v >= 2 && v <= 400) g_st_scale = (float)v;
+                else bmvr_log("stereo: bad stereo_scale=%s (use a whole number 2..400 units per metre); keeping %d", line + 13, (int)g_st_scale);
+            }
             else if (!strncmp(line, "every=", 6)) {
                 long v = strtol(line + 6, NULL, 10);
                 if (v >= 1 && v <= 3600) { g_x_every = (unsigned)v; bmvr_log("xfer: every=%ld (one delivery per %ld present(s))", v, v); }
@@ -568,6 +592,19 @@ static void load_cfg_once(void)
     if (e && *e) parse_flip2(e);
     e = getenv("BMVR_SYNC");
     if (e && *e) parse_sync(e);
+    e = getenv("BMVR_STEREO");
+    if (e && *e) g_st_want = e[0] == '1';
+    /* Stereo draws both eyes into the SAME engine target one after the other, so eye 1 needs no target2 of its own: it is the
+     * same spec as eye 0. That also keeps the two-image negotiation (and the loading-screen fallback, which delivers a flat pair)
+     * working exactly as with an explicit target2. */
+    if (g_st_want && g_spec[0].kind != SPEC_WINDOW && !g_spec2_on) {
+        g_spec[1] = g_spec[0];
+        g_spec2_on = 1;
+        bmvr_log("stereo: requested (module '%s', class '%s', RenderView slot %d, %d units/m); eye 1 reads the same target as eye 0", g_st_module, g_st_class, g_st_slot, (int)g_st_scale);
+    } else if (g_st_want) {
+        bmvr_log("stereo: requested but %s; stereo is off", g_st_want && g_spec[0].kind == SPEC_WINDOW ? "the target is the window (stereo needs a render target: set target=)" : "target2 is configured (stereo draws both eyes into one target; remove target2)");
+        g_st_want = 0;
+    }
     bmvr_log("xfer: sync mode requested: %s", g_sync_want ? "GPU semaphores (falls back to glFinish + ack if unavailable)" : "glFinish + ack");
     if (g_spec[0].kind == SPEC_NAME) bmvr_log("xfer: target = render target with label containing '%s', flip=%s", g_spec[0].name,
                                               g_flip_mode == 2 ? "alt" : (g_flip_mode ? "1" : "0"));
@@ -1189,7 +1226,7 @@ struct eyeinfo {
 
 /* Tell the helper the shared image(s) hold a frame, wait for its ack. Returns 1 on success.
  * `semflag` (BMVR_XFER_FLAG_SEMAPHORE or 0) applies to the whole pair; ei[0] is always valid, ei[1] when neyes == 2. */
-static int xfer_send_frame(unsigned neyes, const struct eyeinfo *ei, unsigned semflag)
+static int xfer_send_frame(unsigned neyes, const struct eyeinfo *ei, unsigned semflag, uint32_t pose_id)
 {
     unsigned sw = ei[0].w, sh = ei[0].h, flags = ei[0].flags | semflag;
     const char *name = ei[0].name;
@@ -1203,7 +1240,7 @@ static int xfer_send_frame(unsigned neyes, const struct eyeinfo *ei, unsigned se
     fr.gl_name = ei[0].gl_name;
     snprintf(fr.name, sizeof fr.name, "%.23s", name);
     fr.eye_count = neyes;
-    fr.pose_id = g_x_poses_on ? g_x_pose_used : 0;   /* v5: the pose this pair was rendered with */
+    fr.pose_id = g_x_poses_on ? pose_id : 0;   /* v5: the pose this pair was rendered with */
     if (neyes == 2) {
         fr.eye1_src_w = ei[1].w;
         fr.eye1_src_h = ei[1].h;
@@ -1280,7 +1317,7 @@ static void xfer_snapshot_window(void)
     memset(ei, 0, sizeof ei);
     ei[0].w = (unsigned)sw; ei[0].h = (unsigned)sh; ei[0].flags = BMVR_XFER_FLAG_FLIPPED | BMVR_XFER_FLAG_WINDOW;
     snprintf(ei[0].name, sizeof ei[0].name, "%s", "window");
-    xfer_send_frame(1, ei, semflag);
+    xfer_send_frame(1, ei, semflag, g_x_pose_used);
 }
 
 /* Loading screen / menu: the armed frame never switched render targets, so nothing was "left" for this eye. Reuse the
@@ -1305,6 +1342,57 @@ static int cap_use_fallback(unsigned e)
     lg->valid = 0;   /* gone or resized: forget it, wait for the next gameplay frame */
     bmvr_log("xfer: the last known object of the target%s no longer exists or changed size; waiting for a gameplay frame", e ? " (eye 1)" : "");
     return 0;
+}
+
+/* GL state the blits disturb: saved before, restored after (the engine's bindings must survive: tests T1-T23 check it). */
+struct glstate { int draw, read; unsigned char scissor; };
+static void xfer_gl_save(struct glstate *g)
+{
+    g->draw = g->read = 0;
+    xgl.GetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &g->draw);
+    xgl.GetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &g->read);
+    g->scissor = xgl.IsEnabled(GL_SCISSOR_TEST);
+    if (g->scissor) xgl.Disable(GL_SCISSOR_TEST);
+    while (xgl.GetError()) { /* drain */ }
+}
+static void xfer_gl_restore(const struct glstate *g)
+{
+    xgl.BindFramebuffer(GL_READ_FRAMEBUFFER, (unsigned)g->read);
+    xgl.BindFramebuffer(GL_DRAW_FRAMEBUFFER, (unsigned)g->draw);
+    if (g->scissor) xgl.Enable(GL_SCISSOR_TEST);
+    while (xgl.GetError()) { /* drain whatever the teardown raised */ }
+}
+
+/* Blit one captured target into the shared image of eye `e`. The caller saved the GL state. *synced: the wait for the helper's
+ * previous read is issued once per pair, before the first blit. Returns 1 on success. */
+static int xfer_blit_eye(unsigned e, const struct captarget *cap, int *synced, struct eyeinfo *ei)
+{
+    int ok = 1;
+    int flip = xfer_pick_flip((int)e);
+    xgl.BindFramebuffer(GL_READ_FRAMEBUFFER, g_x_rfbo);
+    if (cap->type == GL_TEXTURE_OBJ) xgl.FramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, cap->name, 0);
+    else xgl.FramebufferRenderbuffer(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, cap->name);
+    unsigned st = xgl.CheckFramebufferStatus(GL_READ_FRAMEBUFFER);
+    if (st == GL_FRAMEBUFFER_COMPLETE && xfer_gl_ok("attach target")) {
+        xgl.BindFramebuffer(GL_DRAW_FRAMEBUFFER, g_x_fbo[e]);
+        if (!*synced) { xfer_sync_before_blit(); *synced = 1; }   /* ONE wait before the first blit of the pair */
+        xgl.BlitFramebuffer(0, 0, (int)cap->w, (int)cap->h, 0, flip ? (int)g_x_h : 0, (int)g_x_w, flip ? 0 : (int)g_x_h,
+                            GL_COLOR_BUFFER_BIT, GL_LINEAR);
+        ok = xfer_gl_ok("glBlitFramebuffer (target)");
+    } else {
+        static unsigned told;
+        if (told++ < 4) bmvr_log("xfer: read FBO on '%s' (%s %u) is not usable (status 0x%x) - object deleted or unsupported format?",
+                                 cap->label, cap->type == GL_TEXTURE_OBJ ? "texture" : "renderbuffer", cap->name, st);
+        while (xgl.GetError()) { /* drain */ }
+        ok = 0;
+    }
+    /* Drop the attachment so the private FBO never keeps (or later aliases) the engine's object. */
+    xgl.BindFramebuffer(GL_READ_FRAMEBUFFER, g_x_rfbo);
+    xgl.FramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
+    ei->w = cap->w; ei->h = cap->h; ei->gl_name = cap->name;
+    ei->flags = flip ? BMVR_XFER_FLAG_FLIPPED : 0;
+    snprintf(ei->name, sizeof ei->name, "%s", cap->label);
+    return ok;
 }
 
 /* Stage 2b / 3d path: blit the render target(s) recorded by rt_leave(). With two eyes the pair is delivered only when
@@ -1341,55 +1429,284 @@ static void xfer_snapshot_target(void)
     struct captarget cap[XFER_EYES];
     for (unsigned e = 0; e < neyes; e++) { cap[e] = g_cap[e]; g_cap[e].valid = 0; }
 
-    int old_draw = 0, old_read = 0;
-    xgl.GetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &old_draw);
-    xgl.GetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &old_read);
-    unsigned char scissor = xgl.IsEnabled(GL_SCISSOR_TEST);
-    if (scissor) xgl.Disable(GL_SCISSOR_TEST);
-    while (xgl.GetError()) { /* drain */ }
+    struct glstate gs;
+    xfer_gl_save(&gs);
 
     int ok = 1, synced = 0;
     struct eyeinfo ei[XFER_EYES];
     memset(ei, 0, sizeof ei);
-    for (unsigned e = 0; e < neyes && ok; e++) {
-        int flip = xfer_pick_flip((int)e);
-        xgl.BindFramebuffer(GL_READ_FRAMEBUFFER, g_x_rfbo);
-        if (cap[e].type == GL_TEXTURE_OBJ) xgl.FramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, cap[e].name, 0);
-        else xgl.FramebufferRenderbuffer(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, cap[e].name);
-        unsigned st = xgl.CheckFramebufferStatus(GL_READ_FRAMEBUFFER);
-        if (st == GL_FRAMEBUFFER_COMPLETE && xfer_gl_ok("attach target")) {
-            xgl.BindFramebuffer(GL_DRAW_FRAMEBUFFER, g_x_fbo[e]);
-            if (!synced) { xfer_sync_before_blit(); synced = 1; }   /* ONE wait before the first blit of the pair */
-            xgl.BlitFramebuffer(0, 0, (int)cap[e].w, (int)cap[e].h, 0, flip ? (int)g_x_h : 0, (int)g_x_w, flip ? 0 : (int)g_x_h,
-                                GL_COLOR_BUFFER_BIT, GL_LINEAR);
-            ok = xfer_gl_ok("glBlitFramebuffer (target)");
-        } else {
-            static unsigned told;
-            if (told++ < 4) bmvr_log("xfer: read FBO on '%s' (%s %u) is not usable (status 0x%x) - object deleted or unsupported format?",
-                                     cap[e].label, cap[e].type == GL_TEXTURE_OBJ ? "texture" : "renderbuffer", cap[e].name, st);
-            while (xgl.GetError()) { /* drain */ }
-            ok = 0;
-        }
-        /* Drop the attachment so the private FBO never keeps (or later aliases) the engine's object. */
-        xgl.BindFramebuffer(GL_READ_FRAMEBUFFER, g_x_rfbo);
-        xgl.FramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
-        ei[e].w = cap[e].w; ei[e].h = cap[e].h; ei[e].gl_name = cap[e].name;
-        ei[e].flags = flip ? BMVR_XFER_FLAG_FLIPPED : 0;
-        snprintf(ei[e].name, sizeof ei[e].name, "%s", cap[e].label);
-    }
+    for (unsigned e = 0; e < neyes && ok; e++) ok = xfer_blit_eye(e, &cap[e], &synced, &ei[e]);
     unsigned semflag = ok ? xfer_sync_publish() : 0u;   /* ONE signal (or one glFinish) for the whole pair */
-    xgl.BindFramebuffer(GL_READ_FRAMEBUFFER, (unsigned)old_read);
-    xgl.BindFramebuffer(GL_DRAW_FRAMEBUFFER, (unsigned)old_draw);
-    if (scissor) xgl.Enable(GL_SCISSOR_TEST);
-    while (xgl.GetError()) { /* drain whatever the teardown raised */ }
+    xfer_gl_restore(&gs);
     if (!ok) return;
-    if (xfer_send_frame(neyes, ei, semflag)) {
+    if (xfer_send_frame(neyes, ei, semflag, g_x_pose_used)) {
         for (unsigned e = 0; e < neyes; e++) {
             if (from_fallback[e]) continue;
             g_last_good[e] = cap[e];
             g_last_good[e].valid = 1;
         }
     }
+}
+
+static int xfer_peer_alive(void);
+
+/* ====================================================================== stage 4b: stereo views
+ * The engine renders ONE view per frame. With "stereo=1" the shim hooks the client's RenderView (a vtable slot found at run time
+ * from RTTI, linux/bmvr_rtti.h), and for a delivery frame draws the main world view TWICE: once per eye, with the origin, angles
+ * and off-centre frustum computed from the pose the helper sent (linux/bmvr_stereo.h). After each pass the target the engine
+ * just drew is blitted into that eye's shared image; after the second the pair is published as one unit and the frame message
+ * carries the pose id the pair was rendered with (bmvr_xfer.h v5). Frames that are not delivery frames, nested views (water,
+ * monitors, cubemaps), small views and any frame without a usable pose are drawn by the game's own RenderView, untouched.
+ *
+ * STATUS: stand-in tested only (tests/linux, T24-T27). What nothing here has been checked against: the real client.so (is the
+ * class found, is RenderView really slot 6, does CViewSetup have the layout below on Linux, is the target complete at the end of
+ * the pass). Every one of those is validated at run time and logged, and a failed validation leaves the game untouched. */
+#define ST_DRAW_HUD 0x2          /* RENDERVIEW_DRAWHUD (src/hooks.cpp kRenderViewDrawHud): the 2D HUD is not drawn into a 3D eye */
+#define ST_VS_COPY 0x200         /* bytes copied for a per-eye CViewSetup (the Windows build's is 0x148; over-copying is harmless) */
+/* CViewSetup offsets on the Windows BM client (src/sdk/sdk.h). Not assumed: st_view_sane() checks them on every view. */
+#define VS_X 0x00
+#define VS_Y 0x08
+#define VS_W 0x10
+#define VS_H 0x18
+#define VS_FOV 0xB4
+#define VS_FOVVM 0xB8
+#define VS_ORIGIN 0xBC
+#define VS_ANGLES 0xC8
+#define VS_ZNEAR 0xD4
+#define VS_ZFAR 0xD8
+#define VS_ASPECT 0xE8
+#define VS_OFFC 0xEC
+#define VS_OC_TOP 0xF0
+#define VS_OC_BOTTOM 0xF4
+#define VS_OC_LEFT 0xF8
+#define VS_OC_RIGHT 0xFC
+#define ST_MAX_FAILS 5           /* consecutive failed eye captures before stereo switches itself off */
+#define ST_FLAG_CLEAR_FRAMES 600 /* good stereo frames after which the crash-sticky flag is removed */
+
+typedef void (*PFN_RenderView)(void *, void *, int, int);
+static int g_st_state;                  /* 0 = not tried, 1 = hooked, -1 = refused / failed */
+static PFN_RenderView g_st_orig;
+static struct bmvr_stereo_rig g_st_rig;
+static volatile int g_st_depth;         /* RenderView nesting on the thread that is inside the hook */
+static long g_st_tid;
+static int g_st_sent;                   /* this frame's pair was delivered from inside the hook */
+static unsigned g_st_frames, g_st_fails, g_st_consec_fail, g_st_pass_main;
+static int g_st_flag_on;
+static char g_st_flag_path[512];
+
+static float vs_f(const unsigned char *v, unsigned off) { float f; memcpy(&f, v + off, sizeof f); return f; }
+static int vs_i(const unsigned char *v, unsigned off) { int i; memcpy(&i, v + off, sizeof i); return i; }
+static void vs_setf(unsigned char *v, unsigned off, float f) { memcpy(v + off, &f, sizeof f); }
+static int fin(float f) { return f == f && f > -1e7f && f < 1e7f; }
+
+/* The layout check that stands in for "we know CViewSetup on Linux": every field we read or write must look like what it is. */
+static int st_view_sane(const unsigned char *v)
+{
+    const int w = vs_i(v, VS_W), h = vs_i(v, VS_H);
+    if (w < 640 || h < 360 || w > 16384 || h > 16384) return 0;
+    if (vs_i(v, VS_X) != 0 || vs_i(v, VS_Y) != 0) return 0;          /* a sub-rectangle view is not the main view */
+    const float fov = vs_f(v, VS_FOV), asp = vs_f(v, VS_ASPECT), zn = vs_f(v, VS_ZNEAR), zf = vs_f(v, VS_ZFAR);
+    if (!fin(fov) || fov < 20.0f || fov > 170.0f) return 0;
+    if (!fin(asp) || asp < 0.4f || asp > 4.0f) return 0;
+    if (!fin(zn) || !fin(zf) || zn <= 0.0f || zf <= zn) return 0;
+    for (unsigned i = 0; i < 3; i++) if (!fin(vs_f(v, VS_ORIGIN + 4 * i)) || !fin(vs_f(v, VS_ANGLES + 4 * i))) return 0;
+    if (fabsf(vs_f(v, VS_ANGLES)) > 91.0f) return 0;
+    return 1;
+}
+
+static void st_apply(unsigned char *v, const struct bmvr_view *e)
+{
+    for (unsigned i = 0; i < 3; i++) { vs_setf(v, VS_ORIGIN + 4 * i, e->origin[i]); vs_setf(v, VS_ANGLES + 4 * i, e->angles[i]); }
+    vs_setf(v, VS_FOV, e->fov_deg);
+    vs_setf(v, VS_FOVVM, e->fov_deg);
+    vs_setf(v, VS_ASPECT, e->aspect);
+    v[VS_OFFC] = 1;
+    vs_setf(v, VS_OC_LEFT, e->frac[0]);
+    vs_setf(v, VS_OC_RIGHT, e->frac[1]);
+    vs_setf(v, VS_OC_BOTTOM, e->frac[2]);
+    vs_setf(v, VS_OC_TOP, e->frac[3]);
+}
+
+/* Why the hook let a view through untouched: logged once per reason (a game frame has many RenderViews). */
+static void st_note(unsigned reason, const char *why)
+{
+    static unsigned seen;
+    if (seen & (1u << reason)) return;
+    seen |= 1u << reason;
+    bmvr_log("stereo: drawing the game's own view: %s (logged once)", why);
+}
+
+/* The engine target that holds the eye that was just drawn: what rt_leave() saw it leave, else what is bound right now. */
+static int st_find_target(struct captarget *cap)
+{
+    if (g_cap[0].valid) { *cap = g_cap[0]; return 1; }
+    struct reg_ent re;
+    memset(&re, 0, sizeof re);
+    int known = g_cur_rt0 && reg_get(g_cur_rt0, &re);
+    struct glatt a;
+    probe_draw_fbo(&a);
+    if (!a.valid || !spec_matches(0, known, &re, &a)) return 0;
+    if (known && ((uint32_t)a.w != re.w || (uint32_t)a.h != re.h)) return 0;
+    cap->valid = 1; cap->type = a.type; cap->name = a.name; cap->w = (unsigned)a.w; cap->h = (unsigned)a.h;
+    snprintf(cap->label, sizeof cap->label, "%s", known && re.label[0] ? re.label : "size");
+    return 1;
+}
+
+static void st_fail_eye(unsigned e)
+{
+    g_st_fails++;
+    if (++g_st_consec_fail >= ST_MAX_FAILS) {
+        g_st_state = -1;
+        bmvr_log("stereo: eye %u: no matching render target after the pass, %u times in a row; stereo switched OFF (the game draws its own view). "
+                 "Check target= in bmvr_target.txt against the rt-trace lines.", e, g_st_consec_fail);
+    } else if (g_st_fails <= 3) {
+        bmvr_log("stereo: eye %u: no render target matching the spec was left or is bound after the pass; the pair is dropped", e);
+    }
+}
+
+/* Draw the pair. Returns 1 when the game's own RenderView must NOT be called afterwards (the eyes were drawn). */
+static int st_try_stereo(void *self, void *view, int clear, int what)
+{
+    if (g_st_state != 1 || g_x_state != 1 || g_x_neyes != 2 || !g_x_armed) return 0;   /* the common case: not a delivery frame */
+    if (!g_x_poses_on || !g_x_pose_pending) { st_note(0, "the helper has sent no pose yet"); return 0; }
+    if (!(g_x_pose_pending_data.flags & BMVR_XFER_POSE_LOCAL)) { st_note(1, "the helper's poses are head-locked (VIEW space), not room-fixed (LOCAL)"); return 0; }
+    if (g_spec[0].kind == SPEC_WINDOW || !xfer_gl_usable()) return 0;
+    const unsigned char *vv = (const unsigned char *)view;
+    if (vs_i(vv, VS_W) < 640 || vs_i(vv, VS_H) < 360) { g_st_pass_main++; return 0; }   /* small views: reflections, monitors */
+    if (!st_view_sane(vv)) { st_note(2, "the view does not look like a CViewSetup with the expected layout (size, fov, aspect, near/far, origin)"); return 0; }
+    if (!xfer_peer_alive()) return 0;     /* before any GPU wait: a dead helper never signals (see xfer_peer_alive) */
+
+    /* the recenter trigger: touch <game folder>/bmvr_recenter */
+    if ((g_st_frames % 30) == 0) {
+        char dir[400], path[512];
+        if (game_dir(dir, sizeof dir)) {
+            snprintf(path, sizeof path, "%s/bmvr_recenter", dir);
+            if (access(path, F_OK) == 0) { unlink(path); g_st_rig.have_ref = 0; bmvr_log("stereo: recentered on request"); }
+        }
+    }
+    const struct bmvr_xfer_pose pose = g_x_pose_pending_data;
+    const uint32_t pose_id = g_x_pose_pending;
+    float go[3] = { vs_f(vv, VS_ORIGIN), vs_f(vv, VS_ORIGIN + 4), vs_f(vv, VS_ORIGIN + 8) };
+    struct bmvr_view ev[2];
+    if (!bmvr_stereo_eyes(&g_st_rig, &pose, go, vs_f(vv, VS_ANGLES + 4), ev)) { st_note(3, "the pose is unusable (bad quaternion or field of view)"); return 0; }
+
+    if (!g_st_flag_on && g_st_flag_path[0]) {        /* crash-sticky: present until ST_FLAG_CLEAR_FRAMES good frames or a clean exit */
+        int fd = open(g_st_flag_path, O_WRONLY | O_CREAT, 0644);
+        if (fd >= 0) { close(fd); g_st_flag_on = 1; }
+    }
+    if (g_st_frames < 3)
+        bmvr_log("stereo: frame %u pose %u: game view %dx%d fov %.1f origin (%.1f %.1f %.1f) yaw %.1f -> left eye origin (%.1f %.1f %.1f) ang (%.1f %.1f %.1f) "
+                 "fov %.2f aspect %.3f frac l/r/b/t %.3f %.3f %.3f %.3f; right eye origin (%.1f %.1f %.1f)",
+                 g_st_frames, pose_id, vs_i(vv, VS_W), vs_i(vv, VS_H), (double)vs_f(vv, VS_FOV), (double)go[0], (double)go[1], (double)go[2], (double)vs_f(vv, VS_ANGLES + 4),
+                 (double)ev[0].origin[0], (double)ev[0].origin[1], (double)ev[0].origin[2], (double)ev[0].angles[0], (double)ev[0].angles[1], (double)ev[0].angles[2],
+                 (double)ev[0].fov_deg, (double)ev[0].aspect, (double)ev[0].frac[0], (double)ev[0].frac[1], (double)ev[0].frac[2], (double)ev[0].frac[3],
+                 (double)ev[1].origin[0], (double)ev[1].origin[1], (double)ev[1].origin[2]);
+
+    struct glstate gs;
+    struct eyeinfo ei[XFER_EYES];
+    struct captarget cap[XFER_EYES];
+    memset(ei, 0, sizeof ei);
+    int ok = 1, synced = 0;
+    g_x_t0 = now_ns();
+    for (unsigned e = 0; e < 2 && ok; e++) {
+        unsigned char buf[ST_VS_COPY];
+        memcpy(buf, vv, sizeof buf);
+        st_apply(buf, &ev[e]);
+        g_cap[0].valid = g_cap[1].valid = 0;
+        g_st_orig(self, buf, clear, what & ~ST_DRAW_HUD);
+        if (!st_find_target(&cap[e])) { st_fail_eye(e); ok = 0; break; }
+        if (g_st_frames < 3 && cap[e].w != (unsigned)vs_i(vv, VS_W))
+            bmvr_log("stereo: eye %u: the target '%s' is %ux%u but the view is %dx%d; the whole target is blitted", e, cap[e].label, cap[e].w, cap[e].h, vs_i(vv, VS_W), vs_i(vv, VS_H));
+        xfer_gl_save(&gs);
+        ok = xfer_blit_eye(e, &cap[e], &synced, &ei[e]);
+        xfer_gl_restore(&gs);
+    }
+    g_x_armed = 0;
+    if (ok) {
+        unsigned semflag = xfer_sync_publish();
+        if (xfer_send_frame(2, ei, semflag, pose_id)) {
+            g_last_good[0] = cap[0]; g_last_good[0].valid = 1;
+            g_last_good[1] = cap[1]; g_last_good[1].valid = 1;
+            g_st_sent = 1;
+            g_st_consec_fail = 0;
+            g_st_frames++;
+            if (g_st_frames == ST_FLAG_CLEAR_FRAMES && g_st_flag_on) { unlink(g_st_flag_path); g_st_flag_on = 0; }
+            if (g_st_frames % 600 == 0) bmvr_log("stereo: %u stereo pairs delivered (%u dropped)", g_st_frames, g_st_fails);
+        }
+    }
+    return 1;   /* the eyes were drawn; the game's own view is not drawn again */
+}
+
+#if defined(__i386__)
+__attribute__((force_align_arg_pointer))
+#endif
+static void st_detour(void *self, void *view, int clear, int what)
+{
+    PFN_RenderView orig = g_st_orig;
+    const long tid = (long)syscall(SYS_gettid);
+    if (g_st_depth > 0) { orig(self, view, clear, what); return; }   /* nested view (water, monitor, cubemap), or another thread */
+    g_st_depth = 1;
+    g_st_tid = tid;
+    if (!st_try_stereo(self, view, clear, what)) orig(self, view, clear, what);
+    g_st_depth = 0;
+}
+
+static void __attribute__((destructor)) st_atexit(void)
+{
+    if (g_st_flag_on) unlink(g_st_flag_path);   /* a clean exit is not a crash */
+}
+
+struct st_list { unsigned n; };
+static void st_list_cb(const char *mangled, uintptr_t addr, void *ud)
+{
+    struct st_list *l = (struct st_list *)ud;
+    if (l->n++ < 12) bmvr_log("stereo:   class name in the module: %s (string at %#lx)", mangled, (unsigned long)addr);
+}
+
+/* Find the vtable, validate it, patch the RenderView slot. Every refusal says why and leaves the game untouched. */
+static void st_try_install(void)
+{
+    if (!g_st_want || g_st_state != 0) return;
+    g_st_state = -1;
+    char dir[400];
+    if (game_dir(dir, sizeof dir)) snprintf(g_st_flag_path, sizeof g_st_flag_path, "%s/bmvr_in_stereo.flag", dir);
+    if (g_st_flag_path[0] && access(g_st_flag_path, F_OK) == 0) {
+        unlink(g_st_flag_path);
+        bmvr_log("stereo: bmvr_in_stereo.flag exists: the previous launch died while stereo was active. Stereo is OFF for this launch only "
+                 "(the flag is removed; the next launch tries again).");
+        return;
+    }
+    char mangled[80];
+    snprintf(mangled, sizeof mangled, "%u%s", (unsigned)strlen(g_st_class), g_st_class);
+    struct bmvr_map mod[BMVR_RTTI_MAX_RANGES];
+    int nm = bmvr_maps_module(g_st_module, mod, BMVR_RTTI_MAX_RANGES);
+    if (!nm) { bmvr_log("stereo: no readable mapping of a module matching '%s'; stereo is off (stereo_module=)", g_st_module); return; }
+    struct bmvr_vt_hit h[8];
+    int n = bmvr_rtti_find(g_st_module, mangled, h, 8), prim = -1, nprim = 0;
+    for (int i = 0; i < n; i++) {
+        bmvr_log("stereo: RTTI %s: type_info %#lx vtable %#lx (module offset %#lx) %s", mangled, (unsigned long)h[i].typeinfo, (unsigned long)h[i].vtable,
+                 (unsigned long)(h[i].vtable - mod[0].lo), h[i].primary ? "primary" : "secondary");
+        if (h[i].primary) { prim = i; nprim++; }
+    }
+    if (nprim != 1) {
+        struct st_list l = { 0 };
+        bmvr_log("stereo: class '%s' has %d primary vtables in '%s' (need exactly 1); stereo is off. Classes whose name ends in ViewRender:", g_st_class, nprim, g_st_module);
+        bmvr_rtti_list(g_st_module, "ViewRender", st_list_cb, &l);
+        if (!l.n) bmvr_log("stereo:   (none: the module may not carry RTTI, or stereo_module= names the wrong file)");
+        return;
+    }
+    uintptr_t *vt = (uintptr_t *)h[prim].vtable;
+    for (int i = 0; i <= g_st_slot + 1; i++)   /* never read past the slot we were asked to use, plus one neighbour for the log */
+        bmvr_log("stereo:   slot %2d -> %#lx (module offset %#lx)%s", i, (unsigned long)vt[i], (unsigned long)(vt[i] - mod[0].lo), i == g_st_slot ? "   <- RenderView?" : "");
+    for (int i = 0; i <= g_st_slot; i++)
+        if (!bmvr_addr_executable(vt[i])) { bmvr_log("stereo: vtable slot %d is not executable code: the vtable is shorter than stereo_slot=%d; stereo is off", i, g_st_slot); return; }
+    uintptr_t old = 0;
+    bmvr_stereo_rig_init(&g_st_rig, g_st_scale);
+    g_st_orig = (PFN_RenderView)vt[g_st_slot];
+    if (!bmvr_vtable_patch(&vt[g_st_slot], (uintptr_t)st_detour, &old)) { bmvr_log("stereo: could not patch the vtable slot (mprotect refused); stereo is off"); g_st_orig = NULL; return; }
+    g_st_state = 1;
+    bmvr_log("stereo: hooked %s vtable slot %d (was %#lx). Each delivery frame now draws two eyes from the helper's pose. UNVERIFIED on this game build: "
+             "check the 'frame 0' line below and the picture in the headset.", mangled, g_st_slot, (unsigned long)old);
 }
 
 /* Is the helper still connected? The kernel closes the socket when the helper process dies, so a non-blocking
@@ -1413,8 +1730,8 @@ static int xfer_peer_alive(void)
  * (right-handed, +Y up, -Z forward); the conversion to Source space belongs to the caller. Nothing in the shim calls this yet. */
 BMVR_EXPORT int bmvr_get_render_pose(struct bmvr_xfer_pose *out)
 {
-    if (!g_x_poses_on || !g_x_pose_latest.pose_id) return 0;
-    *out = g_x_pose_latest;
+    if (!g_x_poses_on || !g_x_pose_pending) return 0;
+    *out = g_x_pose_pending_data;
     return 1;
 }
 
@@ -1426,6 +1743,7 @@ static void xfer_tick(void)
     /* v5: the frame delivered at this Present was rendered with the pose latched one Present ago; the next frame starts with the newest one. */
     g_x_pose_used = g_x_pose_pending;
     g_x_pose_pending = g_x_pose_latest.pose_id;
+    g_x_pose_pending_data = g_x_pose_latest;
     load_cfg_once();
     if (!xfer_resolve_gl()) return;
 
@@ -1458,8 +1776,11 @@ static void xfer_tick(void)
         if (!xfer_gl_usable() || !xfer_connect_and_import()) return;
         return; /* first snapshot on the next period */
     }
+    st_try_install();
     if (g_x_tick % g_x_every == 0) {
-        if (xfer_gl_usable() && xfer_peer_alive()) {
+        if (g_st_sent) {
+            g_st_sent = 0;   /* stage 4b: the stereo hook already delivered this frame's pair, mid-frame */
+        } else if (xfer_gl_usable() && xfer_peer_alive()) {
             g_x_t0 = now_ns();
             if (g_spec[0].kind == SPEC_WINDOW) xfer_snapshot_window();
             else xfer_snapshot_target();

@@ -32,6 +32,8 @@ T14-T19 are the stage 3d two-eye cases (`fake_game` takes `FAKE_SKIP_RT` / `FAKE
 
 `test_xr_sink.sh [build dir] [--software] [--kill-rounds N]` (X2, NOT part of `run-tests.sh`) runs `bmvr_xfer_helper --sink xr` against its own headless Monado, with `xr_client.c` (`cc -O2 -o xr_client tests/linux/xr_client.c -lvulkan`) as a Vulkan stand-in for the game: frame integrity at every stage (`--xr-check`), two-eye pairs, last-image-after-disconnect, second helper refused, SIGINT, and a `kill -9` loop. The semaphore path, GL, SteamVR and the picture in a headset are NOT covered.
 
-T20 (in `suite.py`, run by `run-tests.sh`) covers the `every=N` key of `bmvr_target.txt` (delivery cadence of the shim).
+Stage 4b (stereo views): `stereo_test.c` (`cc -O2 -std=gnu11 -I linux -o stereo_test tests/linux/stereo_test.c -lm`, the OpenXR -> Source view math, no GPU) and `rtti_test.cpp` (`g++ -O0 -I linux`, the RTTI vtable finder and slot patcher against real g++ RTTI) run in `run-tests.sh`. `rtti_test` is not meaningful under AddressSanitizer: a memory scanner reads a module's whole image, redzones included. Suite T24-T30 use `fake_game` with `FAKE_STEREO=1` (a `CViewRender` whose `RenderView` is vtable slot 6, takes a 0x148-byte view, makes a nested water view and prints what it was given; `FAKE_BAD_VIEW=1` gives it an implausible view) and `mock_helper --eyes 2 --poses`; `PRE_FLAG=1` makes `run_case.sh` pre-create `bmvr_in_stereo.flag`.
+
+T20 (in `suite.py', run by `run-tests.sh`) covers the `every=N` key of `bmvr_target.txt` (delivery cadence of the shim).
 
 T21-T23 (X4, in `suite.py`) cover the protocol v5 pose channel through `mock_helper --poses` (acks carry pose id n+1; the shim must stamp frames with a pose it has already seen). `pose_test.c` (run by `run-tests.sh`, no GPU) stress-tests `linux/bmvr_pose_store.h`; also with `-fsanitize=thread`.

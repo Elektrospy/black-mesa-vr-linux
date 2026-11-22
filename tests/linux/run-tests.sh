@@ -20,7 +20,7 @@ if [[ "${BMVR_TEST_NATIVE:-0}" == 1 ]]; then M32=""; ARCH="NATIVE (host, not 32-
 echo "== building the $ARCH shim and the stand-ins"
 export SHIM="$B/bmvr_preload32.so"
 gcc $M32 -shared -fPIC -O2 -Wall -Wextra -fvisibility=hidden -fno-stack-protector -U_FORTIFY_SOURCE \
-    -o "$SHIM" "$ROOT/linux/bmvr_preload.c" -ldl
+    -o "$SHIM" "$ROOT/linux/bmvr_preload.c" -ldl -lm
 gcc $M32 -shared -fPIC -O1 -Wall -o "$B/libSDL2-2.0.so.0" "$T/mock_gl.c"
 g++ $M32 -shared -fPIC -I"$T" -o "$B/libtogl.so" "$T/fake_togl.cpp" -L"$B" -l:libSDL2-2.0.so.0 -Wl,-rpath,'$ORIGIN'
 g++ $M32 -I"$T" -o "$B/fake_game" "$T/fake_game.cpp" -L"$B" -ltogl -Wl,--no-as-needed -l:libSDL2-2.0.so.0 -Wl,-rpath,'$ORIGIN'
@@ -42,6 +42,14 @@ cc -Wall -Wextra -std=gnu11 -I"$ROOT/linux" -o "$B/lock_test" "$T/lock_test.c"
 echo "== pose table (stage 4a X4; no GPU)"
 cc -O2 -Wall -Wextra -std=gnu11 -pthread -I"$ROOT/linux" -o "$B/pose_test" "$T/pose_test.c"
 "$B/pose_test" | sed 's/^/  /'
+
+echo "== stereo math (stage 4b; no GPU, no game)"
+cc -O2 -Wall -Wextra -std=gnu11 -I"$ROOT/linux" -o "$B/stereo_test" "$T/stereo_test.c" -lm
+"$B/stereo_test" | sed 's/^/  /'
+
+echo "== RTTI vtable finder and slot patcher (stage 4b; real g++ RTTI as ground truth)"
+g++ -O0 -Wall -Wextra -I"$ROOT/linux" -o "$B/rtti_test" "$T/rtti_test.cpp"
+"$B/rtti_test" | sed 's/^/  /'
 
 echo "== stand-in suite"
 python3 "$T/suite.py"
