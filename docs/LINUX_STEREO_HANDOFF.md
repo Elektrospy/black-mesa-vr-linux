@@ -2,7 +2,7 @@
 
 Status: **transport implemented, stand-in tested (protocol v4, T14-T19, host-native build) and verified in the real game** (pairs delivered on an RTX 3080, kill loop 30/30 with `--eyes 2`, 32-bit suite passes). **Eye 1 carrying
 different content is not proven yet**: with `target2=name:_rt_hud` every eye-1 pixel was (0,0,0), probably an empty HUD layer (menu and
-loading screens); `_rt_gblightdiff` and a HUD-visible run are the next tests. **Stereo content is not solved**: the engine still renders one view. The OpenXR consumer exists and shows the game's pair in the headset (X2, complete 2026-11-21, `docs/LINUX_OPENXR_CONSUMER.md`), but with one engine view both eyes carry the same picture.
+loading screens); `_rt_gblightdiff` and a HUD-visible run are the next tests. **Stereo content is solved as of 2026-11-22** (stage 4b, `docs/LINUX_PORT.md` "Stage 4b real runs": inline-detoured `RenderView` draws two eyes; with `+mat_queue_mode 0` head tracking and depth were confirmed in the headset by the user). The sentence that follows describes the state before that. The OpenXR consumer exists and shows the game's pair in the headset (X2, complete 2026-11-21, `docs/LINUX_OPENXR_CONSUMER.md`), but with one engine view both eyes carry the same picture.
 Read `docs/LINUX_PORT.md` first (stages 2a-3c) and `docs/openxr-eye-publish.md` (the Windows pipeline whose defects this design
 must not repeat). How to try it in the game: the end of the "Stage 3d" section of `docs/LINUX_PORT.md`.
 
@@ -13,7 +13,7 @@ must not repeat). How to try it in the game: the end of the "Stage 3d" section o
 | Shim -> helper transport of ONE render target, GPU semaphores, helper-death guard, reconnect | verified in the real game (3a, 3b kill loop) |
 | One helper per game folder (`flock`) | 3c, unit-tested; real-helper check pending |
 | **Two eye images in the transport, a pair as one atomic publication** | **3d, this document; stand-in tested; real game verified (transport); eye-1 content pending** |
-| Engine rendering a separate left/right view | **stage 4b: implemented and stand-in tested, not run in the real game** (`docs/LINUX_PORT.md` "Stage 4b": RTTI-found `RenderView` vtable slot, two views from the pose channel, per-eye mid-frame blit, one pair). Still open: the real `client.so` (class, slot, `CViewSetup` layout) |
+| Engine rendering a separate left/right view | **stage 4b: verified in the real game (headset, 2026-11-22), needs `mat_queue_mode 0`** (`docs/LINUX_PORT.md` "Stage 4b": RTTI-found `RenderView` vtable slot, two views from the pose channel, per-eye mid-frame blit, one pair). Still open: the real `client.so` (class, slot, `CViewSetup` layout) |
 | A native OpenXR consumer | **does not exist**: `OpenXRHelper64/` is Windows-only (`XR_USE_GRAPHICS_API_D3D11`, `<Windows.h>`, 10k lines). A Linux consumer is a new program, not a port |
 
 On the real game a pair is currently two *existing* render targets (or one target twice): that proves the plumbing, the

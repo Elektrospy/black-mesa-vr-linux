@@ -518,7 +518,7 @@ Other Steam library: adjust the path (check `steamxr_linux64.json` exists first)
 `XR_RUNTIME_JSON=<SteamVR dir>/steamxr_linux64.json`. Not tested: Flatpak, per-launch override. Needs a headset (or null
 driver) connected to SteamVR, otherwise a "no system" error can follow once the runtime loads.
 
-## Stage 4b: stereo views (implemented, compiled, stand-in tested; NOT run in the real game)
+## Stage 4b: stereo views (implemented; **stereo and head tracking verified in the headset 2026-11-22** with the inline hook and `mat_queue_mode 0`, see "Real runs" below)
 
 The engine renders one view per frame, so until now both eyes of a pair carried the same picture. Stage 4b makes the game draw a
 left and a right view from the pose the OpenXR sink sends (protocol v5, X4) and delivers them as one pair. **Opt-in**: nothing
@@ -628,18 +628,54 @@ code, not a vtable slot); an inline detour would be the next step, and it needs 
    Then (design in `docs/LINUX_STEREO_HANDOFF.md`): render a *separate* stereo pair into two eye targets (the engine renders one view today) and
    hand both to a 64-bit native OpenXR helper. Which targets and sizes to use is decided by the
    `rt-trace` output.
-4. (First hook done: stage 4b hooks `RenderView` and draws two eyes; stand-in tested, not yet run in the game.) Find and port the ~100 game hooks (Itanium ABI: cdecl with `this` first, destructor
+4. (First hook done and verified in the headset: stage 4b hooks `RenderView` by inline detour and draws two eyes.) Find and port the ~100 game hooks (Itanium ABI: cdecl with `this` first, destructor
    slot shift in vtables, stripped code -> anchor/RTTI scanning).
 5. Port hands / weapon wheel / HUD drawing off D3D9-on-DXVK.
 6. Introduce a platform layer so shared code stops depending on `windows.h`, MinHook and SEH.
 
-### Stage 4b second real run (2026-11-22): hook installed, slot never called
+### Stage 4b real runs, 2026-11-22 (RTX 3080, SteamVR 2.19.4 OpenXR, 32-bit `bms_linux`)
 
-Log (`bmvr_linux_log.txt`, RTX 3080, map loaded, 30 fps): `CViewRender` found by RTTI (one primary vtable), slot 6 = module offset 0x714870 (slots 0-6 in
-0x6e9100-0x714870, slot 7 at 0x3ac1b0: consistent with `IViewRender` where slot 7 is the trivial `GetDrawFlags`), patched; then
-`RenderView calls 0` at ticks 662 / 1262 / 1862 / 2462 and the WARNING. So the class and slot look right, but the engine does not reach
-`RenderView` through that vtable slot (direct/devirtualised call from `CViewRender::Render`, or an override in a derived class).
-Added: `stereo_hook=auto|vtable|inline` in `bmvr_target.txt` (default auto = vtable first, inline detour on the function entry after 300
-frames without a call), `linux/bmvr_inline.h` (small position-independence-checking prologue decoder + trampoline; 32-bit only; refuses
-and logs rather than guesses), the entry's first 16 bytes and all `*ViewRender` class names in the log. `tests/linux/inline_test.c` pins the
-decoder (12 checks). The i386 patching code itself has NOT been compiled or run (no 32-bit toolchain where this was written).
+**Run 1** (vtable hook only): mono picture, fixed to the headset (what a pose-0 pair looks like). Game log was not part of the report.
+
+**Run 2** (log read): the shim found `11CViewRender` through RTTI (one primary vtable at module offset 0xbe9c88, secondary 0xbe9d54) and
+patched slot 6 (`RenderView` entry at module offset 0x714870; slots 0-6 lie in 0x6e9100-0x714870 and slot 7 at 0x3ac1b0, consistent with
+`IViewRender` where slot 7 is the trivial `GetDrawFlags`). The slot was called **0 times in 2400 frames** with a map loaded. The module also
+holds `20CBlackMesaViewRender` (plus `11IViewRender`); which of them the engine really uses was not established. Conclusion: the engine does
+not reach `RenderView` through that vtable slot.
+
+**Fix: inline detour** (`linux/bmvr_inline.h`, `stereo_hook=auto|vtable|inline` in `bmvr_target.txt`, default `auto` = vtable, then inline
+after 300 frames without a call). The entry bytes on this build are `55 89 e5 57 56 53 81 ec 3c 03 00 00 8b 45 08 e8` (push ebp; mov
+ebp,esp; push edi; push esi; push ebx; sub esp,0x33c; mov eax,[ebp+8]; call ...). The decoder steals whole instructions covering at least 5 bytes (here exactly 5: `push ebp; mov ebp,esp; push edi; push esi`); it refuses calls/jumps/unknown opcodes and logs the bytes.
+After installing,
+the function was called every frame (tick 362 on). Verified in the log: `CViewSetup` layout matches the Windows one (fov 0xb4, origin 0xbc,
+angles 0xc8 with yaw at 0xcc, aspect 0xe8), view 3840x2160, left/right eye origins 2.4 units apart, per-eye frustum fractions from the
+pose channel.
+
+**Second symptom: pairs stopped after 35** (status line: `stereo pairs 35`, `RenderView calls` still rising). No gate that counts its own
+exits fired, so one of the silent exits was taken. Working hypothesis, **inferred, not read from a log**: the engine moved rendering to a
+queued render thread (`mat_queue_mode`), so `RenderView` ran on a thread without the current GL context and `xfer_gl_usable()` returned 0.
+Launching with `+mat_queue_mode 0` (the Windows build also keeps `mat_queue` off) gave correct rendering and head tracking in the headset
+(user report, 2026-11-22 12:23). The log of that run was not read, so the diagnostic line below has not been seen in a real log.
+Added diagnostics: the status line now ends with `silent exits: not armed / no GL context / small view / helper gone / blit failed`, and the
+first no-GL-context exit logs the thread id and the `mat_queue_mode 0` hint.
+
+**Launch option gotcha:** game arguments go AFTER `%command%`:
+`"<game folder>/bmvr-run.sh" %command% +mat_queue_mode 0`. Placed before `%command%` they become arguments of `bmvr-run.sh`, which
+`exec`s them: the game does not start (`bmvr_run_marker.txt` shows `args: +mat_queue_mode 0 <steam-launch-wrapper> ...`).
+
+**Status words (AGENTS.md rule 17):** implemented / compiled / launched / runtime-initialized / head tracking verified / rendering verified /
+stereo verified (user report; no depth measurements) / headset presentation verified. Gameplay is **not** verified: there is no controller
+input, no hands or weapon at the controller, no HUD in the world on Linux.
+
+**Not verified / open:**
+- The i386 inline-patch code (`bmvr_inline_hook`) was only syntax-checked where it was written; the decoder has 12 unit checks (`inline_test.c`).
+  It ran correctly in the real game (hook installed, trampoline called) but nothing tested the 32-bit build in CI.
+- Why exactly the pairs stopped without `mat_queue_mode 0` (hypothesis above).
+- `+mat_queue_mode 0` is still a manual launch option; make it automatic (`bmvr-bms.sh` / `bmvr.cfg`) and make `stereo=1` + `stereo_hook=inline` the shipped defaults.
+- Frame pacing: the game delivers ~30 pairs/s against a 90 Hz compositor (helper log: `pairs=30/s displayed=90/s reused=60/s`). The Windows
+  "one pair per `xrWaitFrame` pose" handshake (`docs/openxr-eye-publish.md`) is not ported.
+- Which class (`CViewRender` or `CBlackMesaViewRender`) the engine instantiates; the inline detour makes this irrelevant for `RenderView` itself.
+
+**Next stages (plan):** (1) defaults and cleanup above; (2) OpenXR controller input (action set in the helper, channel to the shim, aim from the
+controller; see `docs/LINUX_OPENXR_CONSUMER.md` on input); (3) hands/viewmodel at the controller pose, off D3D9-on-DXVK; (4) HUD in the world,
+bloom/exposure on the eyes, frame pacing.
