@@ -1228,6 +1228,53 @@ struct eyeinfo {
     char name[40];
 };
 
+/* v6: controller state from the ack. Slice 2 (verification): log what arrives, change by change, so a headset run can confirm the path
+ * before anything is fed to the game. bmvr_get_input() is the interface the game-side hook (slice 3) will use. */
+static struct bmvr_xfer_input g_x_input;
+static unsigned g_x_input_logs;
+static unsigned in_quant(const struct bmvr_xfer_input *n)   /* a coarse state: buttons, trigger/squeeze > 0.5, stick directions at 0.5 */
+{
+    unsigned q = n->buttons & 0xffffu;
+    for (int h = 0; h < 2; h++) {
+        if (n->trigger[h] > 0.5f) q |= 1u << (16 + h * 8);
+        if (n->squeeze[h] > 0.5f) q |= 2u << (16 + h * 8);
+        if (n->stick[h][0] > 0.5f) q |= 4u << (16 + h * 8);
+        if (n->stick[h][0] < -0.5f) q |= 8u << (16 + h * 8);
+        if (n->stick[h][1] > 0.5f) q |= 16u << (16 + h * 8);
+        if (n->stick[h][1] < -0.5f) q |= 32u << (16 + h * 8);
+    }
+    return q;
+}
+static void in_note(const struct bmvr_xfer_input *n)
+{
+    if (!n->seq) return;
+    const struct bmvr_xfer_input old = g_x_input;
+    g_x_input = *n;
+    if (g_x_input_logs >= 200) return;
+    if (!old.seq) {
+        g_x_input_logs++;
+        bmvr_log("input: first controller state (seq %u): focused=%d left pose %s right pose %s; right aim (%.2f %.2f %.2f) left aim (%.2f %.2f %.2f) [LOCAL space, metres]",
+                 n->seq, !!(n->flags & BMVR_XFER_INPUT_FOCUSED), (n->flags & BMVR_XFER_INPUT_POSE_L) ? "valid" : "none", (n->flags & BMVR_XFER_INPUT_POSE_R) ? "valid" : "none",
+                 (double)n->aim[1][0], (double)n->aim[1][1], (double)n->aim[1][2], (double)n->aim[0][0], (double)n->aim[0][1], (double)n->aim[0][2]);
+        return;
+    }
+    if (in_quant(&old) != in_quant(n) || ((old.flags ^ n->flags) & (BMVR_XFER_INPUT_FOCUSED | BMVR_XFER_INPUT_POSE_L | BMVR_XFER_INPUT_POSE_R))) {
+        g_x_input_logs++;
+        bmvr_log("input: focused=%d poses L%d R%d | buttons L %#x R %#x | stick L (%.2f %.2f) R (%.2f %.2f) | trigger L %.2f R %.2f | squeeze L %.2f R %.2f",
+                 !!(n->flags & BMVR_XFER_INPUT_FOCUSED), !!(n->flags & BMVR_XFER_INPUT_POSE_L), !!(n->flags & BMVR_XFER_INPUT_POSE_R), n->buttons & 0xffu, (n->buttons >> 8) & 0xffu,
+                 (double)n->stick[0][0], (double)n->stick[0][1], (double)n->stick[1][0], (double)n->stick[1][1],
+                 (double)n->trigger[0], (double)n->trigger[1], (double)n->squeeze[0], (double)n->squeeze[1]);
+    }
+}
+
+/* v6 hook-port interface: the newest controller state. Returns 1 and fills *out, or 0 when the helper offers no input / none arrived yet. */
+BMVR_EXPORT int bmvr_get_input(struct bmvr_xfer_input *out)
+{
+    if (!g_x_input.seq) return 0;
+    *out = g_x_input;
+    return 1;
+}
+
 /* Tell the helper the shared image(s) hold a frame, wait for its ack. Returns 1 on success.
  * `semflag` (BMVR_XFER_FLAG_SEMAPHORE or 0) applies to the whole pair; ei[0] is always valid, ei[1] when neyes == 2. */
 static int xfer_send_frame(unsigned neyes, const struct eyeinfo *ei, unsigned semflag, uint32_t pose_id)
@@ -1269,6 +1316,7 @@ static int xfer_send_frame(unsigned neyes, const struct eyeinfo *ei, unsigned se
                      (double)ack.pose.eye[0].fov[0], (double)ack.pose.eye[0].fov[1], (double)ack.pose.eye[0].fov[2], (double)ack.pose.eye[0].fov[3]);
         g_x_pose_latest = ack.pose;
     }
+    in_note(&ack.input);   /* v6: controllers (seq 0 = none) */
     if (flags & BMVR_XFER_FLAG_SEMAPHORE) g_x_sem_inflight = 1;   /* the helper's vk_done signal is now pending */
     unsigned long long gl_us = g_x_t0 && t1 > g_x_t0 ? (unsigned long long)((t1 - g_x_t0) / 1000u) : 0ull;
     unsigned long long rtt_us = (unsigned long long)((t2 - t1) / 1000u);

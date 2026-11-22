@@ -138,6 +138,7 @@ static int vk_ver_minor_key(uint32_t v) { return (int)(VK_API_VERSION_MAJOR(v) *
 
 /* ------------------------------------------------------------------ the probe */
 struct ctx {
+    int has_valve_ctrl;   /* XR_VALVE_frame_controller_interaction was offered and enabled (Steam Frame controllers) */
     void *xr_lib, *vk_lib;
     XrInstance inst;
     XrSystemId sys;
@@ -639,13 +640,16 @@ static int st_open(struct st *s, int want_w, int want_h, int require_memfd, int 
     for (uint32_t i = 0; i < next; i++) ext[i].type = XR_TYPE_EXTENSION_PROPERTIES;
     if (XR_FAILED(enumExt(NULL, next, &next, ext))) next = 0;
     int has_enable2 = 0;
-    for (uint32_t i = 0; i < next; i++) if (!strcmp(ext[i].extensionName, XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME)) has_enable2 = 1;
+    for (uint32_t i = 0; i < next; i++) {
+        if (!strcmp(ext[i].extensionName, XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME)) has_enable2 = 1;
+        if (!strcmp(ext[i].extensionName, "XR_VALVE_frame_controller_interaction")) c->has_valve_ctrl = 1;
+    }
     free(ext);
     ledger("XR_KHR_vulkan_enable2", has_enable2, 1, has_enable2 ? "offered" : "NOT offered by this runtime");
     if (!has_enable2) return 1;
 
-    const char *want_ext[] = { XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME };
-    XrInstanceCreateInfo ici = { .type = XR_TYPE_INSTANCE_CREATE_INFO, .enabledExtensionCount = 1, .enabledExtensionNames = want_ext };
+    const char *want_ext[] = { XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME, "XR_VALVE_frame_controller_interaction" };
+    XrInstanceCreateInfo ici = { .type = XR_TYPE_INSTANCE_CREATE_INFO, .enabledExtensionCount = c->has_valve_ctrl ? 2u : 1u, .enabledExtensionNames = want_ext };
     snprintf(ici.applicationInfo.applicationName, sizeof ici.applicationInfo.applicationName, "bmvr_xfer_helper");
     ici.applicationInfo.applicationVersion = 1;
     snprintf(ici.applicationInfo.engineName, sizeof ici.applicationInfo.engineName, "bmvr");
@@ -1277,6 +1281,18 @@ int bmvr_xr_selftest(const struct bmvr_xr_selftest_opts *o)
 static PFN_vkGetMemoryFdKHR vkGetMemoryFdKHR_;
 static PFN_vkGetSemaphoreFdKHR vkGetSemaphoreFdKHR_;
 
+struct sk_input {
+    int on;
+    XrActionSet set;
+    XrAction stick, trigger, squeeze, bumper, primary, secondary, menu, sclick, grip, aim;
+    XrPath hand[2];
+    XrSpace grip_sp[2], aim_sp[2];
+    pthread_mutex_t mu;
+    struct bmvr_xfer_input cur;
+    uint32_t seq;
+    int logged_profile;
+};
+
 struct bmvr_xr_sink {
     struct st st;                 /* session, device, queue, swapchain 0, memory properties (shared with the X1 code) */
     int eyes;                     /* images per pair (shared images, ring slot images) */
@@ -1306,6 +1322,7 @@ struct bmvr_xr_sink {
     void *chk_map;
     struct bmvr_ring ring;
     struct bmvr_pose_store poses; /* X4: poses by id (put by the XR thread, read by both threads) */
+    struct sk_input in;           /* v6: controller actions */
     float slot_aspect[BMVR_RING_SLOTS];  /* width / height of eye 0's source (the engine target), for the flat (pose-less) layer */
     uint32_t slot_pose[BMVR_RING_SLOTS]; /* X4: the pose id each ring slot's pair was rendered with (written by the transport before end_write) */
     int poses_on;                 /* X4: poses are generated and offered (projection layer and a LOCAL space) */
@@ -1320,6 +1337,180 @@ struct bmvr_xr_sink {
     char why[200];
     int stuck;                    /* the transport queue is blocked behind a semaphore wait the game never signalled: only a new helper helps */
 };
+
+
+/* ---------------------------------------------------------------- v6: controllers (OpenXR actions)
+ * One action set, symmetrical actions with both hand subaction paths. Bindings: the Steam Frame controller profile
+ * (XR_VALVE_frame_controller_interaction, /interaction_profiles/valve/frame_controller_valve; paths from Valve's Steamworks docs, NOT yet
+ * checked on a runtime) and khr/simple_controller as a fallback. The XR thread syncs once per frame; the transport thread reads the
+ * newest snapshot for the ack. Not verified on hardware: the first run's log line says which profile the runtime picked. */
+static PFN_xrStringToPath xrStringToPath_;
+static PFN_xrCreateActionSet xrCreateActionSet_;
+static PFN_xrCreateAction xrCreateAction_;
+static PFN_xrSuggestInteractionProfileBindings xrSuggestInteractionProfileBindings_;
+static PFN_xrAttachSessionActionSets xrAttachSessionActionSets_;
+static PFN_xrSyncActions xrSyncActions_;
+static PFN_xrGetActionStateFloat xrGetActionStateFloat_;
+static PFN_xrGetActionStateBoolean xrGetActionStateBoolean_;
+static PFN_xrGetActionStateVector2f xrGetActionStateVector2f_;
+static PFN_xrCreateActionSpace xrCreateActionSpace_;
+static PFN_xrLocateSpace xrLocateSpace_;
+static PFN_xrGetCurrentInteractionProfile xrGetCurrentInteractionProfile_;
+static PFN_xrPathToString xrPathToString_;
+
+static XrAction sk_in_action(struct bmvr_xr_sink *k, const char *name, XrActionType t)
+{
+    struct sk_input *in = &k->in;
+    XrActionCreateInfo ai = { .type = XR_TYPE_ACTION_CREATE_INFO, .actionType = t, .countSubactionPaths = 2, .subactionPaths = in->hand };
+    snprintf(ai.actionName, sizeof ai.actionName, "%s", name);
+    snprintf(ai.localizedActionName, sizeof ai.localizedActionName, "%s", name);
+    XrAction a = XR_NULL_HANDLE;
+    if (XR_FAILED(xrCreateAction_(in->set, &ai, &a))) return XR_NULL_HANDLE;
+    return a;
+}
+
+static void sk_input_init(struct bmvr_xr_sink *k)
+{
+    struct sk_input *in = &k->in;
+    struct ctx *c = &k->st.c;
+    pthread_mutex_init(&in->mu, NULL);
+#define LOADI(n) xrGetInstanceProcAddr_(c->inst, #n, (PFN_xrVoidFunction *)&n##_); if (!n##_) { XLOG("xr-sink: input off: runtime lacks " #n); return; }
+    LOADI(xrStringToPath) LOADI(xrCreateActionSet) LOADI(xrCreateAction) LOADI(xrSuggestInteractionProfileBindings)
+    LOADI(xrAttachSessionActionSets) LOADI(xrSyncActions) LOADI(xrGetActionStateFloat) LOADI(xrGetActionStateBoolean)
+    LOADI(xrGetActionStateVector2f) LOADI(xrCreateActionSpace) LOADI(xrLocateSpace) LOADI(xrGetCurrentInteractionProfile) LOADI(xrPathToString)
+#undef LOADI
+    xrStringToPath_(c->inst, "/user/hand/left", &in->hand[0]);
+    xrStringToPath_(c->inst, "/user/hand/right", &in->hand[1]);
+    XrActionSetCreateInfo si = { .type = XR_TYPE_ACTION_SET_CREATE_INFO, .priority = 0 };
+    snprintf(si.actionSetName, sizeof si.actionSetName, "gameplay");
+    snprintf(si.localizedActionSetName, sizeof si.localizedActionSetName, "Black Mesa VR");
+    if (XR_FAILED(xrCreateActionSet_(c->inst, &si, &in->set))) { XLOG("xr-sink: input off: xrCreateActionSet failed"); return; }
+    in->stick = sk_in_action(k, "stick", XR_ACTION_TYPE_VECTOR2F_INPUT);
+    in->trigger = sk_in_action(k, "trigger", XR_ACTION_TYPE_FLOAT_INPUT);
+    in->squeeze = sk_in_action(k, "squeeze", XR_ACTION_TYPE_FLOAT_INPUT);
+    in->bumper = sk_in_action(k, "bumper", XR_ACTION_TYPE_BOOLEAN_INPUT);
+    in->primary = sk_in_action(k, "primary", XR_ACTION_TYPE_BOOLEAN_INPUT);
+    in->secondary = sk_in_action(k, "secondary", XR_ACTION_TYPE_BOOLEAN_INPUT);
+    in->menu = sk_in_action(k, "menu", XR_ACTION_TYPE_BOOLEAN_INPUT);
+    in->sclick = sk_in_action(k, "stick_click", XR_ACTION_TYPE_BOOLEAN_INPUT);
+    in->grip = sk_in_action(k, "grip_pose", XR_ACTION_TYPE_POSE_INPUT);
+    in->aim = sk_in_action(k, "aim_pose", XR_ACTION_TYPE_POSE_INPUT);
+    if (!in->stick || !in->trigger || !in->squeeze || !in->bumper || !in->primary || !in->secondary || !in->menu || !in->sclick || !in->grip || !in->aim) {
+        XLOG("xr-sink: input off: xrCreateAction failed"); return;
+    }
+    XrActionSuggestedBinding b[48];
+    uint32_t n;
+#define BIND(act, path) do { XrPath p_; if (n < 48 && XR_SUCCEEDED(xrStringToPath_(c->inst, path, &p_))) b[n++] = (XrActionSuggestedBinding){ act, p_ }; } while (0)
+    int any = 0;
+    if (c->has_valve_ctrl) {
+        n = 0;
+        static const char *sd[2] = { "/user/hand/left", "/user/hand/right" };
+        for (int h = 0; h < 2; h++) {
+            char p[96];
+#define BP(act, suffix) do { snprintf(p, sizeof p, "%s/input/%s", sd[h], suffix); BIND(act, p); } while (0)
+            BP(in->trigger, "trigger/value"); BP(in->squeeze, "squeeze/value"); BP(in->stick, "thumbstick"); BP(in->sclick, "thumbstick/click");
+            BP(in->bumper, "bumper/click"); BP(in->grip, "grip/pose"); BP(in->aim, "aim/pose");
+            BP(in->primary, h ? "a/click" : "x/click"); BP(in->secondary, h ? "b/click" : "y/click"); BP(in->menu, h ? "menu/click" : "view/click");
+#undef BP
+        }
+        XrPath prof;
+        xrStringToPath_(c->inst, "/interaction_profiles/valve/frame_controller_valve", &prof);
+        XrInteractionProfileSuggestedBinding sb = { .type = XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING, .interactionProfile = prof, .countSuggestedBindings = n, .suggestedBindings = b };
+        XrResult r = xrSuggestInteractionProfileBindings_(c->inst, &sb);
+        XLOG("xr-sink: input: Steam Frame controller bindings %s (%s)", XR_SUCCEEDED(r) ? "suggested" : "REJECTED", xr_rs(c->inst, r));
+        any |= XR_SUCCEEDED(r);
+    } else XLOG("xr-sink: input: the runtime does not offer XR_VALVE_frame_controller_interaction; using the generic profile only");
+    {
+        n = 0;
+        static const char *sd[2] = { "/user/hand/left", "/user/hand/right" };
+        for (int h = 0; h < 2; h++) {
+            char p[96];
+            snprintf(p, sizeof p, "%s/input/select/click", sd[h]); BIND(in->trigger, p);
+            snprintf(p, sizeof p, "%s/input/menu/click", sd[h]); BIND(in->menu, p);
+            snprintf(p, sizeof p, "%s/input/grip/pose", sd[h]); BIND(in->grip, p);
+            snprintf(p, sizeof p, "%s/input/aim/pose", sd[h]); BIND(in->aim, p);
+        }
+        XrPath prof;
+        xrStringToPath_(c->inst, "/interaction_profiles/khr/simple_controller", &prof);
+        XrInteractionProfileSuggestedBinding sb = { .type = XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING, .interactionProfile = prof, .countSuggestedBindings = n, .suggestedBindings = b };
+        XrResult r = xrSuggestInteractionProfileBindings_(c->inst, &sb);
+        if (XR_SUCCEEDED(r)) any = 1;
+    }
+#undef BIND
+    if (!any) { XLOG("xr-sink: input off: no interaction profile accepted our bindings"); return; }
+    for (int h = 0; h < 2; h++) {
+        XrActionSpaceCreateInfo ci = { .type = XR_TYPE_ACTION_SPACE_CREATE_INFO, .subactionPath = in->hand[h], .poseInActionSpace = { .orientation = { 0, 0, 0, 1 } } };
+        ci.action = in->aim;  if (XR_FAILED(xrCreateActionSpace_(c->sess, &ci, &in->aim_sp[h]))) { XLOG("xr-sink: input off: aim space failed"); return; }
+        ci.action = in->grip; if (XR_FAILED(xrCreateActionSpace_(c->sess, &ci, &in->grip_sp[h]))) { XLOG("xr-sink: input off: grip space failed"); return; }
+    }
+    XrSessionActionSetsAttachInfo ai = { .type = XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO, .countActionSets = 1, .actionSets = &in->set };
+    XrResult r = xrAttachSessionActionSets_(c->sess, &ai);
+    if (XR_FAILED(r)) { XLOG("xr-sink: input off: xrAttachSessionActionSets: %s", xr_rs(c->inst, r)); return; }
+    in->on = 1;
+    XLOG("xr-sink: input: controller actions attached (v6 input channel offered)");
+}
+
+static void sk_in_pose(struct bmvr_xr_sink *k, XrSpace sp, XrTime t, float out[7], int *valid)
+{
+    XrSpaceLocation loc = { .type = XR_TYPE_SPACE_LOCATION };
+    *valid = 0;
+    if (XR_FAILED(xrLocateSpace_(sp, k->world_space, t, &loc))) return;
+    const XrSpaceLocationFlags need = XR_SPACE_LOCATION_POSITION_VALID_BIT | XR_SPACE_LOCATION_ORIENTATION_VALID_BIT;
+    if ((loc.locationFlags & need) != need) return;
+    out[0] = loc.pose.position.x; out[1] = loc.pose.position.y; out[2] = loc.pose.position.z;
+    out[3] = loc.pose.orientation.x; out[4] = loc.pose.orientation.y; out[5] = loc.pose.orientation.z; out[6] = loc.pose.orientation.w;
+    *valid = 1;
+}
+
+/* XR thread, once per frame (after xrBeginFrame). */
+static void sk_input_poll(struct bmvr_xr_sink *k, XrTime t)
+{
+    struct sk_input *in = &k->in;
+    struct ctx *c = &k->st.c;
+    if (!in->on) return;
+    struct bmvr_xfer_input n;
+    memset(&n, 0, sizeof n);
+    XrActiveActionSet as = { .actionSet = in->set, .subactionPath = XR_NULL_PATH };
+    XrActionsSyncInfo si = { .type = XR_TYPE_ACTIONS_SYNC_INFO, .countActiveActionSets = 1, .activeActionSets = &as };
+    XrResult r = xrSyncActions_(c->sess, &si);
+    if (r == XR_SUCCESS) {
+        n.flags |= BMVR_XFER_INPUT_FOCUSED;
+        for (int h = 0; h < 2; h++) {
+            XrActionStateGetInfo gi = { .type = XR_TYPE_ACTION_STATE_GET_INFO, .subactionPath = in->hand[h] };
+            XrActionStateVector2f sv = { .type = XR_TYPE_ACTION_STATE_VECTOR2F };
+            XrActionStateFloat sf = { .type = XR_TYPE_ACTION_STATE_FLOAT };
+            XrActionStateBoolean sb = { .type = XR_TYPE_ACTION_STATE_BOOLEAN };
+            gi.action = in->stick;   if (XR_SUCCEEDED(xrGetActionStateVector2f_(c->sess, &gi, &sv)) && sv.isActive) { n.stick[h][0] = sv.currentState.x; n.stick[h][1] = sv.currentState.y; }
+            gi.action = in->trigger; if (XR_SUCCEEDED(xrGetActionStateFloat_(c->sess, &gi, &sf)) && sf.isActive) n.trigger[h] = sf.currentState;
+            gi.action = in->squeeze; if (XR_SUCCEEDED(xrGetActionStateFloat_(c->sess, &gi, &sf)) && sf.isActive) n.squeeze[h] = sf.currentState;
+            const struct { XrAction a; uint32_t bit; } bt[] = { { in->primary, BMVR_XFER_BTN_PRIMARY }, { in->secondary, BMVR_XFER_BTN_SECONDARY },
+                { in->menu, BMVR_XFER_BTN_MENU }, { in->sclick, BMVR_XFER_BTN_STICK }, { in->bumper, BMVR_XFER_BTN_BUMPER } };
+            for (size_t i = 0; i < sizeof bt / sizeof bt[0]; i++) {
+                gi.action = bt[i].a;
+                if (XR_SUCCEEDED(xrGetActionStateBoolean_(c->sess, &gi, &sb)) && sb.isActive && sb.currentState) n.buttons |= bt[i].bit << (8 * h);
+            }
+            int va = 0, vg = 0;
+            if (k->world_space) {
+                sk_in_pose(k, in->aim_sp[h], t, n.aim[h], &va);
+                sk_in_pose(k, in->grip_sp[h], t, n.grip[h], &vg);
+            }
+            if (va && vg) n.flags |= h ? BMVR_XFER_INPUT_POSE_R : BMVR_XFER_INPUT_POSE_L;
+        }
+        if (!in->logged_profile) {
+            XrInteractionProfileState ps = { .type = XR_TYPE_INTERACTION_PROFILE_STATE };
+            if (XR_SUCCEEDED(xrGetCurrentInteractionProfile_(c->sess, in->hand[1], &ps)) && ps.interactionProfile != XR_NULL_PATH) {
+                char name[128]; uint32_t len = 0;
+                if (XR_SUCCEEDED(xrPathToString_(c->inst, ps.interactionProfile, sizeof name, &len, name))) XLOG("xr-sink: input: the runtime bound the right hand to %s", name);
+                in->logged_profile = 1;
+            }
+        }
+    }
+    pthread_mutex_lock(&in->mu);
+    if (++in->seq == 0) in->seq = 1;
+    n.seq = in->seq;
+    in->cur = n;
+    pthread_mutex_unlock(&in->mu);
+}
 
 static int sk_done_fn(void *ctx, int slot)
 {
@@ -1624,6 +1815,7 @@ static void *sk_thread(void *arg)
         sk_qunlock(k);
         if (XR_FAILED(r)) { sk_fail(k, "xrBeginFrame: %s", xr_rs(c->inst, r)); break; }
         xr_frames++;
+        sk_input_poll(k, fs.predictedDisplayTime);
 
         XrCompositionLayerQuad quad;
         XrCompositionLayerProjection proj;
@@ -1757,6 +1949,7 @@ void bmvr_xr_sink_info(const struct bmvr_xr_sink *k, struct bmvr_xr_sink_info *i
     info->eyes = k->eyes;
     info->semaphores = k->sem_ok;
     info->poses = k->poses_on;
+    info->input = k->in.on;
 }
 
 static void sk_destroy(struct bmvr_xr_sink *k)
@@ -1827,6 +2020,7 @@ int bmvr_xr_sink_open(const struct bmvr_xr_sink_opts *o, struct bmvr_xr_sink **o
         if (XR_FAILED(lr)) { ledger("xrCreateReferenceSpace(LOCAL)", 0, 0, "%s: falling back to a head-locked quad", xr_rs(s->c.inst, lr)); k->head_locked = 1; k->world_space = XR_NULL_HANDLE; }
     }
     k->poses_on = k->projection && k->world_space != XR_NULL_HANDLE;
+    if (!failed && !unavailable && k->world_space != XR_NULL_HANDLE) sk_input_init(k);   /* optional: a failure only switches input off */
     if (k->projection && !k->poses_on && !failed && !unavailable) XLOG("xr-sink: no LOCAL reference space: the pose channel is not offered (head-locked projection, as X3)");
     if (!failed && !unavailable) failed = sk_make_gpu_objects(k);
     if (!failed && !unavailable) {
@@ -1931,6 +2125,15 @@ static void sk_record_copy(struct bmvr_xr_sink *k, VkCommandBuffer cb, int slot,
     for (int e = 0; e < eyes; e++) post[e] = st_img_barrier(k->slot_img[slot][e], VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
     vkCmdPipelineBarrier_(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0, NULL, (uint32_t)eyes, post);
     vkEndCommandBuffer_(cb);
+}
+
+int bmvr_xr_sink_latest_input(struct bmvr_xr_sink *k, struct bmvr_xfer_input *out)
+{
+    if (!k->in.on) return 0;
+    pthread_mutex_lock(&k->in.mu);
+    *out = k->in.cur;
+    pthread_mutex_unlock(&k->in.mu);
+    return out->seq != 0;
 }
 
 int bmvr_xr_sink_latest_pose(struct bmvr_xr_sink *k, struct bmvr_xfer_pose *out)

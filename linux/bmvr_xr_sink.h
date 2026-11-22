@@ -71,6 +71,7 @@ struct bmvr_xr_sink_info {
     int eyes;
     int semaphores;           /* 1: the hello may carry BMVR_XFER_CAP_SEMAPHORES */
     int poses;                /* 1: the hello may carry BMVR_XFER_CAP_POSES (projection layer + LOCAL space: X4) */
+    int input;                /* 1: the hello may carry BMVR_XFER_CAP_INPUT (controller actions were created: v6) */
 };
 
 /* Opens the runtime (loader, instance, runtime-chosen device, session, one swapchain), creates the shared images, the ring and the
@@ -90,6 +91,9 @@ int bmvr_xr_sink_pair(struct bmvr_xr_sink *k, uint32_t tick, int eyes, int use_s
 
 /* X4: the newest pose the XR thread located (for the ack). 1 and *out filled, 0 when none yet or poses are not offered. */
 int bmvr_xr_sink_latest_pose(struct bmvr_xr_sink *k, struct bmvr_xfer_pose *out);
+
+/* v6: the newest controller state (for the ack). 1 and *out filled, 0 when input is not offered or nothing was polled yet. */
+int bmvr_xr_sink_latest_input(struct bmvr_xr_sink *k, struct bmvr_xfer_input *out);
 
 /* The game went away: wait (bounded) for our submissions to finish. The XR thread keeps showing the last pair. */
 void bmvr_xr_sink_client_end(struct bmvr_xr_sink *k);

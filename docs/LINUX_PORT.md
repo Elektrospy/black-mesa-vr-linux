@@ -685,3 +685,34 @@ bloom/exposure on the eyes, frame pacing.
 only if it is still alive (a second helper exits at once on the flock). It no longer `exec`s the game: it waits for it, returns its exit
 status and sends the helper SIGINT only if this script started it. SteamVR must already be running (the helper exits otherwise; the game
 then starts mono-pair as before). Replaces the manual "start the helper in a terminal first" step.
+
+## Stage 5, slices 1-2: controller input channel (protocol v6; compiled + stand-in tested; NOT run on a headset)
+
+Hardware in use: Steam Frame headset and its controllers. Control scheme chosen by the user (2026-11-22): **smooth turning, left stick moves,
+weapon in the right hand**; to be configurable (see "Options" below).
+
+- **Protocol v6** (`linux/bmvr_xfer.h`): every ack carries `struct bmvr_xfer_input` (160 bytes, fixed-width; ack is 272 bytes on both 32- and 64-bit):
+  per hand stick, trigger, squeeze, 5 buttons (primary = right a / left x, secondary = b / y, menu = menu / view, stick click, bumper),
+  aim and grip poses in the same LOCAL space as the eye poses, flags (focused, poses valid per hand). `BMVR_XFER_CAP_INPUT` in the hello.
+  Shim and helper must be rebuilt together (version 6).
+- **Helper** (`bmvr_xr_sink.c`, `sk_input_*`): one action set; enables `XR_VALVE_frame_controller_interaction` when the runtime offers it and
+  suggests `/interaction_profiles/valve/frame_controller_valve` bindings (paths from Valve's Steamworks Steam Frame input page, **not yet
+  checked against the runtime**) plus `khr/simple_controller` as a fallback. `xrSyncActions` once per frame after `xrBeginFrame`; values are
+  zero when the session is not focused. The log says which profile the runtime bound (`input: the runtime bound the right hand to ...`) and
+  whether the Valve bindings were accepted or rejected.
+- **Shim** (`bmvr_preload.c`, `in_note`): logs the first state and every coarse change (`input: ...` lines, at most 200) and exports
+  `bmvr_get_input()` for the game-side hook.
+- **Tests:** `mock_helper --input`, suite T23b/T23c; the whole suite passes host-native. The helper compiles clean (`-Wall -Wextra`) with the
+  vendored OpenXR and Vulkan headers; it has not run against a runtime.
+
+**To verify on the headset:** start SteamVR, launch the game (the helper starts itself), press buttons, push both sticks, then send
+`bmvr_helper_log.txt` and `bmvr_linux_log.txt`. Expected: `input: Steam Frame controller bindings suggested`, `input: controller actions attached`,
+`input: the runtime bound the right hand to /interaction_profiles/valve/frame_controller_valve`, then `input:` lines when you press things.
+
+**Next (slice 3):** feed the state into the game's `CreateMove`: left stick -> forward/side move, right stick -> smooth yaw, trigger -> attack,
+bumper/`a` -> jump/use, etc.; first log the real `CreateMove` entry bytes and `CUserCmd` layout as was done for `RenderView`. Then aim from the
+right controller and hands/viewmodel.
+
+**Options:** a `bmvr_input.txt` next to `bmvr_target.txt` (`turn=smooth|snap`, `turn_speed=`, `move_hand=left|right`, `weapon_hand=right|left`,
+deadzone, button map) is planned with slice 3. In-game options (Black Mesa's options menu or a VR panel) need the engine's UI/cvar hooks, which
+are not ported to Linux; until then the file is the options UI, optionally with console cvars once a cvar hook exists.

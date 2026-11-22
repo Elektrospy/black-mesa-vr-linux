@@ -53,13 +53,14 @@
 #include <stdint.h>
 
 #define BMVR_XFER_SOCKET_NAME "bmvr_xfer.sock"
-#define BMVR_XFER_VERSION 5u
+#define BMVR_XFER_VERSION 6u
 #define BMVR_XFER_MAGIC_HELLO 0x31564d42u /* "BMV1" */
 #define BMVR_XFER_MAGIC_FRAME 0x31524642u /* "BFR1" */
 #define BMVR_XFER_MAGIC_ACK   0x314b4341u /* "ACK1" */
 
 #define BMVR_XFER_CAP_SEMAPHORES 1u /* hello carries 3 fds: memory, gl_ready semaphore, vk_done semaphore */
 #define BMVR_XFER_CAP_POSES      2u /* v5: every ack may carry a pose (the helper submits a projection layer with game-rendered poses) */
+#define BMVR_XFER_CAP_INPUT      4u /* v6: every ack carries the controllers' state (struct bmvr_xfer_input); seq 0 = none yet */
 
 struct bmvr_xfer_hello {
     uint32_t magic;             /* BMVR_XFER_MAGIC_HELLO */
@@ -112,17 +113,40 @@ struct bmvr_xfer_pose {
     struct bmvr_xfer_eye_pose eye[2];   /* 0 = left, 1 = right */
 };
 
+/* v6: controllers. Fixed-width, 4-byte aligned fields only (identical in the 32-bit shim and the 64-bit helper). Poses are OpenXR's convention
+ * (right-handed, +Y up, -Z forward, metres) in the same LOCAL space as the eye poses: pos xyz, then rotation quaternion xyzw. hand 0 = left, 1 = right. */
+#define BMVR_XFER_INPUT_POSE_L   1u   /* flags: hand 0's aim/grip poses are valid */
+#define BMVR_XFER_INPUT_POSE_R   2u   /* hand 1's */
+#define BMVR_XFER_INPUT_FOCUSED  4u   /* the session has input focus (otherwise all values are zero) */
+#define BMVR_XFER_BTN_PRIMARY    1u   /* per hand, shifted by 8 * hand: right a / left x */
+#define BMVR_XFER_BTN_SECONDARY  2u   /* right b / left y */
+#define BMVR_XFER_BTN_MENU       4u   /* right menu / left view */
+#define BMVR_XFER_BTN_STICK      8u   /* thumbstick click */
+#define BMVR_XFER_BTN_BUMPER     16u
+struct bmvr_xfer_input {
+    uint32_t seq;               /* 0 = no state yet; otherwise increases with every helper poll */
+    uint32_t flags;             /* BMVR_XFER_INPUT_* */
+    uint32_t buttons;           /* BMVR_XFER_BTN_* << (8 * hand) */
+    float stick[2][2];          /* [hand][x, y], -1..1, +y up */
+    float trigger[2], squeeze[2];
+    float aim[2][7];            /* [hand] pos xyz, quat xyzw */
+    float grip[2][7];
+    uint32_t reserved;          /* pads the struct to 160 bytes so struct bmvr_xfer_ack is 272 on both 32- and 64-bit (int64 alignment inside the pose) */
+};
+
 struct bmvr_xfer_ack {
     uint32_t magic;             /* BMVR_XFER_MAGIC_ACK */
     uint32_t status;            /* 0 = ok. With BMVR_XFER_FLAG_SEMAPHORE: the helper's queue submission is done */
     struct bmvr_xfer_pose pose; /* v5: the newest pose (pose_id 0 = none yet / not offered) */
+    struct bmvr_xfer_input input; /* v6: the controllers (seq 0 = none / not offered) */
 };
 
 _Static_assert(sizeof(struct bmvr_xfer_hello) == 48, "bmvr_xfer_hello layout differs between 32/64-bit");
 _Static_assert(sizeof(struct bmvr_xfer_frame) == 96, "bmvr_xfer_frame layout");
 _Static_assert(sizeof(struct bmvr_xfer_eye_pose) == 44, "bmvr_xfer_eye_pose layout");
 _Static_assert(sizeof(struct bmvr_xfer_pose) == 104, "bmvr_xfer_pose layout differs between 32/64-bit");
-_Static_assert(sizeof(struct bmvr_xfer_ack) == 112, "bmvr_xfer_ack layout");
+_Static_assert(sizeof(struct bmvr_xfer_input) == 160, "bmvr_xfer_input layout");
+_Static_assert(sizeof(struct bmvr_xfer_ack) == 112 + 160, "bmvr_xfer_ack layout");
 _Static_assert(offsetof(struct bmvr_xfer_pose, display_time) == 8 && offsetof(struct bmvr_xfer_pose, eye) == 16 && offsetof(struct bmvr_xfer_ack, pose) == 8,
                "pose offsets differ between 32/64-bit (int64 alignment)");
 
