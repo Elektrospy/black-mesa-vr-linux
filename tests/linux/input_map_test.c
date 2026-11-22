@@ -122,6 +122,22 @@ int main(void)
     struct bmvr_input_map m4; bmvr_input_map_init(&m4); bmvr_input_map_step(&m4, NULL, 11.0f, &c);
     CHECK(c.buttons == 0 && c.events == 0 && c.forward == 0.0f, "NULL input is quiet");
 
+    /* head-relative walking: stick forward, head turned 90 deg left of the game yaw -> the cmd moves LEFT (negative sidemove) */
+    {   float fm, sm;
+        bmvr_im_move_relative(1.0f, 0.0f, 0.0f, 450.0f, &fm, &sm);
+        CHECK(near(fm, 450.0f) && near(sm, 0.0f), "move_relative: no head turn = straight through");
+        bmvr_im_move_relative(0.0f, 1.0f, 0.0f, 450.0f, &fm, &sm);
+        CHECK(near(fm, 0.0f) && near(sm, 450.0f), "move_relative: stick right = strafe right");
+        bmvr_im_move_relative(1.0f, 0.0f, 90.0f, 450.0f, &fm, &sm);
+        CHECK(near(fm, 0.0f) && near(sm, -450.0f), "move_relative: head 90 left, stick forward = move left");
+        bmvr_im_move_relative(1.0f, 0.0f, 180.0f, 450.0f, &fm, &sm);
+        CHECK(near(fm, -450.0f) && near(sm, 0.0f), "move_relative: head 180 = backwards");
+        bmvr_im_move_relative(0.7f, 0.7f, 33.0f, 450.0f, &fm, &sm);
+        CHECK(fabsf(sqrtf(fm * fm + sm * sm) - 450.0f * 0.98995f) < 0.5f, "move_relative: rotation keeps the length");
+        bmvr_im_move_relative(1.0f, 1.0f, 0.0f, 450.0f, &fm, &sm);
+        CHECK(sqrtf(fm * fm + sm * sm) <= 450.01f, "move_relative: clamped to max speed");
+    }
+
     printf("%d checks, %d failed\n", checks, fails);
     return fails ? 1 : 0;
 }

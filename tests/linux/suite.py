@@ -360,6 +360,49 @@ check('periodic status line reports calls and pairs', 'stereo: status tick' in l
 log,tr,out,ex=run('t31b',['--sem','--eyes','2','--poses'],ST.replace('stereo=1','stereo=1\nstereo_class=CViewRender')+'sync=sem\nevery=1\n',('FAKE_STEREO=1',),'100 40',fake_bin='fake_game_bm')
 check('stereo_class= given explicitly and absent: never substituted', 'has 0 primary vtables' in log and 'hooked' not in log and 'using the only usable' not in log and 'exit=0' in ex)
 
+# ---------------------------------------------------------------------------- slice 3b: controller input into CreateMove
+IN='target=_rt_fullframefb\ninput=1\ninput_module=exe\nflip=0\n'
+def cm(out):
+    m=re.search(r'CM calls=(\d+) cmds=(\d+) moved=(\d+) maxfwd=(\S+) attack=(\d+) kbd_lost=(\d+) impulse100=(\d+) turned=(\d+) minyaw=(\S+)', out)
+    return dict(zip(['calls','cmds','moved','maxfwd','attack','kbd_lost','imp100','turned','minyaw'],[float(x) for x in m.groups()])) if m else None
+
+print('T32 input=1: the hook watches first, then the controllers drive CreateMove (walk, attack, turn, flashlight), keyboard bits stay')
+log,tr,out,ex=run('t32',['--sem','--drive'],IN+'sync=sem\nevery=1\n',('FAKE_INPUT=1',),'100 200')
+c=cm(out) or {}
+check('game clean, class found by RTTI alone, slot 22 hooked, watching only at first', 'gl_state_violations=0' in out and 'exit=0' in ex and 'RTTI 16ClientModeShared' in log and 'hooked 16ClientModeShared vtable slot 22' in log and 'WATCHING ONLY' in log, log[-600:])
+check('the slot proved itself after 20 plausible cmds, and it is logged', 'looks like CreateMove (20 consecutive calls' in log)
+check('every cmd went through the hook', c and c['calls']==c['cmds']==200, str(c))
+check('the first 20 cmds were never written (learning), later ones were: walking at full speed 450', c and 20<=c['moved']<=c['cmds']-19 and abs(c['maxfwd']-450.0)<0.01, str(c))
+check('right trigger became IN_ATTACK on the same cmds', c and c['attack']>=c['moved']-2 and c['attack']>=100, str(c))
+check('keyboard bits the engine put in the cmd survive', c and c['kbd_lost']==0, str(c))
+check('right stick turned the view to the right (yaw below the starting 10)', c and c['turned']>=100 and c['minyaw']<10.0, str(c))
+check('the flashlight squeeze gave exactly one impulse 100', c and c['imp100']==1, str(c))
+check('input flag removed at a clean exit', not os.path.exists(f'{R}/cases/t32/bmvr_in_input.flag'))
+
+print('T33 input=1 with the helper offering no input: nothing is written, nothing breaks')
+log,tr,out,ex=run('t33',['--sem'],IN+'sync=sem\nevery=1\n',('FAKE_INPUT=1',),'100 100')
+c=cm(out) or {}
+check('hooked and armed, but no value ever changes', 'exit=0' in ex and c and c['moved']==0 and c['attack']==0 and c['turned']==0 and c['kbd_lost']==0, str(c))
+
+print('T34 a wrong slot never writes: the cmd pointer is junk')
+log,tr,out,ex=run('t34',['--sem','--drive'],IN+'sync=sem\nevery=1\n',('FAKE_INPUT=1','FAKE_INPUT_BADCMD=1'),'100 100')
+check('game finishes clean; "does not look like a CUserCmd" logged; never armed', 'exit=0' in ex and 'does not look like a CUserCmd' in log and 'looks like CreateMove' not in log, log[-400:])
+check('the junk buffer is untouched', 'gl_state_violations=0' in out)
+
+print('T35 refusals leave the game untouched and say why')
+log,tr,out,ex=run('t35a',['--sem','--drive'],IN.replace('input=1','input=1\ninput_slot=60')+'sync=sem\nevery=1\n',('FAKE_INPUT=1',),'100 40')
+check('slot beyond the vtable: refused, no hook', 'is not executable code' in log and 'hooked 16' not in log and 'exit=0' in ex)
+log,tr,out,ex=run('t35b',['--sem','--drive'],IN.replace('input=1','input=1\ninput_class=CNoSuchMode')+'sync=sem\nevery=1\n',('FAKE_INPUT=1',),'100 40')
+check('unknown class: 0 primary vtables, ClientMode classes listed, no hook', 'has 0 primary vtables' in log and 'ClientModeShared' in log and 'hooked 16' not in log and 'exit=0' in ex)
+log,tr,out,ex=run('t35c',['--sem','--drive'],IN.replace('input=1','input=1\ninput_slot=21')+'sync=sem\nevery=1\n',('FAKE_INPUT=1',),'100 100')
+c=cm(out) or {}
+check('a slot that is never called (21 = a different virtual): game unaffected, nothing written', 'exit=0' in ex and c and c['moved']==0 and c['attack']==0 and 'looks like CreateMove' not in log, str(c))
+os.environ['PRE_FLAG_INPUT']='1'
+log,tr,out,ex=run('t35d',['--sem','--drive'],IN+'sync=sem\nevery=1\n',('FAKE_INPUT=1',),'100 100')
+del os.environ['PRE_FLAG_INPUT']
+c=cm(out) or {}
+check('crash-sticky flag present at start: input OFF for this launch, flag consumed', 'bmvr_in_input.flag exists' in log and 'hooked 16' not in log and c and c['moved']==0 and not os.path.exists(f'{R}/cases/t35d/bmvr_in_input.flag'), str(c))
+
 print()
 print('FAILED: %d'%fails if fails else 'ALL CHECKS PASSED')
 sys.exit(1 if fails else 0)

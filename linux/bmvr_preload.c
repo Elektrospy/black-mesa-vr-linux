@@ -38,6 +38,7 @@
 #include "bmvr_stereo.h"
 #include "bmvr_rtti.h"
 #include "bmvr_inline.h"
+#include "bmvr_input_map.h"
 
 /* Portability: this library is loaded into the game, which Steam may run inside an OLDER
  * glibc (Steam Linux Runtime). Built on a modern distro it would require dlsym@GLIBC_2.34
@@ -451,6 +452,18 @@ static int g_st_slot = 6;                          /* stereo_slot=: vtable slot 
 static int g_st_hook_mode;                         /* stereo_hook=: 0 auto (vtable slot, then an inline detour if the slot is never called), 1 vtable only, 2 inline only */
 static float g_st_scale = BMVR_STEREO_DEFAULT_SCALE; /* stereo_scale=: Source units per metre */
 
+/* Slice 3b: controller input into the game (docs/LINUX_PORT.md). Opt-in: nothing below does anything unless "input=1" is set. The hook is on
+ * IClientMode::CreateMove (ClientModeShared slot 21 on the Windows build; the Linux build has two destructor slots, so 22 is the first guess:
+ * UNVERIFIED, the learning phase below says whether it is right before a single value is written). */
+static int g_ic_want;                              /* config: input=1 (BMVR_INPUT=1) */
+static char g_ic_module[96] = "/client.so";        /* input_module= */
+static char g_ic_class[64] = "ClientModeShared";   /* input_class=: class whose vtable holds CreateMove (plain name; mangled here) */
+static int g_ic_class_explicit;
+static int g_ic_slot = 22;                         /* input_slot= */
+static float g_ic_turn_speed = 180.0f;             /* input_turn_speed= degrees per second at full stick (smooth turning) */
+static float g_ic_snap = 0.0f;                     /* input_snap= degrees per flick; 0 = smooth turning */
+static volatile int g_st_recenter_req;             /* the right stick click asks the stereo rig to recenter on its next frame */
+
 static int game_dir(char *out, size_t cap)
 {
     char exe[400];
@@ -576,6 +589,16 @@ static void load_cfg_once(void)
                 if (v >= 2 && v <= 400) g_st_scale = (float)v;
                 else bmvr_log("stereo: bad stereo_scale=%s (use a whole number 2..400 units per metre); keeping %d", line + 13, (int)g_st_scale);
             }
+            else if (!strncmp(line, "input=", 6)) g_ic_want = line[6] == '1';
+            else if (!strncmp(line, "input_module=", 13)) snprintf(g_ic_module, sizeof g_ic_module, "%.95s", line + 13);
+            else if (!strncmp(line, "input_class=", 12)) { snprintf(g_ic_class, sizeof g_ic_class, "%.63s", line + 12); g_ic_class_explicit = 1; }
+            else if (!strncmp(line, "input_slot=", 11)) {
+                long v = strtol(line + 11, NULL, 10);
+                if (v >= 0 && v < 256) g_ic_slot = (int)v;
+                else bmvr_log("input: bad input_slot=%s (use 0..255); keeping %d", line + 11, g_ic_slot);
+            }
+            else if (!strncmp(line, "input_turn_speed=", 17)) { float v = (float)atof(line + 17); if (v >= 10.0f && v <= 720.0f) g_ic_turn_speed = v; }
+            else if (!strncmp(line, "input_snap=", 11)) { float v = (float)atof(line + 11); if (v == 0.0f || (v >= 5.0f && v <= 120.0f)) g_ic_snap = v; }
             else if (!strncmp(line, "every=", 6)) {
                 long v = strtol(line + 6, NULL, 10);
                 if (v >= 1 && v <= 3600) { g_x_every = (unsigned)v; bmvr_log("xfer: every=%ld (one delivery per %ld present(s))", v, v); }
@@ -598,6 +621,9 @@ static void load_cfg_once(void)
     if (e && *e) parse_sync(e);
     e = getenv("BMVR_STEREO");
     if (e && *e) g_st_want = e[0] == '1';
+    e = getenv("BMVR_INPUT");
+    if (e && *e) g_ic_want = e[0] == '1';
+    if (g_ic_want) bmvr_log("input: requested (module '%s', class '%s', CreateMove slot %d, %s turning); it only watches until the slot proves to be CreateMove", g_ic_module, g_ic_class, g_ic_slot, g_ic_snap > 0.0f ? "snap" : "smooth");
     /* Stereo draws both eyes into the SAME engine target one after the other, so eye 1 needs no target2 of its own: it is the
      * same spec as eye 0. That also keeps the two-image negotiation (and the loading-screen fallback, which delivers a flat pair)
      * working exactly as with an explicit target2. */
@@ -1669,6 +1695,7 @@ static int st_try_stereo(void *self, void *view, int clear, int what)
     if (!st_view_sane(vv)) { st_note(2, "the view does not look like a CViewSetup with the expected layout (size, fov, aspect, near/far, origin)"); return 0; }
     if (!xfer_peer_alive()) { g_st_silent[3]++; return 0; }     /* before any GPU wait: a dead helper never signals (see xfer_peer_alive) */
 
+    if (g_st_recenter_req) { g_st_recenter_req = 0; g_st_rig.have_ref = 0; bmvr_log("stereo: recentered (right stick click)"); }
     /* the recenter trigger: touch <game folder>/bmvr_recenter */
     if ((g_st_frames % 30) == 0) {
         char dir[400], path[512];
@@ -1940,6 +1967,219 @@ BMVR_EXPORT int bmvr_get_render_pose(struct bmvr_xfer_pose *out)
     return 1;
 }
 
+/* ------------------------------------------------------------ slice 3b: controller input into CreateMove
+ * IClientMode::CreateMove(float flInputSampleTime, CUserCmd *cmd) -> bool. i386 System V: a plain cdecl call with `this` as the first stack
+ * argument, so an ordinary C function of the same shape can stand in for it.
+ *
+ * Safety, because the slot number is a guess on this game build:
+ *   1. the detour forwards its three arguments unchanged and returns what the original returned, so a wrong slot behaves like the real
+ *      function for every callee that takes (this, float, pointer) and returns an integer;
+ *   2. for IC_LEARN consecutive calls it only LOOKS at the second pointer: it must be readable memory laid out like a CUserCmd (vptr in a
+ *      mapped region, finite view angles, plausible numbers, a command number that never goes backwards). Only then does it write;
+ *   3. one bad call after that (the cmd stops looking like a cmd) switches writing off for good, and says so;
+ *   4. a flag file marks "input was active": a launch that died with it set runs without input once (like the stereo flag). */
+struct bmvr_usercmd {            /* mirrors src/sdk/usercmd.h: virtual destructor first, then the fields in the same order */
+    void *vptr;
+    int command_number, tick_count;
+    float viewangles[3];
+    float forwardmove, sidemove, upmove;
+    int buttons;
+    unsigned char impulse;
+    int weaponselect, weaponsubtype, random_seed;
+    short mousedx, mousedy;
+    unsigned char hasbeenpredicted;
+};
+#define IC_LEARN 20
+#define IC_FLAG_CLEAR_CALLS 1800
+typedef int (*PFN_CreateMove)(void *, float, void *);
+static int g_ic_state;                 /* 0 = not tried, 1 = hooked, -1 = refused / failed */
+static PFN_CreateMove g_ic_orig;
+static uintptr_t *g_ic_vt_slot;
+static unsigned g_ic_next_try, g_ic_hook_tick;
+static unsigned g_ic_calls, g_ic_sane_run, g_ic_insane, g_ic_applied, g_ic_nocmd;
+static int g_ic_armed;                 /* the learning phase passed: values are written */
+static int g_ic_dead;                  /* armed, then a cmd failed the check: never write again */
+static int g_ic_last_cmdnum = -1;
+static char g_ic_flag_path[512];
+static int g_ic_flag_on;
+static struct bmvr_input_map g_ic_map;
+static int g_ic_map_ready;
+static int g_ic_snap_latched;
+static unsigned g_ic_unwired_seen;
+static unsigned g_ic_bad_run;          /* consecutive implausible cmds while armed */
+
+static int ic_cmd_sane(const struct bmvr_usercmd *c)
+{
+    struct bmvr_map m;
+    if (!c || ((uintptr_t)c & 3u)) return 0;
+    if (!bmvr_maps_find((uintptr_t)c, &m) || m.perms[0] != 'r' || m.perms[1] != 'w') return 0;
+    if ((uintptr_t)c + sizeof *c > m.hi) return 0;
+    if (!c->vptr || !bmvr_maps_find((uintptr_t)c->vptr, &m) || m.perms[0] != 'r') return 0;
+    if (c->command_number < 0 || c->command_number > 0x3fffffff || c->tick_count < 0 || c->tick_count > 0x3fffffff) return 0;
+    for (int i = 0; i < 3; i++) if (!(fabsf(c->viewangles[i]) < 100000.0f)) return 0;      /* also rejects NaN */
+    if (!(fabsf(c->viewangles[0]) <= 180.0f)) return 0;
+    if (!(fabsf(c->forwardmove) <= 5000.0f) || !(fabsf(c->sidemove) <= 5000.0f) || !(fabsf(c->upmove) <= 5000.0f)) return 0;
+    if ((unsigned)c->buttons > 0x3ffffffu) return 0;
+    return 1;
+}
+
+static void ic_unwired(unsigned ev, const char *what)
+{
+    if (g_ic_unwired_seen & ev) return;
+    g_ic_unwired_seen |= ev;
+    bmvr_log("input: %s pressed; not wired yet (needs the engine's weapon / menu state, a later slice). Logged once.", what);
+}
+
+/* Write the controllers into one cmd. Everything the keyboard and mouse already put there stays: ours is added on top. */
+static void ic_apply(float dt, struct bmvr_usercmd *cmd)
+{
+    struct bmvr_xfer_input in;
+    if (!bmvr_get_input(&in)) { g_ic_nocmd++; return; }
+    {   struct bmvr_xfer_input again;   /* the render thread may be writing it: take it only if it did not move while we copied */
+        if (!bmvr_get_input(&again) || again.seq != in.seq) in = again;
+    }
+    if (!g_ic_map_ready) { bmvr_input_map_init(&g_ic_map); g_ic_map_ready = 1; }
+    float dt_ms = dt * 1000.0f;
+    if (!(dt_ms > 0.5f && dt_ms < 250.0f)) dt_ms = 11.0f;
+    struct bmvr_cmd c;
+    bmvr_input_map_step(&g_ic_map, &in, dt_ms, &c);
+
+    /* movement: the stick is relative to where the HEAD looks; the cmd is relative to the game's yaw (cmd->viewangles[1]).
+     * delta = head yaw change since the stereo recenter (0 when there is no head reference). */
+    float delta = 0.0f;
+    if (g_st_rig.have_ref && (g_x_pose_pending_data.flags & BMVR_XFER_POSE_LOCAL)) {
+        float pos[3], fwd[3];
+        if (bmvr_stereo_head(&g_x_pose_pending_data, g_st_rig.scale, pos, fwd)) {
+            delta = atan2f(fwd[1], fwd[0]) * 180.0f / BMVR_PI_F - g_st_rig.ref_yaw;
+            while (delta > 180.0f) delta -= 360.0f;
+            while (delta < -180.0f) delta += 360.0f;
+        }
+    }
+    float fm, sm;
+    bmvr_im_move_relative(c.forward, c.side, delta, 450.0f, &fm, &sm);
+    cmd->forwardmove += fm;
+    cmd->sidemove += sm;
+
+    /* turning: Source yaw is positive to the LEFT, so a right-stick push SUBTRACTS */
+    if (g_ic_snap > 0.0f) {
+        if (fabsf(c.turn) < 0.3f) g_ic_snap_latched = 0;
+        else if (fabsf(c.turn) > 0.7f && !g_ic_snap_latched) { g_ic_snap_latched = 1; cmd->viewangles[1] -= (c.turn > 0.0f ? 1.0f : -1.0f) * g_ic_snap; }
+    } else cmd->viewangles[1] -= c.turn * g_ic_turn_speed * (dt_ms / 1000.0f);
+    while (cmd->viewangles[1] > 180.0f) cmd->viewangles[1] -= 360.0f;
+    while (cmd->viewangles[1] < -180.0f) cmd->viewangles[1] += 360.0f;
+
+    cmd->buttons |= (int)c.buttons;
+    if (c.events & BMVR_EV_FLASHLIGHT) cmd->impulse = 100;
+    if (c.events & BMVR_EV_RECENTER) g_st_recenter_req = 1;
+    if (c.events & BMVR_EV_PAUSE) ic_unwired(BMVR_EV_PAUSE, "pause");
+    if (c.events & (BMVR_EV_WEAPON_PREV | BMVR_EV_WEAPON_NEXT)) ic_unwired(BMVR_EV_WEAPON_NEXT, "previous/next weapon");
+    if (c.events & (BMVR_EV_WHEEL_OPEN | BMVR_EV_WHEEL_SELECT)) ic_unwired(BMVR_EV_WHEEL_OPEN, "the weapon wheel");
+    g_ic_applied++;
+}
+
+static int ic_detour(void *self, float t, void *cmdp)
+{
+    struct bmvr_usercmd *cmd = (struct bmvr_usercmd *)cmdp;
+    g_ic_calls++;
+    const int sane = ic_cmd_sane(cmd);
+    if (g_ic_armed && !g_ic_dead && sane && cmd->command_number != 0) {
+        if (cmd->command_number >= g_ic_last_cmdnum) g_ic_last_cmdnum = cmd->command_number;
+        ic_apply(t, cmd);
+    }
+    const int r = g_ic_orig(self, t, cmdp);
+    if (!g_ic_armed) {
+        /* learning: judge the cmd AFTER the original ran, and never write */
+        if (sane && cmd->command_number >= g_ic_last_cmdnum && cmd->command_number != 0) {
+            g_ic_last_cmdnum = cmd->command_number;
+            if (++g_ic_sane_run == IC_LEARN) {
+                g_ic_armed = 1;
+                bmvr_log("input: the hooked slot %d looks like CreateMove (%d consecutive calls with a plausible, increasing CUserCmd). Controller input is now written "
+                         "into the game: left stick walks, right stick turns, right trigger fires.", g_ic_slot, IC_LEARN);
+                if (g_ic_flag_path[0]) { int fd = open(g_ic_flag_path, O_WRONLY | O_CREAT, 0644); if (fd >= 0) { close(fd); g_ic_flag_on = 1; } }
+            }
+        } else if (cmd && cmd->command_number != 0 && g_ic_sane_run) { g_ic_sane_run = 0; g_ic_insane++; }
+        else if (!sane && !g_ic_insane++) bmvr_log("input: the second argument of the hooked slot's calls does not look like a CUserCmd yet (watching; nothing is written)");
+    } else if (!g_ic_dead && sane) {
+        g_ic_bad_run = 0;
+    } else if (!g_ic_dead && ++g_ic_bad_run >= 3) {
+        g_ic_dead = 1;
+        bmvr_log("input: a call of the hooked slot no longer looks like CreateMove; input is OFF for the rest of this launch (wrong input_slot=?)");
+    }
+    return r;
+}
+
+static void __attribute__((destructor)) ic_atexit(void)
+{
+    if (g_ic_flag_on) unlink(g_ic_flag_path);   /* a clean exit is not a crash */
+}
+
+static void ic_try_install(void)
+{
+    if (!g_ic_want || g_ic_state != 0 || g_x_tick < g_ic_next_try) return;
+    g_ic_state = -1;
+    char dir[400];
+    if (game_dir(dir, sizeof dir)) snprintf(g_ic_flag_path, sizeof g_ic_flag_path, "%s/bmvr_in_input.flag", dir);
+    if (g_ic_flag_path[0] && access(g_ic_flag_path, F_OK) == 0) {
+        unlink(g_ic_flag_path);
+        bmvr_log("input: bmvr_in_input.flag exists: the previous launch died while controller input was active. Input is OFF for this launch only "
+                 "(the flag is removed; the next launch tries again). If it repeats, set input_slot= or input=0.");
+        return;
+    }
+    struct bmvr_map mod[BMVR_RTTI_MAX_RANGES];
+    if (!bmvr_maps_module(g_ic_module, mod, BMVR_RTTI_MAX_RANGES)) {
+        static int said;
+        if (!said) { said = 1; bmvr_log("input: no readable mapping of a module matching '%s' yet; trying again every 60 frames", g_ic_module); }
+        g_ic_state = 0;
+        g_ic_next_try = g_x_tick + 60;
+        return;
+    }
+    char mangled[80];
+    snprintf(mangled, sizeof mangled, "%u%s", (unsigned)strlen(g_ic_class), g_ic_class);
+    struct bmvr_vt_hit h[8];
+    int n = bmvr_rtti_find(g_ic_module, mangled, h, 8), prim = -1, nprim = 0;
+    for (int i = 0; i < n; i++) {
+        bmvr_log("input: RTTI %s: type_info %#lx vtable %#lx (module offset %#lx) %s", mangled, (unsigned long)h[i].typeinfo, (unsigned long)h[i].vtable,
+                 (unsigned long)(h[i].vtable - mod[0].lo), h[i].primary ? "primary" : "secondary");
+        if (h[i].primary) { prim = i; nprim++; }
+    }
+    if (nprim != 1) {
+        bmvr_log("input: class '%s' has %d primary vtables in '%s' (need exactly 1); input is off. Classes whose name contains ClientMode:", g_ic_class, nprim, g_ic_module);
+        struct st_list l = { 0 };
+        bmvr_rtti_list(g_ic_module, "ClientMode", st_list_cb, &l);
+        bmvr_rtti_list(g_ic_module, "ClientModeShared", st_list_cb, &l);
+        if (!l.n) bmvr_log("input:   (none: the module may not carry RTTI, or input_module= names the wrong file)");
+        else bmvr_log("input:   pick the one the game really uses with input_class= (without the length prefix) and send me this log");
+        return;
+    }
+    uintptr_t *vt = (uintptr_t *)h[prim].vtable;
+    for (int i = 0; i <= g_ic_slot + 2; i++)
+        bmvr_log("input:   slot %2d -> %#lx (module offset %#lx)%s", i, (unsigned long)vt[i], (unsigned long)(vt[i] - mod[0].lo), i == g_ic_slot ? "   <- CreateMove?" : "");
+    for (int i = 0; i <= g_ic_slot; i++)
+        if (!bmvr_addr_executable(vt[i])) { bmvr_log("input: vtable slot %d is not executable code: the vtable is shorter than input_slot=%d; input is off", i, g_ic_slot); return; }
+    uintptr_t old = 0;
+    g_ic_orig = (PFN_CreateMove)vt[g_ic_slot];
+    g_ic_state = 1;
+    g_ic_hook_tick = g_x_tick;
+    if (!bmvr_vtable_patch(&vt[g_ic_slot], (uintptr_t)ic_detour, &old)) { bmvr_log("input: could not patch the vtable slot (mprotect refused); input is off"); g_ic_orig = NULL; g_ic_state = -1; return; }
+    g_ic_vt_slot = &vt[g_ic_slot];
+    bmvr_log("input: hooked %s vtable slot %d (was %#lx). WATCHING ONLY until %d consecutive calls look like CreateMove; then the controllers are written into the game. "
+             "UNVERIFIED on this build.", mangled, g_ic_slot, (unsigned long)old, IC_LEARN);
+}
+
+static void ic_status_tick(void)
+{
+    if (!g_ic_want || g_ic_state != 1 || g_x_tick == g_ic_hook_tick) return;
+    if (g_ic_flag_on && g_ic_applied >= IC_FLAG_CLEAR_CALLS && g_ic_flag_path[0]) { unlink(g_ic_flag_path); g_ic_flag_on = 0; }
+    if ((g_x_tick - g_ic_hook_tick) % 600) return;
+    bmvr_log("input: status tick %u: CreateMove calls %u, plausible-cmd run %u (need %d), implausible %u, armed %d%s, cmds written %u, no input yet %u",
+             g_x_tick, g_ic_calls, g_ic_sane_run, IC_LEARN, g_ic_insane, g_ic_armed, g_ic_dead ? " (DEAD)" : "", g_ic_applied, g_ic_nocmd);
+    if (!g_ic_calls && g_x_tick - g_ic_hook_tick >= 1800) {
+        static int warned;
+        if (!warned) { warned = 1; bmvr_log("input: WARNING: the hooked slot has not been called once in %u frames. If a map is loaded this is the wrong class or input_slot= "
+                                           "(compare the slot dump above); nothing was changed in the game.", g_x_tick - g_ic_hook_tick); }
+    }
+}
+
 /* Called once per Present, after report_gl_once(), on the render thread (GL context current). */
 static void xfer_tick(void)
 {
@@ -1983,6 +2223,8 @@ static void xfer_tick(void)
     }
     st_try_install();
     st_status_tick();
+    ic_try_install();
+    ic_status_tick();
     if (g_x_tick % g_x_every == 0) {
         if (g_st_sent) {
             g_st_sent = 0;   /* stage 4b: the stereo hook already delivered this frame's pair, mid-frame */

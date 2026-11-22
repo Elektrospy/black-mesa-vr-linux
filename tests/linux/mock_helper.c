@@ -17,8 +17,8 @@ static void T(const char *fmt, ...) {
   if (tfd == -2) { const char *p = getenv("MOCK_TRACE"); tfd = open(p ? p : "mock_trace.txt", O_WRONLY | O_CREAT | O_APPEND, 0644); }
   char b[512]; va_list ap; va_start(ap, fmt); int n = vsnprintf(b, sizeof b - 1, fmt, ap); va_end(ap); b[n++] = '\n'; if (write(tfd, b, (size_t)n) < 0) {} }
 int main(int argc, char **argv) {
-  const char *dir = argv[1]; int sem = 0, ver = BMVR_XFER_VERSION, die_after = -1, die_idle = -1, eyes = 1, poses = 0, input = 0;
-  for (int i = 2; i < argc; i++) { if (!strcmp(argv[i], "--sem")) sem = 1; else if (!strcmp(argv[i], "--version")) ver = atoi(argv[++i]); else if (!strcmp(argv[i], "--die-after")) die_after = atoi(argv[++i]); else if (!strcmp(argv[i], "--die-idle-after")) die_idle = atoi(argv[++i]); else if (!strcmp(argv[i], "--eyes")) eyes = atoi(argv[++i]); else if (!strcmp(argv[i], "--poses")) poses = 1; else if (!strcmp(argv[i], "--input")) input = 1; }
+  const char *dir = argv[1]; int sem = 0, ver = BMVR_XFER_VERSION, die_after = -1, die_idle = -1, eyes = 1, poses = 0, input = 0, drive = 0;
+  for (int i = 2; i < argc; i++) { if (!strcmp(argv[i], "--sem")) sem = 1; else if (!strcmp(argv[i], "--version")) ver = atoi(argv[++i]); else if (!strcmp(argv[i], "--die-after")) die_after = atoi(argv[++i]); else if (!strcmp(argv[i], "--die-idle-after")) die_idle = atoi(argv[++i]); else if (!strcmp(argv[i], "--eyes")) eyes = atoi(argv[++i]); else if (!strcmp(argv[i], "--poses")) poses = 1; else if (!strcmp(argv[i], "--input")) input = 1; else if (!strcmp(argv[i], "--drive")) { input = 1; drive = 1; } }
   signal(SIGPIPE, SIG_IGN);
   char path[512]; snprintf(path, sizeof path, "%s/%s", dir, BMVR_XFER_SOCKET_NAME);
   struct sockaddr_un sa = { .sun_family = AF_UNIX }; strcpy(sa.sun_path, path); unlink(path);
@@ -53,6 +53,11 @@ int main(int argc, char **argv) {
       a.input.seq = (uint32_t)n + 1; a.input.flags = BMVR_XFER_INPUT_FOCUSED | BMVR_XFER_INPUT_POSE_L | BMVR_XFER_INPUT_POSE_R;
       if (n >= 5) a.input.buttons = BMVR_XFER_BTN_PRIMARY << 8;
       if (n >= 10) a.input.stick[1][1] = 1.0f;
+      if (drive) {   /* --drive: from ack 10 the left stick is full forward, the right trigger and the right stick (turn right) are held; a right squeeze from ack 20 on */
+        a.input.buttons = 0; a.input.stick[1][1] = 0.0f;
+        if (n >= 10) { a.input.stick[0][1] = 1.0f; a.input.trigger[1] = 1.0f; a.input.stick[1][0] = 0.8f; }
+        if (n >= 20) a.input.squeeze[1] = 1.0f;
+      }
       a.input.aim[0][3] = a.input.aim[1][3] = a.input.grip[0][3] = a.input.grip[1][3] = 1.0f;
     }
     T("HELPER ack pose_id=%u", a.pose.pose_id);
@@ -61,3 +66,4 @@ int main(int argc, char **argv) {
     if (die_idle >= 0 && n >= die_idle) { T("HELPER dying idle (after ack %d)", n); _exit(0); }   /* acked, then gone: its GPU signal never arrives */
   }
   T("HELPER end"); return 0; }
+  

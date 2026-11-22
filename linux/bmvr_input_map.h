@@ -113,6 +113,22 @@ static inline int bmvr_im_hyst(int on, float v, float hi, float lo)
     return v >= hi;
 }
 
+/* Walk stick -> forwardmove / sidemove. The stick is relative to where the HEAD looks; the cmd is relative to the game's yaw.
+ * head_delta_deg = how far the head yaw is from the game yaw, in Source degrees (positive = head turned LEFT, same sign as
+ * CUserCmd::viewangles[1]). Rotates the (forward, side) stick vector into the game's frame and scales it by max_speed
+ * (Source cl_forwardspeed, 450). Pure: no state, NULL outputs are skipped. */
+static inline void bmvr_im_move_relative(float forward, float side, float head_delta_deg, float max_speed, float *fwd_out, float *side_out)
+{
+    const float r = head_delta_deg * (3.14159265358979f / 180.0f);
+    const float cs = cosf(r), sn = sinf(r);
+    float f = forward * cs + side * sn;       /* along the game's forward */
+    float s = side * cs - forward * sn;       /* along the game's right */
+    const float len = sqrtf(f * f + s * s);
+    if (len > 1.0f) { f /= len; s /= len; }
+    if (fwd_out) *fwd_out = f * max_speed;
+    if (side_out) *side_out = s * max_speed;
+}
+
 /* One step per game tick. dt_ms: time since the previous step. `in` may be NULL or unfocused: everything is released (and an open wheel
  * is cancelled, not selected). */
 static inline void bmvr_input_map_step(struct bmvr_input_map *m, const struct bmvr_xfer_input *in, float dt_ms, struct bmvr_cmd *out)

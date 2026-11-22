@@ -13,6 +13,18 @@ static float vgf(const CVS &v, unsigned o) { float f; memcpy(&f, v.raw + o, 4); 
 static void vsi(CVS &v, unsigned o, int i) { memcpy(v.raw + o, &i, 4); }
 struct IViewRender { virtual void Init() {} virtual void LevelInit() {} virtual void LevelShutdown() {} virtual void Shutdown() {} virtual void OnRenderStart() {} virtual void Render() {}
                      virtual void RenderView(const CVS &v, int clear, int what) = 0; virtual void Tail() {} };
+// FAKE_INPUT=1: every gameplay frame the "engine" fills a CUserCmd from the keyboard (here: one button bit) and calls IClientMode::CreateMove through the
+// vtable, like CInput does. ClientModeShared has the layout of the Linux build: a virtual destructor (two slots) and 20 virtuals before CreateMove = slot 22.
+// FAKE_INPUT_BADCMD=1 passes a pointer to junk instead of a CUserCmd (a wrong slot would see exactly that).
+struct FUserCmd { virtual ~FUserCmd() {} int command_number = 0, tick_count = 0; float viewangles[3] = {0,0,0}; float forwardmove = 0, sidemove = 0, upmove = 0; int buttons = 0;
+                  unsigned char impulse = 0; int weaponselect = 0, weaponsubtype = 0, random_seed = 0; short mousedx = 0, mousedy = 0; bool hasbeenpredicted = false; };
+struct IClientMode { virtual ~IClientMode() {}
+  virtual void f0() {} virtual void f1() {} virtual void f2() {} virtual void f3() {} virtual void f4() {} virtual void f5() {} virtual void f6() {} virtual void f7() {} virtual void f8() {} virtual void f9() {}
+  virtual void f10() {} virtual void f11() {} virtual void f12() {} virtual void f13() {} virtual void f14() {} virtual void f15() {} virtual void f16() {} virtual void f17() {} virtual void f18() {} virtual void f19() {}
+  virtual bool CreateMove(float flInputSampleTime, FUserCmd *cmd) = 0; };
+static int g_cm_calls;
+struct ClientModeShared : IClientMode { bool CreateMove(float, FUserCmd *c) override { g_cm_calls++; c->buttons |= 0x10000; c->tick_count = c->command_number; return true; } };
+__attribute__((noinline)) static IClientMode *make_client_mode() { return new ClientModeShared(); }
 static unsigned char g_main_raw[0x148];   // the engine builds nested views (water) from its own state, not from the view it was handed
 static IDirect3DDevice9 *g_dev; static IDirect3DSurface9 *g_back; static IDirect3DTexture9 *g_tx[5]; static int g_switches = 60, g_nest;
 #ifndef VR_CLASS_NAME
@@ -46,6 +58,8 @@ int main(int argc, char **argv) {
   for (int i = 0; i < 5; i++) if (skip_rt && !strcmp(skip_rt, rts[i].n)) skip_idx = i;
   int violations = 0; g_dev = dev; g_back = back; for (int i = 0; i < 5; i++) g_tx[i] = tx[i];
   IViewRender *vr = make_view_render(); const bool stereo = getenv("FAKE_STEREO") != 0;
+  const bool input = getenv("FAKE_INPUT") != 0; IClientMode *cmode = make_client_mode(); FUserCmd fu; unsigned char junk[256]; memset(junk, 0xAB, sizeof junk);
+  int cm_n = 0, cm_move = 0, cm_attack = 0, cm_kbd_lost = 0, cm_imp100 = 0, cm_turned = 0, cm_after_bad = 0; float cm_maxfwd = 0, cm_minyaw = 0;
   CVS main_view; memset(&main_view, 0, sizeof main_view);
   if (getenv("FAKE_BAD_VIEW")) vsf(main_view,0xB4,5); // FAKE_BAD_VIEW: not a CViewSetup-looking view
   vsi(main_view,0x10,3840); vsi(main_view,0x18,2160); if (!getenv("FAKE_BAD_VIEW")) vsf(main_view,0xB4,90); vsf(main_view,0xE8,16.0f/9); vsf(main_view,0xD4,7); vsf(main_view,0xD8,30000);
@@ -61,12 +75,22 @@ int main(int argc, char **argv) {
       }
       dev->SetRenderTarget(0, back); dev->DrawPrimitive(PT0, 0, 1);
     }
+    if (input && f >= loading && f < loading + play) {
+      fu = FUserCmd(); fu.command_number = ++cm_n; fu.viewangles[1] = 10.0f;
+      if (getenv("FAKE_INPUT_BADCMD")) { cmode->CreateMove(0.011f, (FUserCmd *)junk); }
+      else {
+        cmode->CreateMove(0.011f, &fu);
+        if (fu.forwardmove > 1.0f) cm_move++; if (fu.forwardmove > cm_maxfwd) cm_maxfwd = fu.forwardmove; if (fu.buttons & 1) cm_attack++;
+        if (!(fu.buttons & 0x10000)) cm_kbd_lost++; if (fu.impulse == 100) cm_imp100++; if (fu.viewangles[1] < 10.0f) cm_turned++; if (fu.viewangles[1] < cm_minyaw || cm_minyaw == 0) cm_minyaw = fu.viewangles[1];
+      }
+    }
     unsigned dr = mock_draw();               // the lazily bound FBO must stay as ToGL left it (the shim reads it to learn the target)
     mock_set_state(dr, 8, 9, 10, 1);         // everything else the engine has bound must survive the shim's work inside Present
     dev->Present(0, 0, 0, 0);
     if (!mock_state_ok(dr, 8, 9, 10, 1)) violations++;
     if (f % 4 == 0) usleep(200);
   }
+  if (input) printf("CM calls=%d cmds=%d moved=%d maxfwd=%.1f attack=%d kbd_lost=%d impulse100=%d turned=%d minyaw=%.2f\n", g_cm_calls, cm_n, cm_move, cm_maxfwd, cm_attack, cm_kbd_lost, cm_imp100, cm_turned, cm_minyaw);
   printf("GAME done: frames=%d gl_state_violations=%d\n", loading + play + tail, violations);
   return violations ? 1 : 0;
 }

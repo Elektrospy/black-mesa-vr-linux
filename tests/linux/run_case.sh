@@ -10,6 +10,7 @@ envs=("$@")
 D=$B/cases/$name; rm -rf "$D"; mkdir -p "$D"
 cp "$B/${FAKE_BIN:-fake_game}" "$D/fake_game"; cp "$B/libtogl.so" "$B/libSDL2-2.0.so.0" "$D/"
 [ -n "${PRE_FLAG:-}" ] && : > "$D/bmvr_in_stereo.flag"   # T29: a previous launch died with stereo active
+[ -n "${PRE_FLAG_INPUT:-}" ] && : > "$D/bmvr_in_input.flag"   # a previous launch died with controller input active
 [ -n "$cfg" ] && printf '%b' "$cfg" > "$D/bmvr_target.txt"
 export MOCK_TRACE="$D/trace.txt"; : > "$MOCK_TRACE"
 ( cd "$D" && "$B/mock_helper" "$D" "${helper_args[@]}" > helper.out 2>&1 ) &
