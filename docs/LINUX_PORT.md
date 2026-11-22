@@ -716,3 +716,15 @@ right controller and hands/viewmodel.
 **Options:** a `bmvr_input.txt` next to `bmvr_target.txt` (`turn=smooth|snap`, `turn_speed=`, `move_hand=left|right`, `weapon_hand=right|left`,
 deadzone, button map) is planned with slice 3. In-game options (Black Mesa's options menu or a VR panel) need the engine's UI/cvar hooks, which
 are not ported to Linux; until then the file is the options UI, optionally with console cvars once a cvar hook exists.
+
+**First headset run of the input channel (2026-11-22, SteamVR 2.19.4):** the channel works end to end (`input: first controller state`, both poses valid,
+aim at about (-0.00 -0.31 -0.45) m in LOCAL space) and stereo ran 3178 pairs with 0 dropped and no silent exits (the automatic `+mat_queue_mode 0` and
+`stereo_hook=inline` defaults held). But SteamVR answered `XR_ERROR_PATH_UNSUPPORTED` to the whole Steam Frame suggestion, so the runtime bound
+`khr/simple_controller` (select/menu only; no sticks, so no `input:` change lines). One path in the list from Valve's page is unknown to this runtime.
+Fix (compiled, not yet run): the helper now probes every binding on its own, logs `Steam Frame profile rejects <path>` for each bad one and suggests the rest.
+Next run: send the helper log; the rejected paths tell which names to correct.
+
+**Second headset run (2026-11-22):** `/interaction_profiles/valve/frame_controller_valve` is now bound by the runtime (18 of 20 accepted). Both sticks arrive
+and change in the shim log. Rejected: `/user/hand/left/input/x/click` and `y/click`: on this controller x/y are on the RIGHT hand (with a/b); the left hand has the d-pad and
+`view`. Remapped (compiled, not run): left primary/secondary = `dpad_down` / `dpad_up`; right x/y = new `BMVR_XFER_BTN_EXTRA1/2`. No trigger/squeeze/button
+change lines were in that log; whether they were pressed is unknown, so triggers, squeeze, bumper and the face buttons are still unconfirmed.

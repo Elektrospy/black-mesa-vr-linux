@@ -118,11 +118,13 @@ struct bmvr_xfer_pose {
 #define BMVR_XFER_INPUT_POSE_L   1u   /* flags: hand 0's aim/grip poses are valid */
 #define BMVR_XFER_INPUT_POSE_R   2u   /* hand 1's */
 #define BMVR_XFER_INPUT_FOCUSED  4u   /* the session has input focus (otherwise all values are zero) */
-#define BMVR_XFER_BTN_PRIMARY    1u   /* per hand, shifted by 8 * hand: right a / left x */
-#define BMVR_XFER_BTN_SECONDARY  2u   /* right b / left y */
+#define BMVR_XFER_BTN_PRIMARY    1u   /* per hand, shifted by 8 * hand: right a / left dpad down */
+#define BMVR_XFER_BTN_SECONDARY  2u   /* right b / left dpad up */
 #define BMVR_XFER_BTN_MENU       4u   /* right menu / left view */
 #define BMVR_XFER_BTN_STICK      8u   /* thumbstick click */
 #define BMVR_XFER_BTN_BUMPER     16u
+#define BMVR_XFER_BTN_EXTRA1     32u  /* right x (the left hand has none) */
+#define BMVR_XFER_BTN_EXTRA2     64u  /* right y */
 struct bmvr_xfer_input {
     uint32_t seq;               /* 0 = no state yet; otherwise increases with every helper poll */
     uint32_t flags;             /* BMVR_XFER_INPUT_* */

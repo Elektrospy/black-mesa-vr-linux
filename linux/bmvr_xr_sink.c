@@ -1284,7 +1284,7 @@ static PFN_vkGetSemaphoreFdKHR vkGetSemaphoreFdKHR_;
 struct sk_input {
     int on;
     XrActionSet set;
-    XrAction stick, trigger, squeeze, bumper, primary, secondary, menu, sclick, grip, aim;
+    XrAction stick, trigger, squeeze, bumper, primary, secondary, extra1, extra2, menu, sclick, grip, aim;
     XrPath hand[2];
     XrSpace grip_sp[2], aim_sp[2];
     pthread_mutex_t mu;
@@ -1391,11 +1391,13 @@ static void sk_input_init(struct bmvr_xr_sink *k)
     in->bumper = sk_in_action(k, "bumper", XR_ACTION_TYPE_BOOLEAN_INPUT);
     in->primary = sk_in_action(k, "primary", XR_ACTION_TYPE_BOOLEAN_INPUT);
     in->secondary = sk_in_action(k, "secondary", XR_ACTION_TYPE_BOOLEAN_INPUT);
+    in->extra1 = sk_in_action(k, "extra1", XR_ACTION_TYPE_BOOLEAN_INPUT);
+    in->extra2 = sk_in_action(k, "extra2", XR_ACTION_TYPE_BOOLEAN_INPUT);
     in->menu = sk_in_action(k, "menu", XR_ACTION_TYPE_BOOLEAN_INPUT);
     in->sclick = sk_in_action(k, "stick_click", XR_ACTION_TYPE_BOOLEAN_INPUT);
     in->grip = sk_in_action(k, "grip_pose", XR_ACTION_TYPE_POSE_INPUT);
     in->aim = sk_in_action(k, "aim_pose", XR_ACTION_TYPE_POSE_INPUT);
-    if (!in->stick || !in->trigger || !in->squeeze || !in->bumper || !in->primary || !in->secondary || !in->menu || !in->sclick || !in->grip || !in->aim) {
+    if (!in->stick || !in->trigger || !in->squeeze || !in->bumper || !in->primary || !in->secondary || !in->extra1 || !in->extra2 || !in->menu || !in->sclick || !in->grip || !in->aim) {
         XLOG("xr-sink: input off: xrCreateAction failed"); return;
     }
     XrActionSuggestedBinding b[48];
@@ -1410,14 +1412,32 @@ static void sk_input_init(struct bmvr_xr_sink *k)
 #define BP(act, suffix) do { snprintf(p, sizeof p, "%s/input/%s", sd[h], suffix); BIND(act, p); } while (0)
             BP(in->trigger, "trigger/value"); BP(in->squeeze, "squeeze/value"); BP(in->stick, "thumbstick"); BP(in->sclick, "thumbstick/click");
             BP(in->bumper, "bumper/click"); BP(in->grip, "grip/pose"); BP(in->aim, "aim/pose");
-            BP(in->primary, h ? "a/click" : "x/click"); BP(in->secondary, h ? "b/click" : "y/click"); BP(in->menu, h ? "menu/click" : "view/click");
+            BP(in->primary, h ? "a/click" : "dpad_down/click"); BP(in->secondary, h ? "b/click" : "dpad_up/click"); BP(in->menu, h ? "menu/click" : "view/click");
+            if (h) { BP(in->extra1, "x/click"); BP(in->extra2, "y/click"); }
 #undef BP
         }
         XrPath prof;
         xrStringToPath_(c->inst, "/interaction_profiles/valve/frame_controller_valve", &prof);
-        XrInteractionProfileSuggestedBinding sb = { .type = XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING, .interactionProfile = prof, .countSuggestedBindings = n, .suggestedBindings = b };
-        XrResult r = xrSuggestInteractionProfileBindings_(c->inst, &sb);
-        XLOG("xr-sink: input: Steam Frame controller bindings %s (%s)", XR_SUCCEEDED(r) ? "suggested" : "REJECTED", xr_rs(c->inst, r));
+        /* One path the runtime does not know rejects the WHOLE suggestion (XR_ERROR_PATH_UNSUPPORTED, seen on SteamVR 2.19.4), so probe each binding
+         * alone (a later call for the same profile replaces the earlier one), log the rejected paths, then suggest only the accepted ones. */
+        XrActionSuggestedBinding good[48];
+        uint32_t ng = 0;
+        for (uint32_t i = 0; i < n; i++) {
+            XrInteractionProfileSuggestedBinding one = { .type = XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING, .interactionProfile = prof, .countSuggestedBindings = 1, .suggestedBindings = &b[i] };
+            XrResult rr = xrSuggestInteractionProfileBindings_(c->inst, &one);
+            if (XR_SUCCEEDED(rr)) good[ng++] = b[i];
+            else {
+                char pn[128] = "?"; uint32_t len = 0;
+                xrPathToString_(c->inst, b[i].binding, sizeof pn, &len, pn);
+                XLOG("xr-sink: input: Steam Frame profile rejects %s (%s)", pn, xr_rs(c->inst, rr));
+            }
+        }
+        XrResult r = XR_ERROR_PATH_UNSUPPORTED;
+        if (ng) {
+            XrInteractionProfileSuggestedBinding sb = { .type = XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING, .interactionProfile = prof, .countSuggestedBindings = ng, .suggestedBindings = good };
+            r = xrSuggestInteractionProfileBindings_(c->inst, &sb);
+        }
+        XLOG("xr-sink: input: Steam Frame controller bindings: %u of %u accepted, %s (%s)", ng, n, XR_SUCCEEDED(r) ? "suggested" : "REJECTED", xr_rs(c->inst, r));
         any |= XR_SUCCEEDED(r);
     } else XLOG("xr-sink: input: the runtime does not offer XR_VALVE_frame_controller_interaction; using the generic profile only");
     {
@@ -1484,7 +1504,8 @@ static void sk_input_poll(struct bmvr_xr_sink *k, XrTime t)
             gi.action = in->trigger; if (XR_SUCCEEDED(xrGetActionStateFloat_(c->sess, &gi, &sf)) && sf.isActive) n.trigger[h] = sf.currentState;
             gi.action = in->squeeze; if (XR_SUCCEEDED(xrGetActionStateFloat_(c->sess, &gi, &sf)) && sf.isActive) n.squeeze[h] = sf.currentState;
             const struct { XrAction a; uint32_t bit; } bt[] = { { in->primary, BMVR_XFER_BTN_PRIMARY }, { in->secondary, BMVR_XFER_BTN_SECONDARY },
-                { in->menu, BMVR_XFER_BTN_MENU }, { in->sclick, BMVR_XFER_BTN_STICK }, { in->bumper, BMVR_XFER_BTN_BUMPER } };
+                { in->menu, BMVR_XFER_BTN_MENU }, { in->sclick, BMVR_XFER_BTN_STICK }, { in->bumper, BMVR_XFER_BTN_BUMPER },
+                { in->extra1, BMVR_XFER_BTN_EXTRA1 }, { in->extra2, BMVR_XFER_BTN_EXTRA2 } };
             for (size_t i = 0; i < sizeof bt / sizeof bt[0]; i++) {
                 gi.action = bt[i].a;
                 if (XR_SUCCEEDED(xrGetActionStateBoolean_(c->sess, &gi, &sb)) && sb.isActive && sb.currentState) n.buttons |= bt[i].bit << (8 * h);
