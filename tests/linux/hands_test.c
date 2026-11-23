@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include "bmvr_hands.h"
 #include "bmvr_stereo.h"
+#include "bmvr_fingers.h"
 
 static int fails, checks;
 #define CHECK(cond, ...) do { checks++; if (!(cond)) { fails++; printf("  FAIL  "); printf(__VA_ARGS__); printf("\n"); } } while (0)
@@ -72,6 +73,31 @@ int main(int argc, char **argv)
     check_asset(dir, "bare_hand_right_model.glb", 1);
     check_asset(dir, "bare_hand_left_model.glb", 0);
 
+    /* finger curls from tracked joints (the SteamVR skeletal input, as XR_EXT_hand_tracking reports it) */
+    {   struct bf_joint j[BF_JOINTS];
+        float cu[5];
+        const int base[5] = { BF_THUMB_METACARPAL, BF_INDEX_METACARPAL, BF_MIDDLE_METACARPAL, BF_RING_METACARPAL, BF_LITTLE_METACARPAL };
+        /* every finger a chain along +X (straight), or turning by `bend` radians per joint (a fist is about 60 deg each) */
+        for (int pass = 0; pass < 3; pass++) {
+            const float bend = pass == 1 ? 1.0472f : 0.0f;
+            memset(j, 0, sizeof j);
+            for (int i = 0; i < BF_JOINTS; i++) j[i].valid = 1;
+            for (int f = 0; f < 5; f++) {
+                float x = 0.0f, y = 0.0f, a = 0.0f;
+                for (int k = 0; k < 5; k++) {
+                    j[base[f] + k].p[0] = x; j[base[f] + k].p[1] = y; j[base[f] + k].p[2] = (float)f * 0.02f;
+                    x += 0.03f * cosf(a); y += 0.03f * sinf(a);
+                    if (k > 0 || f > 0) a += bend;
+                }
+            }
+            if (pass == 2) { j[BF_MIDDLE_METACARPAL + 2].valid = 0; j[BF_RING_METACARPAL].valid = 0; }   /* two fingers lose a joint */
+            const int n = bf_hand_curls(j, 1, cu);
+            if (pass == 0) CHECK(n == 5 && cu[0] < 0.01f && cu[1] < 0.01f && cu[4] < 0.01f, "fingers: a straight hand is open (%d fingers, %.3f %.3f %.3f)", n, cu[0], cu[1], cu[4]);
+            if (pass == 1) CHECK(n == 5 && cu[1] > 0.9f && cu[2] > 0.9f && cu[3] > 0.9f && cu[4] > 0.9f, "fingers: joints bent 60 deg each close the finger (%.3f %.3f %.3f %.3f)", cu[1], cu[2], cu[3], cu[4]);
+            if (pass == 2) CHECK(n == 3 && cu[2] == 0.0f && cu[3] == 0.0f && cu[1] == 0.0f, "fingers: a finger with an untracked joint is left out (%d usable)", n);
+        }
+        CHECK(bf_hand_curls(j, 0, cu) == 0 && cu[1] == 0.0f, "fingers: an inactive hand gives nothing");
+    }
     /* curls from trigger / grip */
     float c[5];
     bh_curls_from_input(0, 0, c);

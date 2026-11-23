@@ -53,7 +53,7 @@
 #include <stdint.h>
 
 #define BMVR_XFER_SOCKET_NAME "bmvr_xfer.sock"
-#define BMVR_XFER_VERSION 6u
+#define BMVR_XFER_VERSION 7u
 #define BMVR_XFER_MAGIC_HELLO 0x31564d42u /* "BMV1" */
 #define BMVR_XFER_MAGIC_FRAME 0x31524642u /* "BFR1" */
 #define BMVR_XFER_MAGIC_ACK   0x314b4341u /* "ACK1" */
@@ -118,6 +118,8 @@ struct bmvr_xfer_pose {
 #define BMVR_XFER_INPUT_POSE_L   1u   /* flags: hand 0's aim/grip poses are valid */
 #define BMVR_XFER_INPUT_POSE_R   2u   /* hand 1's */
 #define BMVR_XFER_INPUT_FOCUSED  4u   /* the session has input focus (otherwise all values are zero) */
+#define BMVR_XFER_INPUT_FINGERS_L 8u  /* v7: hand 0's finger[] curls come from tracked hand joints (SteamVR skeletal input via XR_EXT_hand_tracking); otherwise they are 0 and the shim bends the fingers from trigger / grip */
+#define BMVR_XFER_INPUT_FINGERS_R 16u /* v7: hand 1's */
 #define BMVR_XFER_BTN_PRIMARY    1u   /* per hand, shifted by 8 * hand: right a / left dpad down */
 #define BMVR_XFER_BTN_SECONDARY  2u   /* right b / left dpad up */
 #define BMVR_XFER_BTN_MENU       4u   /* right menu / left view */
@@ -133,7 +135,8 @@ struct bmvr_xfer_input {
     float trigger[2], squeeze[2];
     float aim[2][7];            /* [hand] pos xyz, quat xyzw */
     float grip[2][7];
-    uint32_t reserved;          /* pads the struct to 160 bytes so struct bmvr_xfer_ack is 272 on both 32- and 64-bit (int64 alignment inside the pose) */
+    float finger[2][5];         /* v7: [hand][thumb, index, middle, ring, pinky], 0 = open, 1 = closed; valid only with BMVR_XFER_INPUT_FINGERS_L / _R */
+    uint32_t reserved;          /* pads the struct to 200 bytes so struct bmvr_xfer_ack is 312 on both 32- and 64-bit (int64 alignment inside the pose) */
 };
 
 struct bmvr_xfer_ack {
@@ -147,8 +150,8 @@ _Static_assert(sizeof(struct bmvr_xfer_hello) == 48, "bmvr_xfer_hello layout dif
 _Static_assert(sizeof(struct bmvr_xfer_frame) == 96, "bmvr_xfer_frame layout");
 _Static_assert(sizeof(struct bmvr_xfer_eye_pose) == 44, "bmvr_xfer_eye_pose layout");
 _Static_assert(sizeof(struct bmvr_xfer_pose) == 104, "bmvr_xfer_pose layout differs between 32/64-bit");
-_Static_assert(sizeof(struct bmvr_xfer_input) == 160, "bmvr_xfer_input layout");
-_Static_assert(sizeof(struct bmvr_xfer_ack) == 112 + 160, "bmvr_xfer_ack layout");
+_Static_assert(sizeof(struct bmvr_xfer_input) == 200, "bmvr_xfer_input layout");
+_Static_assert(sizeof(struct bmvr_xfer_ack) == 112 + 200, "bmvr_xfer_ack layout");
 _Static_assert(offsetof(struct bmvr_xfer_pose, display_time) == 8 && offsetof(struct bmvr_xfer_pose, eye) == 16 && offsetof(struct bmvr_xfer_ack, pose) == 8,
                "pose offsets differ between 32/64-bit (int64 alignment)");
 

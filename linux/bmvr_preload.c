@@ -479,6 +479,8 @@ static int g_ic_armed, g_ic_dead;                  /* defined with their comment
 static int g_hd_want;                              /* hands=1: draw the glove / hand models at the controllers (opt-in; UNVERIFIED in the game) */
 static int g_hd_bare;                              /* hands_model=bare (default: hev) */
 static int g_hd_right;                             /* hands_right=1: also draw the weapon hand */
+static int g_hd_fingers_off;                       /* hands_fingers=off: ignore the runtime's finger tracking (default auto: use it when the helper reports tracked hands, else trigger / grip) */
+static int g_hd_src[2];                            /* last finger source per hand: 0 none yet, 1 tracked, 2 trigger / grip (logged on change) */
 static float g_hd_scale = 0.85f;                   /* hands_scale= (src/bmvr_flags.cpp g_VrHandsModelScale) */
 static float g_hd_roll = 90.0f;                    /* hands_roll= (g_VrHandsRollDeg) */
 static float g_hd_off[3] = { 0.0f, -0.008f, -0.10f };   /* hands_offset=x,y,z in metres, local to the controller (g_VrHandsPoseOff*) */
@@ -617,6 +619,7 @@ static void load_cfg_once(void)
             else if (!strncmp(line, "input_turn_analog=", 18)) g_ic_turn_analog = line[18] != '0';
             else if (!strncmp(line, "hands=", 6)) g_hd_want = line[6] == '1';
             else if (!strncmp(line, "hands_model=", 12)) g_hd_bare = !strcmp(line + 12, "bare");
+            else if (!strncmp(line, "hands_fingers=", 14)) g_hd_fingers_off = !strcmp(line + 14, "off");
             else if (!strncmp(line, "hands_right=", 12)) g_hd_right = line[12] == '1';
             else if (!strncmp(line, "hands_scale=", 12)) { float v = (float)atof(line + 12); if (v >= 0.2f && v <= 3.0f) g_hd_scale = v; else bmvr_log("hands: bad hands_scale=%s (use 0.2..3)", line + 12); }
             else if (!strncmp(line, "hands_roll=", 11)) g_hd_roll = (float)atof(line + 11);
@@ -2033,7 +2036,14 @@ static void hd_draw_eye(unsigned e, const struct captarget *cap, const struct bm
             bmvr_angle_vectors(ang, f, r, u);
             float world[16], pal[BH_MAXJ][16], curls[5];
             bh_controller_world(org, r, u, f, g_st_scale, g_hd_scale, g_hd_off, g_hd_rot, world);
-            bh_curls_from_input(in.trigger[h], in.squeeze[h], curls);
+            const int tracked = !g_hd_fingers_off && (in.flags & (h ? BMVR_XFER_INPUT_FINGERS_R : BMVR_XFER_INPUT_FINGERS_L));
+            if (tracked) for (int i = 0; i < 5; i++) { const float v = in.finger[h][i]; curls[i] = v < 0.0f ? 0.0f : v > 1.0f ? 1.0f : v; }
+            else bh_curls_from_input(in.trigger[h], in.squeeze[h], curls);
+            if (g_hd_src[h] != (tracked ? 1 : 2)) {
+                static int said;
+                g_hd_src[h] = tracked ? 1 : 2;
+                if (said++ < 12) bmvr_log("hands: the %s hand's fingers now come from %s", h ? "right" : "left", tracked ? "the runtime's finger tracking (SteamVR skeletal input via XR_EXT_hand_tracking)" : "trigger and grip (no finger tracking from the helper)");
+            }
             if (!bh_palette(&g_hd.a[h], curls, pal)) continue;
             hgl.UniformMatrix4fv(g_hd.u_world, 1, 1, world);
             hgl.UniformMatrix4fv(g_hd.u_pal, g_hd.a[h].nj, 1, &pal[0][0]);

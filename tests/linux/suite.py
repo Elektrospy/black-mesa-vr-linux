@@ -66,7 +66,7 @@ check('glFinish path used', len(gl(tr,'FINISH'))==nsnap(tr)>=3 and 'exit=0' in e
 
 print('T6  helper speaks the old protocol (v2)')
 log,tr,out,ex=run('t6',['--sem','--version','2'],'sync=sem\n')
-check('mismatch reported with both versions', 'bad hello from helper' in log and 'version 2, want 6' in log)
+check('mismatch reported with both versions', 'bad hello from helper' in log and 'version 2, want 7' in log)
 check('game unaffected', 'gl_state_violations=0' in out and 'exit=0' in ex and nsnap(tr)==0)
 
 print('T7  helper dies in the middle of a semaphore session')
@@ -151,7 +151,7 @@ print('T14 two eyes, sync=sem: a PAIR is one wait, two blits, ONE signal, one fr
 log,tr,out,ex=run('t14',['--sem','--eyes','2'],PAIR+'sync=sem\n')
 n=len(frames(tr))
 check('game ran clean, GL bindings preserved', 'gl_state_violations=0' in out and 'exit=0' in ex)
-check('hello offered 2 images + 2 semaphores (4 fds), protocol v6', 'HELPER hello version=6 caps=1 fds=4 eyes=2' in tr)
+check('hello offered 2 images + 2 semaphores (4 fds), protocol v7', 'HELPER hello version=7 caps=1 fds=4 eyes=2' in tr)
 check('both images imported as GL textures (2 memory imports, 2 semaphore imports)', len([l for l in tr if l.startswith('GL ImportMemoryFd')])==2 and len([l for l in tr if 'ImportSemaphoreFd' in l])==2)
 check('log names both textures', '(eye 0) and' in log and '(eye 1)' in log)
 check('pairs delivered', n>=3, str(n))
@@ -214,7 +214,7 @@ check('semaphores deleted, game kept running with clean GL state', len(gl(tr,'De
 
 print('T18 protocol: other versions and bad eye counts are rejected, the game is unaffected')
 log,tr,out,ex=run('t18a',['--sem','--eyes','2','--version','4'],PAIR+'sync=sem\n')
-check('v4 helper vs v6 shim: both versions named', 'bad hello from helper' in log and 'version 4, want 6' in log and not frames(tr))
+check('v4 helper vs v7 shim: both versions named', 'bad hello from helper' in log and 'version 4, want 7' in log and not frames(tr))
 log,tr,out,ex=run('t18b',['--sem','--eyes','3'],PAIR+'sync=sem\n')
 check('eye_count 3 rejected', 'bad hello from helper' in log and not frames(tr))
 check('game unaffected', 'gl_state_violations=0' in out and 'exit=0' in ex)
@@ -258,7 +258,7 @@ log,tr,out,ex=run('t23',['--poses'],'every=2\n')
 fr=frames(tr)
 check('single-eye frames still carry the pose id', len(fr)>=20 and all(field(l,'eyes')=='1' for l in fr) and max(int(field(l,'pose')) for l in fr)>0 and 'exit=0' in ex, str(len(fr)))
 
-print('T23b protocol v6 input channel: acks carry controller state, the shim logs the first state and every change')
+print('T23b protocol v7 input channel: acks carry controller state, the shim logs the first state and every change')
 log,tr,out,ex=run('t23b',['--eyes','2','--poses','--input'],PAIR+'every=2\n')
 check('first controller state logged with poses valid', 'input: first controller state' in log and 'left pose valid right pose valid' in log)
 check('a button press (right primary) and the stick push are logged as changes', 'buttons L 0 R 0x1' in log and 'stick L (0.00 0.00) R (0.00 1.00)' in log, log[-300:])
@@ -379,6 +379,12 @@ check('right stick turned the view to the right (yaw below the starting 10)', c 
 check('the flashlight squeeze gave exactly one impulse 100', c and c['imp100']==1, str(c))
 check('the Menu button pushed exactly one Escape key press (down, then up) into SDL', tr.count('SDL_PushEvent type=0x300 scancode=41 sym=27')==1 and tr.count('SDL_PushEvent type=0x301 scancode=41 sym=27')==1, tr[-300:])
 check('input flag removed at a clean exit', not os.path.exists(f'{R}/cases/t32/bmvr_in_input.flag'))
+
+print('T37 hands=1 on a GL stand-in without shader entry points: the hands switch themselves off, the stereo pairs keep flowing')
+log,tr,out,ex=run('t37',['--sem','--eyes','2','--poses','--drive'],ST+'sync=sem\nevery=1\nhands=1\nhands_dir='+os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)),'..','..','VR','hands'))+'\n',('FAKE_STEREO=1',),'100 60')
+check('game ran clean, GL bindings preserved', 'gl_state_violations=0' in out and 'exit=0' in ex, log[-500:])
+check('the hands said why they are off (a missing GL entry point), once', log.count('hands: GL entry point') == 1 and 'glCreateShader' in log, log[-500:])
+check('stereo pairs were still delivered', len([l for l in tr if l.startswith('HELPER frame')])>=20)
 
 print('T33 input=1 with the helper offering no input: nothing is written, nothing breaks')
 log,tr,out,ex=run('t33',['--sem'],IN+'sync=sem\nevery=1\n',('FAKE_INPUT=1',),'100 100')

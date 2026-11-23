@@ -782,9 +782,25 @@ The same ripped GLB hands as the Windows mod (`VR/hands/hev_glove_*_model.glb`, 
 - **Config** (`bmvr_target.txt`): `hands=1`; `hands_model=hev|bare` (default hev); `hands_right=1` also draws the weapon hand (default: only the other hand, like the Windows default);
   `hands_scale=0.85`; `hands_roll=90` (glove roll about the controller's forward axis, mirrored per hand); `hands_offset=x,y,z` metres (default 0,-0.008,-0.10);
   `hands_rot=x,y,z` degrees (default 0,180,0); `hands_dir=` (default `<game folder>/VR/hands`). `build-linux.sh` copies `VR/hands` into the game folder.
-- **Fingers** follow the analog trigger (index) and grip (middle, ring, pinky; thumb a little), the Windows OpenXR fallback formulas. No hand tracking, no gun-grip pose.
+- **Fingers** follow the runtime's finger tracking when the helper reports it (see slice 5b below), otherwise the analog trigger (index) and grip (middle, ring, pinky; thumb a little), the Windows OpenXR fallback formulas. No gun-grip pose.
 - **Limits:** drawn OVER the world (own depth buffer; a hand inside a wall still shows); fixed headlight instead of the scene light; the weapon viewmodel is still drawn by the engine where it was.
 - **Not verified:** all GL drawing (shader compile on the real driver, the FBO on the engine's target, restored state, hand placement and size, texture orientation, the flip rule `!xfer_pick_flip`).
   If the log says `hands: ... disabled`, the game is unaffected. `hands: first hand drawn: ...` appears once the first draw ran. Tune with `hands_offset` / `hands_rot` / `hands_scale` first.
 - **Tests:** `tests/linux/hands_test.c` (67 checks): all four GLBs load, PNG decodes, weights and joints are sane, open curls give the bind pose, a fist moves the fingertips and not the palm,
   curls from trigger / grip, controller placement, projection, `pose_world`.
+
+## Stage 5, slice 5b: optional finger tracking (SteamVR skeletal input) with automatic fallback (protocol v7; helper compiles, NOT run on a headset)
+
+- **Where it comes from.** The Linux helper is an OpenXR client, so SteamVR's skeletal input (Index controllers' finger sensors, Vive touch areas) reaches it through `XR_EXT_hand_tracking`:
+  the runtime reports 26 hand joints, driven by the controllers while you hold them. No OpenVR library is linked and no second runtime session is opened.
+- **Helper** (`linux/bmvr_xr_sink.c`): when the runtime offers the extension (and `BMVR_NO_FINGERS` is not set in the helper's environment) it is enabled at instance creation; after the controller actions are
+  attached the helper checks `supportsHandTracking`, creates one hand tracker per hand and, once per frame, locates the joints. `linux/bmvr_fingers.h` turns them into five curls with the Windows helper's formula
+  (`ComputeCurl`: sum of a finger's joint bend angles / 3.2 rad). A hand counts as tracked when the runtime says it is active and at least 4 of 5 fingers have all their joints.
+- **Protocol v7** (`bmvr_xfer.h`): `struct bmvr_xfer_input` grows by `finger[2][5]` (now 200 bytes, the ack 312); `BMVR_XFER_INPUT_FINGERS_L / _R` say per hand whether the curls are valid. The version is 7, so an old shim and
+  a new helper (or the reverse) refuse each other with the usual version message: rebuild both together (`build-linux.sh` does).
+- **Shim** (`bmvr_preload.c`): per hand and per frame, tracked curls when the flag is set, otherwise `bh_curls_from_input` (trigger / grip). Nothing to configure; `hands_fingers=off` forces trigger / grip.
+  `bmvr.log` says `hands: the left hand's fingers now come from ...` when the source changes; the helper log says `fingers: ...` (extension missing, system without hand tracking, tracker refused, hand tracked / not tracked).
+- **Automatic fallback.** Every missing piece (no extension, unsupported system, failed tracker, inactive hand, too few valid joints) simply leaves the flag clear. Nothing is an error, nothing is retried noisily.
+- **Not verified:** that SteamVR's OpenXR runtime reports controller-driven joints on your hardware, that the curls look right on the models (the curl scale is the Windows formula; a fist may need `hands_*` tuning), the
+  helper on a real runtime. `tests/linux/hands_test.c` checks the curl maths with synthetic joints (open, 60-degree fist, missing joints, inactive hand); the stand-in suite passes with protocol 7 (T37: hands=1 on a GL without
+  shader entry points switches itself off cleanly).

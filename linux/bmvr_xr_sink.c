@@ -34,6 +34,7 @@
 #include "bmvr_pose_store.h"
 #include "bmvr_xfer.h"
 #include "bmvr_xr_sink.h"
+#include "bmvr_fingers.h"
 
 #define XLOG(...) do { fprintf(stderr, "[xr] " __VA_ARGS__); fputc('\n', stderr); } while (0)
 
@@ -139,6 +140,7 @@ static int vk_ver_minor_key(uint32_t v) { return (int)(VK_API_VERSION_MAJOR(v) *
 /* ------------------------------------------------------------------ the probe */
 struct ctx {
     int has_valve_ctrl;   /* XR_VALVE_frame_controller_interaction was offered and enabled (Steam Frame controllers) */
+    int has_hand_tracking; /* XR_EXT_hand_tracking was offered and enabled (finger curls from the runtime's skeletal input) */
     void *xr_lib, *vk_lib;
     XrInstance inst;
     XrSystemId sys;
@@ -643,13 +645,17 @@ static int st_open(struct st *s, int want_w, int want_h, int require_memfd, int 
     for (uint32_t i = 0; i < next; i++) {
         if (!strcmp(ext[i].extensionName, XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME)) has_enable2 = 1;
         if (!strcmp(ext[i].extensionName, "XR_VALVE_frame_controller_interaction")) c->has_valve_ctrl = 1;
+        if (!strcmp(ext[i].extensionName, XR_EXT_HAND_TRACKING_EXTENSION_NAME) && !getenv("BMVR_NO_FINGERS")) c->has_hand_tracking = 1;
     }
     free(ext);
     ledger("XR_KHR_vulkan_enable2", has_enable2, 1, has_enable2 ? "offered" : "NOT offered by this runtime");
     if (!has_enable2) return 1;
 
-    const char *want_ext[] = { XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME, "XR_VALVE_frame_controller_interaction" };
-    XrInstanceCreateInfo ici = { .type = XR_TYPE_INSTANCE_CREATE_INFO, .enabledExtensionCount = c->has_valve_ctrl ? 2u : 1u, .enabledExtensionNames = want_ext };
+    const char *want_ext[3] = { XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME };
+    uint32_t nwant = 1;
+    if (c->has_valve_ctrl) want_ext[nwant++] = "XR_VALVE_frame_controller_interaction";
+    if (c->has_hand_tracking) want_ext[nwant++] = XR_EXT_HAND_TRACKING_EXTENSION_NAME;
+    XrInstanceCreateInfo ici = { .type = XR_TYPE_INSTANCE_CREATE_INFO, .enabledExtensionCount = nwant, .enabledExtensionNames = want_ext };
     snprintf(ici.applicationInfo.applicationName, sizeof ici.applicationInfo.applicationName, "bmvr_xfer_helper");
     ici.applicationInfo.applicationVersion = 1;
     snprintf(ici.applicationInfo.engineName, sizeof ici.applicationInfo.engineName, "bmvr");
@@ -1291,6 +1297,9 @@ struct sk_input {
     struct bmvr_xfer_input cur;
     uint32_t seq;
     int logged_profile;
+    XrHandTrackerEXT tracker[2];   /* v7: XR_EXT_hand_tracking (the runtime's skeletal input); XR_NULL_HANDLE = not available, the shim falls back to trigger / grip */
+    int finger_state[2];           /* 0 not seen yet, 1 tracked, 2 not tracked (logged on change) */
+    int fingers_on;
 };
 
 struct bmvr_xr_sink {
@@ -1357,6 +1366,13 @@ static PFN_xrCreateActionSpace xrCreateActionSpace_;
 static PFN_xrLocateSpace xrLocateSpace_;
 static PFN_xrGetCurrentInteractionProfile xrGetCurrentInteractionProfile_;
 static PFN_xrPathToString xrPathToString_;
+static PFN_xrCreateHandTrackerEXT xrCreateHandTrackerEXT_;
+static PFN_xrLocateHandJointsEXT xrLocateHandJointsEXT_;
+
+/* bmvr_fingers.h numbers its joints itself: they must be XrHandJointEXT's */
+_Static_assert(BF_JOINTS == XR_HAND_JOINT_COUNT_EXT && BF_THUMB_METACARPAL == XR_HAND_JOINT_THUMB_METACARPAL_EXT && BF_INDEX_METACARPAL == XR_HAND_JOINT_INDEX_METACARPAL_EXT &&
+               BF_MIDDLE_METACARPAL == XR_HAND_JOINT_MIDDLE_METACARPAL_EXT && BF_RING_METACARPAL == XR_HAND_JOINT_RING_METACARPAL_EXT &&
+               BF_LITTLE_METACARPAL == XR_HAND_JOINT_LITTLE_METACARPAL_EXT, "bmvr_fingers.h joint numbers differ from XrHandJointEXT");
 
 static XrAction sk_in_action(struct bmvr_xr_sink *k, const char *name, XrActionType t)
 {
@@ -1468,6 +1484,28 @@ static void sk_input_init(struct bmvr_xr_sink *k)
     if (XR_FAILED(r)) { XLOG("xr-sink: input off: xrAttachSessionActionSets: %s", xr_rs(c->inst, r)); return; }
     in->on = 1;
     XLOG("xr-sink: input: controller actions attached (v6 input channel offered)");
+
+    /* v7, optional: finger curls from the runtime's skeletal input (XR_EXT_hand_tracking). Every failure below leaves the trigger / grip curls to the shim. */
+    if (!c->has_hand_tracking) {
+        XLOG("xr-sink: fingers: %s; the fingers follow trigger and grip", getenv("BMVR_NO_FINGERS") ? "switched off (BMVR_NO_FINGERS)" : "the runtime does not offer XR_EXT_hand_tracking");
+        return;
+    }
+    xrGetInstanceProcAddr_(c->inst, "xrCreateHandTrackerEXT", (PFN_xrVoidFunction *)&xrCreateHandTrackerEXT_);
+    xrGetInstanceProcAddr_(c->inst, "xrLocateHandJointsEXT", (PFN_xrVoidFunction *)&xrLocateHandJointsEXT_);
+    if (!xrCreateHandTrackerEXT_ || !xrLocateHandJointsEXT_) { XLOG("xr-sink: fingers: the runtime lists XR_EXT_hand_tracking but not its functions; the fingers follow trigger and grip"); return; }
+    XrSystemHandTrackingPropertiesEXT htp = { .type = XR_TYPE_SYSTEM_HAND_TRACKING_PROPERTIES_EXT };
+    XrSystemProperties sp = { .type = XR_TYPE_SYSTEM_PROPERTIES, .next = &htp };
+    if (XR_FAILED(xrGetSystemProperties_(c->inst, c->sys, &sp)) || !htp.supportsHandTracking) {
+        XLOG("xr-sink: fingers: this system does not support hand tracking; the fingers follow trigger and grip");
+        return;
+    }
+    for (int h = 0; h < 2; h++) {
+        XrHandTrackerCreateInfoEXT hi = { .type = XR_TYPE_HAND_TRACKER_CREATE_INFO_EXT, .hand = h ? XR_HAND_RIGHT_EXT : XR_HAND_LEFT_EXT, .handJointSet = XR_HAND_JOINT_SET_DEFAULT_EXT };
+        XrResult hr = xrCreateHandTrackerEXT_(c->sess, &hi, &in->tracker[h]);
+        if (XR_FAILED(hr)) { in->tracker[h] = XR_NULL_HANDLE; XLOG("xr-sink: fingers: no hand tracker for the %s hand (%s)", h ? "right" : "left", xr_rs(c->inst, hr)); }
+        else in->fingers_on = 1;
+    }
+    if (in->fingers_on) XLOG("xr-sink: fingers: hand trackers created; fingers come from the runtime's skeletal input while it reports tracked hands, otherwise from trigger and grip");
 }
 
 static void sk_in_pose(struct bmvr_xr_sink *k, XrSpace sp, XrTime t, float out[7], int *valid)
@@ -1516,6 +1554,30 @@ static void sk_input_poll(struct bmvr_xr_sink *k, XrTime t)
                 sk_in_pose(k, in->grip_sp[h], t, n.grip[h], &vg);
             }
             if (va && vg) n.flags |= h ? BMVR_XFER_INPUT_POSE_R : BMVR_XFER_INPUT_POSE_L;
+            if (in->tracker[h] && k->world_space) {
+                XrHandJointLocationEXT jl[XR_HAND_JOINT_COUNT_EXT];
+                XrHandJointLocationsEXT loc = { .type = XR_TYPE_HAND_JOINT_LOCATIONS_EXT, .jointCount = XR_HAND_JOINT_COUNT_EXT, .jointLocations = jl };
+                XrHandJointsLocateInfoEXT li = { .type = XR_TYPE_HAND_JOINTS_LOCATE_INFO_EXT, .baseSpace = k->world_space, .time = t };
+                int tracked = 0;
+                if (XR_SUCCEEDED(xrLocateHandJointsEXT_(in->tracker[h], &li, &loc)) && loc.isActive) {
+                    struct bf_joint bj[BF_JOINTS];
+                    float cu[5];
+                    for (int i = 0; i < BF_JOINTS; i++) {
+                        bj[i].p[0] = jl[i].pose.position.x; bj[i].p[1] = jl[i].pose.position.y; bj[i].p[2] = jl[i].pose.position.z;
+                        bj[i].valid = (jl[i].locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) != 0;
+                    }
+                    if (bf_hand_curls(bj, 1, cu) >= 4) {
+                        for (int i = 0; i < 5; i++) n.finger[h][i] = cu[i];
+                        n.flags |= h ? BMVR_XFER_INPUT_FINGERS_R : BMVR_XFER_INPUT_FINGERS_L;
+                        tracked = 1;
+                    }
+                }
+                if (in->finger_state[h] != (tracked ? 1 : 2) && (in->finger_state[h] != 0 || tracked)) {
+                    static int said;
+                    if (said++ < 12) XLOG("xr-sink: fingers: the %s hand is %s", h ? "right" : "left", tracked ? "tracked by the runtime: finger curls come from its skeletal input" : "not tracked (or its fingers are not): trigger / grip curls are used");
+                }
+                if (tracked || in->finger_state[h] != 0) in->finger_state[h] = tracked ? 1 : 2;
+            }
         }
         if (!in->logged_profile) {
             XrInteractionProfileState ps = { .type = XR_TYPE_INTERACTION_PROFILE_STATE };
