@@ -1,3 +1,4 @@
+#include <math.h>
 // Stand-in for the engine: some "loading" frames (only Present), then "gameplay" frames with many SetRenderTarget(0)
 // switches ending on the back buffer, like the real game (~400 per frame; fewer here).
 #include "decls.h"
@@ -28,6 +29,14 @@ struct ClientModeShared : IClientMode { bool CreateMove(float, FUserCmd *c) over
 struct ClientModeBMSNormal : ClientModeShared { void f3() override {} };
 struct ClientModeOwn : ClientModeShared { bool CreateMove(float t, FUserCmd *c) override { return ClientModeShared::CreateMove(t, c); } };   // overrides and calls the base directly
 __attribute__((noinline)) static IClientMode *make_client_mode() { const char *d = getenv("FAKE_INPUT_DERIVED"); if (d && d[0] == '2') return new ClientModeOwn(); if (d) return new ClientModeBMSNormal(); return new ClientModeShared(); }
+// FAKE_VM=1: every gameplay frame the "engine" calls C_BlackMesaViewModel::CalcViewModelView(owner, eyePosition, eyeAngles) through the vtable with a slowly moving
+// eye (2 destructor slots + 22 virtuals before it = slot 24; the test sets vm_slot=24) and records what the function RECEIVED: a placed viewmodel differs from what was sent.
+#define VSTUB(n) virtual void vs##n() {}
+struct C_BaseViewModel { virtual ~C_BaseViewModel() {} VSTUB(0) VSTUB(1) VSTUB(2) VSTUB(3) VSTUB(4) VSTUB(5) VSTUB(6) VSTUB(7) VSTUB(8) VSTUB(9) VSTUB(10) VSTUB(11) VSTUB(12) VSTUB(13) VSTUB(14) VSTUB(15) VSTUB(16) VSTUB(17) VSTUB(18) VSTUB(19) VSTUB(20) VSTUB(21)
+  virtual void CalcViewModelView(void *owner, const float *eyePosition, const float *eyeAngles) = 0; };
+static int g_vm_fcalls; static float g_vm_got[3];
+struct C_BlackMesaViewModel : C_BaseViewModel { void CalcViewModelView(void *, const float *p, const float *) override { g_vm_fcalls++; g_vm_got[0] = p[0]; g_vm_got[1] = p[1]; g_vm_got[2] = p[2]; } };
+__attribute__((noinline)) static C_BaseViewModel *make_viewmodel() { return new C_BlackMesaViewModel(); }
 static unsigned char g_main_raw[0x148];   // the engine builds nested views (water) from its own state, not from the view it was handed
 static IDirect3DDevice9 *g_dev; static IDirect3DSurface9 *g_back; static IDirect3DTexture9 *g_tx[5]; static int g_switches = 60, g_nest;
 #ifndef VR_CLASS_NAME
@@ -63,12 +72,18 @@ int main(int argc, char **argv) {
   IViewRender *vr = make_view_render(); const bool stereo = getenv("FAKE_STEREO") != 0;
   const bool input = getenv("FAKE_INPUT") != 0; IClientMode *cmode = make_client_mode(); FUserCmd fu; unsigned char junk[256]; memset(junk, 0xAB, sizeof junk);
   int cm_n = 0, cm_move = 0, cm_attack = 0, cm_kbd_lost = 0, cm_imp100 = 0, cm_turned = 0, cm_after_bad = 0; float cm_maxfwd = 0, cm_minyaw = 0;
+  const bool vmtest = getenv("FAKE_VM") != 0; C_BaseViewModel *vmod = make_viewmodel(); int vm_n = 0, vm_moved = 0; char vm_owner[16] = {0};
   CVS main_view; memset(&main_view, 0, sizeof main_view);
   if (getenv("FAKE_BAD_VIEW")) vsf(main_view,0xB4,5); // FAKE_BAD_VIEW: not a CViewSetup-looking view
   vsi(main_view,0x10,3840); vsi(main_view,0x18,2160); if (!getenv("FAKE_BAD_VIEW")) vsf(main_view,0xB4,90); vsf(main_view,0xE8,16.0f/9); vsf(main_view,0xD4,7); vsf(main_view,0xD8,30000);
   vsf(main_view,0xBC,100); vsf(main_view,0xC0,200); vsf(main_view,0xC4,50); vsf(main_view,0xCC,45);
   memcpy(g_main_raw, main_view.raw, sizeof g_main_raw);
   for (int f = 0; f < loading + play + tail; f++) {
+    if (vmtest && f >= loading && f < loading + play) {
+      const float sp[3] = { 100.0f + 0.1f * (float)f, 200.0f, 60.0f }, sa[3] = { 0.0f, 10.0f, 0.0f };
+      vmod->CalcViewModelView(vm_owner, sp, sa); vm_n++;
+      if (fabsf(g_vm_got[0] - sp[0]) > 0.01f || fabsf(g_vm_got[1] - sp[1]) > 0.01f || fabsf(g_vm_got[2] - sp[2]) > 0.01f) vm_moved++;
+    }
     if (f >= loading && f < loading + play && stereo) { vr->RenderView(main_view, 7, 3); }
     else if (f >= loading && f < loading + play) {   // the tail is a second loading screen: Present only
       for (int k = 0; k < switches; k++) {
@@ -94,6 +109,7 @@ int main(int argc, char **argv) {
     if (f % 4 == 0) usleep(200);
   }
   if (input) printf("CM calls=%d cmds=%d moved=%d maxfwd=%.1f attack=%d kbd_lost=%d impulse100=%d turned=%d minyaw=%.2f\n", g_cm_calls, cm_n, cm_move, cm_maxfwd, cm_attack, cm_kbd_lost, cm_imp100, cm_turned, cm_minyaw);
+  if (vmtest) printf("VM calls=%d sent=%d moved=%d\n", g_vm_fcalls, vm_n, vm_moved);
   printf("GAME done: frames=%d gl_state_violations=%d\n", loading + play + tail, violations);
   return violations ? 1 : 0;
 }

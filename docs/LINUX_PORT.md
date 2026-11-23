@@ -781,7 +781,7 @@ The same ripped GLB hands as the Windows mod (`VR/hands/hev_glove_*_model.glb`, 
   (GPU skinning, 32 joint matrices) into the eye's target through a private FBO, then restores every piece of GL state it touched. The helper receives eyes that already hold the hands.
 - **Config** (`bmvr_target.txt`): `hands=1`; `hands_model=hev|bare` (default hev); `hands_right=1` also draws the weapon hand (default: only the other hand, like the Windows default);
   `hands_scale=0.85`; `hands_roll=90` (glove roll about the controller's forward axis, mirrored per hand); `hands_offset=x,y,z` metres (default 0,-0.008,-0.10);
-  `hands_rot=x,y,z` degrees (default 0,180,0); `hands_dir=` (default `<game folder>/VR/hands`). `build-linux.sh` copies `VR/hands` into the game folder.
+  `hands_rot=x,y,z` degrees (default 0,270,0 on Linux; the Windows build's 0,180,0 left the glove 90 degrees about the palm normal toward the thumb on the Steam Frame controllers); `hands_dir=` (default `<game folder>/VR/hands`). `build-linux.sh` copies `VR/hands` into the game folder.
 - **Fingers** follow the runtime's finger tracking when the helper reports it (see slice 5b below), otherwise the analog trigger (index) and grip (middle, ring, pinky; thumb a little), the Windows OpenXR fallback formulas. No gun-grip pose.
 - **Limits:** drawn OVER the world (own depth buffer; a hand inside a wall still shows); fixed headlight instead of the scene light; the weapon viewmodel is still drawn by the engine where it was.
 - **Not verified:** all GL drawing (shader compile on the real driver, the FBO on the engine's target, restored state, hand placement and size, texture orientation, the flip rule `!xfer_pick_flip`).
@@ -804,3 +804,23 @@ The same ripped GLB hands as the Windows mod (`VR/hands/hev_glove_*_model.glb`, 
 - **Not verified:** that SteamVR's OpenXR runtime reports controller-driven joints on your hardware, that the curls look right on the models (the curl scale is the Windows formula; a fist may need `hands_*` tuning), the
   helper on a real runtime. `tests/linux/hands_test.c` checks the curl maths with synthetic joints (open, 60-degree fist, missing joints, inactive hand); the stand-in suite passes with protocol 7 (T37: hands=1 on a GL without
   shader entry points switches itself off cleanly).
+
+
+## Weapon viewmodel at the controller, live-tunable hands (stand-in tested only; UNVERIFIED in the game)
+
+- `viewmodel=1` hooks `C_BlackMesaViewModel::CalcViewModelView(owner, eyePosition, eyeAngles)` (`vm_slot=` default 231: Windows 230, plus the Linux
+  vtable's extra destructor slot; `vm_module=` default `/client.so`, `vm_class=` default `C_BlackMesaViewModel`). It watches first and substitutes only after
+  30 consecutive calls with a plausible, smoothly moving eye position and angles (same scheme as CreateMove); a call that later stops looking right three times
+  in a row switches it off for the launch. A crash leaves `bmvr_in_viewmodel.flag`, and the next launch runs without it once.
+- The substitute eye: angles = the weapon controller's AIM pose (+ `vm_rot=pitch,yaw,roll`), position = the GRIP pose position minus
+  `vm_offset=fwd,right,up` (Source units, default 16,3,-2) along those angles. `vm_offset` is where the gun sits relative to the eye in the engine's own
+  placement; if the gun floats in front of / behind / beside the hand, change it. Math: `linux/bmvr_viewmodel.h`, `tests/linux/viewmodel_test.c`.
+- Live tuning: `hands_scale`, `hands_roll`, `hands_offset`, `hands_rot`, `hands_right`, `vm_offset` and `vm_rot` are re-read when `bmvr_target.txt` changes
+  while the game runs (`config: applied '...'` in the log). No restart needed.
+- Not done: the viewmodel FOV (the gun is still drawn with the engine's viewmodel projection), per-weapon offsets, and re-applying the origin after the original runs.
+
+- **Slot search (`vm_probe=N`, default 8):** the first real-game log showed `vm_slot=231` was never called. With `vm_probe` the shim puts transparent probes
+  (`linux/bmvr_probe.h`: a thunk that ends in a plain `jmp` to the original, so any function shape, including struct and float returns, is untouched; run for real
+  in `tests/linux/probe_test.c`) on slots `vm_slot-N .. vm_slot+N`, watches which one is called as `(this, owner, eye position, eye angles)` 30 times in a row,
+  removes the probes and hooks that slot for real. The log prints `probing found it: slot X` (then set `vm_slot=X vm_probe=0`), or, every 600 frames,
+  `probe slot X: N calls, M plausible` for every probed slot that was called. 32-bit build only.

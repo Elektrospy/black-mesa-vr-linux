@@ -410,6 +410,44 @@ del os.environ['PRE_FLAG_INPUT']
 c=cm(out) or {}
 check('crash-sticky flag present at start: input OFF for this launch, flag consumed', 'bmvr_in_input.flag exists' in log and 'hooked 16' not in log and c and c['moved']==0 and not os.path.exists(f'{R}/cases/t35d/bmvr_in_input.flag'), str(c))
 
+print('T38 viewmodel=1: the hook watches CalcViewModelView first, then the gun is placed at the weapon controller')
+VMC=ST.replace('stereo_module=exe','stereo_module=exe\nviewmodel=1\nvm_module=exe\nvm_slot=24\nvm_probe=0')
+def vmo(out):
+    m=re.search(r'VM calls=(\d+) sent=(\d+) moved=(\d+)', out)
+    return dict(zip(['calls','sent','moved'],[int(x) for x in m.groups()])) if m else None
+log,tr,out,ex=run('t38',['--sem','--eyes','2','--poses','--drive'],VMC+'sync=sem\nevery=1\n',('FAKE_STEREO=1','FAKE_VM=1'),'100 200')
+v=vmo(out) or {}
+check('game clean, class found by RTTI alone, slot 24 hooked, watching only at first', 'gl_state_violations=0' in out and 'exit=0' in ex and 'RTTI 20C_BlackMesaViewModel' in log and 'hooked 20C_BlackMesaViewModel vtable slot 24' in log and 'WATCHING ONLY' in log, log[-700:])
+check('the slot proved itself after 30 plausible calls, and it is logged', 'looks like CalcViewModelView (30 consecutive calls' in log, log[-700:])
+check('every call went through the hook', v and v['calls']==v['sent']==200, str(v))
+check('the first 30 calls were never changed (learning), later ones were substituted', v and 100<=v['moved']<=v['sent']-29, str(v))
+check('the first placement is logged', 'viewmodel: first placement' in log, log[-500:])
+check('viewmodel flag removed at a clean exit', not os.path.exists(f'{R}/cases/t38/bmvr_in_viewmodel.flag'))
+
+print('T39 viewmodel=1 with a wrong slot or class: nothing is changed, and it says why')
+log,tr,out,ex=run('t39a',['--sem','--eyes','2','--poses','--drive'],VMC.replace('vm_slot=24','vm_slot=10')+'sync=sem\nevery=1\n',('FAKE_STEREO=1','FAKE_VM=1'),'100 100')
+v=vmo(out) or {}
+check('slot 10 is never called with those arguments: never armed, no call changed', 'exit=0' in ex and 'looks like CalcViewModelView' not in log and v and v['moved']==0, str(v))
+log,tr,out,ex=run('t39b',['--sem','--eyes','2','--poses','--drive'],VMC.replace('vm_slot=24','vm_slot=500')+'sync=sem\nevery=1\n',('FAKE_STEREO=1','FAKE_VM=1'),'100 40')
+check('slot beyond the vtable: refused, no hook', 'is not executable code' in log and 'hooked 20' not in log and 'exit=0' in ex)
+log,tr,out,ex=run('t39c',['--sem','--eyes','2','--poses','--drive'],VMC+'vm_class=CNoSuchViewModel\nsync=sem\nevery=1\n',('FAKE_STEREO=1','FAKE_VM=1'),'100 40')
+check('unknown class: 0 primary vtables, ViewModel classes listed, no hook', 'has 0 primary vtables' in log and 'C_BlackMesaViewModel' in log and 'exit=0' in ex)
+os.environ['PRE_FLAG_VM']='1'
+log,tr,out,ex=run('t39d',['--sem','--eyes','2','--poses','--drive'],VMC+'sync=sem\nevery=1\n',('FAKE_STEREO=1','FAKE_VM=1'),'100 100')
+del os.environ['PRE_FLAG_VM']
+v=vmo(out) or {}
+check('crash-sticky flag present at start: viewmodel OFF for this launch, flag consumed', 'bmvr_in_viewmodel.flag exists' in log and v and v['moved']==0, str(v))
+
+print('T40 viewmodel=1 with the slot guessed wrong: the probes find CalcViewModelView next to it (32-bit build only)')
+log,tr,out,ex=run('t40',['--sem','--eyes','2','--poses','--drive'],VMC.replace('vm_slot=24\nvm_probe=0','vm_slot=21\nvm_probe=6')+'sync=sem\nevery=1\n',('FAKE_STEREO=1','FAKE_VM=1'),'100 200')
+v=vmo(out) or {}
+if 'only available on the 32-bit build' in log:
+    print('  SKIP  probing needs the 32-bit shim (this run is native); tests/linux/probe_test.c covers the thunk itself')
+else:
+    check('probes installed around the wrong slot, nothing changed while probing', 'PROBING slots 15..27' in log and 'exit=0' in ex and 'gl_state_violations=0' in out, log[-700:])
+    check('slot 24 won, probes removed, then hooked for real and armed', 'probing found it: slot 24' in log and 'hooked 20C_BlackMesaViewModel vtable slot 24' in log and 'looks like CalcViewModelView (30 consecutive calls' in log, log[-900:])
+    check('the gun was placed after that', v and v['calls']==v['sent']==200 and v['moved']>=80, str(v))
+
 print('T36 the game instantiates a SUBCLASS of ClientModeShared (own vtable copy): the base hook sees nothing, the probe finds the subclass')
 log,tr,out,ex=run('t36a',['--sem','--drive'],IN+'sync=sem\nevery=1\n',('FAKE_INPUT=1','FAKE_INPUT_DERIVED=1'),'100 200')
 c=cm(out) or {}

@@ -47,6 +47,10 @@ cc -O2 -Wall -Wextra -std=gnu11 -pthread -I"$ROOT/linux" -o "$B/pose_test" "$T/p
 echo "== stereo math (stage 4b; no GPU, no game)"
 cc -O2 -Wall -Wextra -std=gnu11 -I"$ROOT/linux" -o "$B/stereo_test" "$T/stereo_test.c" -lm
 "$B/stereo_test" | sed 's/^/  /'
+cc -O2 -Wall -Wextra -std=gnu11 -I"$ROOT/linux" -o "$B/viewmodel_test" "$T/viewmodel_test.c" -lm
+"$B/viewmodel_test" | sed 's/^/  /'
+echo "== transparent call probe (a real 32-bit freestanding program; no 32-bit libc needed)"
+if gcc -m32 -O2 -fomit-frame-pointer -ffreestanding -nostdlib -static -fno-pic -no-pie -fno-stack-protector -I"$ROOT/linux" -o "$B/probe_test" "$T/probe_test.c" 2>/dev/null && "$B/probe_test" | sed 's/^/  /'; then :; else echo "  FAIL or skipped: probe_test (needs gcc -m32 and a kernel that runs 32-bit programs)"; fi
 cc -O2 -Wall -Wextra -std=gnu11 -I"$ROOT/linux" -o "$B/inline_test" "$T/inline_test.c"
 "$B/inline_test" | sed 's/^/  /'
 

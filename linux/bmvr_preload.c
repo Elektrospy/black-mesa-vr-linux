@@ -40,6 +40,9 @@
 #include "bmvr_inline.h"
 #include "bmvr_input_map.h"
 #include "bmvr_hands.h"
+#include "bmvr_viewmodel.h"
+#include "bmvr_probe.h"
+#include <sys/stat.h>
 
 /* Portability: this library is loaded into the game, which Steam may run inside an OLDER
  * glibc (Steam Linux Runtime). Built on a modern distro it would require dlsym@GLIBC_2.34
@@ -484,7 +487,16 @@ static int g_hd_src[2];                            /* last finger source per han
 static float g_hd_scale = 0.85f;                   /* hands_scale= (src/bmvr_flags.cpp g_VrHandsModelScale) */
 static float g_hd_roll = 90.0f;                    /* hands_roll= (g_VrHandsRollDeg) */
 static float g_hd_off[3] = { 0.0f, -0.008f, -0.10f };   /* hands_offset=x,y,z in metres, local to the controller (g_VrHandsPoseOff*) */
-static float g_hd_rot[3] = { 0.0f, 180.0f, 0.0f };      /* hands_rot=x,y,z in degrees (g_VrHandsPoseRot*) */
+static float g_hd_rot[3] = { 0.0f, 270.0f, 0.0f };      /* hands_rot=x,y,z in degrees (g_VrHandsPoseRot*). The Windows build uses 0,180,0; on the Steam Frame controllers the glove then
+                                                          * sat 90 degrees about the palm normal toward the thumb, so the Linux default is 0,270,0 (rotating 90 degrees back). Live: edit the file while the game runs. */
+/* The weapon viewmodel at the weapon controller (linux/bmvr_viewmodel.h). Opt-in: viewmodel=1. */
+static int g_vm_want;                              /* viewmodel=1 */
+static char g_vm_module[96] = "/client.so";        /* vm_module= */
+static char g_vm_class[64] = "C_BlackMesaViewModel";   /* vm_class= */
+static int g_vm_probe_n = 8;                       /* vm_probe=N: look for CalcViewModelView in slots vm_slot-N .. vm_slot+N with transparent probes (0 = trust vm_slot= only) */
+static int g_vm_slot = 231;                        /* vm_slot=: CalcViewModelView. Windows build: 230; the Linux vtable has one more destructor slot (CreateMove: 21 -> 22) */
+static float g_vm_off[3] = { 16.0f, 3.0f, -2.0f }; /* vm_offset=fwd,right,up (Source units): where the gun sits relative to the eye in the engine's own placement. Live. */
+static float g_vm_rot[3] = { 0.0f, 0.0f, 0.0f };   /* vm_rot=pitch,yaw,roll (degrees) added to the aim pose. Live. */
 static char g_hd_dir[400];                         /* hands_dir= (default <game folder>/VR/hands) */
 static volatile int g_st_recenter_req;             /* the right stick click asks the stereo rig to recenter on its next frame */
 
@@ -585,6 +597,41 @@ static int flip_value(const char *s, int keep)
 static void parse_flip(const char *s) { g_flip_mode = flip_value(s, g_flip_mode); }
 static void parse_flip2(const char *s) { g_flip2_mode = flip_value(s, g_flip2_mode); }
 
+/* Keys that take effect while the game runs (the file is re-read when its modification time changes). Returns 1 when the line was one of them. */
+static int g_cfg_live_ready;
+static int live_parse_line(const char *line)
+{
+    int hit = 1;
+    if (!strncmp(line, "hands_scale=", 12)) { float v = (float)atof(line + 12); if (v >= 0.2f && v <= 3.0f) g_hd_scale = v; else bmvr_log("hands: bad hands_scale=%s (use 0.2..3)", line + 12); }
+    else if (!strncmp(line, "hands_roll=", 11)) g_hd_roll = (float)atof(line + 11);
+    else if (!strncmp(line, "hands_right=", 12)) g_hd_right = line[12] == '1';
+    else if (!strncmp(line, "hands_offset=", 13)) { float a, b, c; if (sscanf(line + 13, "%f,%f,%f", &a, &b, &c) == 3) { g_hd_off[0] = a; g_hd_off[1] = b; g_hd_off[2] = c; } else bmvr_log("hands: bad hands_offset=%s (use x,y,z metres)", line + 13); }
+    else if (!strncmp(line, "hands_rot=", 10)) { float a, b, c; if (sscanf(line + 10, "%f,%f,%f", &a, &b, &c) == 3) { g_hd_rot[0] = a; g_hd_rot[1] = b; g_hd_rot[2] = c; } else bmvr_log("hands: bad hands_rot=%s (use x,y,z degrees)", line + 10); }
+    else if (!strncmp(line, "vm_offset=", 10)) { float a, b, c; if (sscanf(line + 10, "%f,%f,%f", &a, &b, &c) == 3) { g_vm_off[0] = a; g_vm_off[1] = b; g_vm_off[2] = c; } else bmvr_log("viewmodel: bad vm_offset=%s (use fwd,right,up in Source units)", line + 10); }
+    else if (!strncmp(line, "vm_rot=", 7)) { float a, b, c; if (sscanf(line + 7, "%f,%f,%f", &a, &b, &c) == 3) { g_vm_rot[0] = a; g_vm_rot[1] = b; g_vm_rot[2] = c; } else bmvr_log("viewmodel: bad vm_rot=%s (use pitch,yaw,roll degrees)", line + 7); }
+    else hit = 0;
+    if (hit && g_cfg_live_ready) bmvr_log("config: applied '%s'", line);
+    return hit;
+}
+
+static struct timespec g_cfg_mtime;
+static void cfg_live_poll(void)
+{
+    if (!g_cfg_loaded || (g_x_tick % 30)) return;
+    char dir[400], path[512], line[200];
+    if (!game_dir(dir, sizeof dir)) return;
+    snprintf(path, sizeof path, "%s/bmvr_target.txt", dir);
+    struct stat st;
+    if (stat(path, &st)) return;
+    if (!g_cfg_mtime.tv_sec && !g_cfg_mtime.tv_nsec) { g_cfg_mtime = st.st_mtim; g_cfg_live_ready = 1; return; }
+    if (st.st_mtim.tv_sec == g_cfg_mtime.tv_sec && st.st_mtim.tv_nsec == g_cfg_mtime.tv_nsec) return;
+    g_cfg_mtime = st.st_mtim;
+    FILE *f = fopen(path, "r");
+    if (!f) return;
+    while (fgets(line, sizeof line, f)) { trim_eol(line); if (line[0] && line[0] != '#') live_parse_line(line); }
+    fclose(f);
+}
+
 static void load_cfg_once(void)
 {
     if (g_cfg_loaded) return;
@@ -620,14 +667,19 @@ static void load_cfg_once(void)
             else if (!strncmp(line, "input_module=", 13)) snprintf(g_ic_module, sizeof g_ic_module, "%.95s", line + 13);
             else if (!strncmp(line, "input_class=", 12)) { snprintf(g_ic_class, sizeof g_ic_class, "%.63s", line + 12); g_ic_class_explicit = 1; }
             else if (!strncmp(line, "input_turn_analog=", 18)) g_ic_turn_analog = line[18] != '0';
+            else if (live_parse_line(line)) { }
+            else if (!strncmp(line, "viewmodel=", 10)) g_vm_want = line[10] == '1';
+            else if (!strncmp(line, "vm_module=", 10)) snprintf(g_vm_module, sizeof g_vm_module, "%.95s", line + 10);
+            else if (!strncmp(line, "vm_class=", 9)) snprintf(g_vm_class, sizeof g_vm_class, "%.63s", line + 9);
+            else if (!strncmp(line, "vm_probe=", 9)) { long v = strtol(line + 9, NULL, 10); if (v >= 0 && v <= 40) g_vm_probe_n = (int)v; else bmvr_log("viewmodel: bad vm_probe=%s (use 0..40); keeping %d", line + 9, g_vm_probe_n); }
+            else if (!strncmp(line, "vm_slot=", 8)) {
+                long v = strtol(line + 8, NULL, 10);
+                if (v >= 0 && v < 512) g_vm_slot = (int)v;
+                else bmvr_log("viewmodel: bad vm_slot=%s (use 0..511); keeping %d", line + 8, g_vm_slot);
+            }
             else if (!strncmp(line, "hands=", 6)) g_hd_want = line[6] == '1';
             else if (!strncmp(line, "hands_model=", 12)) g_hd_bare = !strcmp(line + 12, "bare");
             else if (!strncmp(line, "hands_fingers=", 14)) g_hd_fingers_off = !strcmp(line + 14, "off");
-            else if (!strncmp(line, "hands_right=", 12)) g_hd_right = line[12] == '1';
-            else if (!strncmp(line, "hands_scale=", 12)) { float v = (float)atof(line + 12); if (v >= 0.2f && v <= 3.0f) g_hd_scale = v; else bmvr_log("hands: bad hands_scale=%s (use 0.2..3)", line + 12); }
-            else if (!strncmp(line, "hands_roll=", 11)) g_hd_roll = (float)atof(line + 11);
-            else if (!strncmp(line, "hands_offset=", 13)) { float a, b, c; if (sscanf(line + 13, "%f,%f,%f", &a, &b, &c) == 3) { g_hd_off[0] = a; g_hd_off[1] = b; g_hd_off[2] = c; } else bmvr_log("hands: bad hands_offset=%s (use x,y,z metres)", line + 13); }
-            else if (!strncmp(line, "hands_rot=", 10)) { float a, b, c; if (sscanf(line + 10, "%f,%f,%f", &a, &b, &c) == 3) { g_hd_rot[0] = a; g_hd_rot[1] = b; g_hd_rot[2] = c; } else bmvr_log("hands: bad hands_rot=%s (use x,y,z degrees)", line + 10); }
             else if (!strncmp(line, "hands_dir=", 10)) snprintf(g_hd_dir, sizeof g_hd_dir, "%s", line + 10);
             else if (!strncmp(line, "input_aim=", 10)) g_ic_aim = line[10] == '1';
             else if (!strncmp(line, "input_weapon_hand=", 18)) g_ic_weapon_left = !strcmp(line + 18, "left");
@@ -2708,6 +2760,295 @@ static void ic_try_install(void)
     }
 }
 
+/* ------------------------------------------------------------ the weapon viewmodel at the weapon controller
+ * C_BaseViewModel::CalcViewModelView(CBasePlayer *owner, const Vector &eyePosition, const QAngle &eyeAngles), a virtual of C_BlackMesaViewModel
+ * (slot 230 on the Windows build; the Linux vtable has one more destructor slot, so 231 is the first guess). The engine places the gun relative to
+ * the eye it is given and then sets the viewmodel entity's absolute origin and angles from that; the detour hands it a substitute eye (see
+ * linux/bmvr_viewmodel.h) so the gun lands on the controller. i386 System V: a plain cdecl call, `this` first, and a void return.
+ *
+ * Safety, because the slot number is a guess on this game build (same scheme as CreateMove above):
+ *   1. the detour forwards its arguments and does not look at the result, so a wrong slot behaves like the real function for every callee of the
+ *      shape (this, pointer, pointer, pointer) that returns nothing;
+ *   2. for VM_LEARN consecutive calls it only LOOKS: the second and third pointers must be readable memory holding finite, plausible floats that
+ *      move smoothly from call to call (an eye position and view angles). Only then does it substitute anything;
+ *   3. a call that stops looking like that, three times in a row, switches it off for the rest of the launch, and says so;
+ *   4. a flag file marks "viewmodel was active": a launch that died with it set runs without it once. */
+#define VM_LEARN 30
+#define VM_MAXH 4
+typedef void (*PFN_CalcVM)(void *, void *, const float *, const float *);
+struct vm_hook { uintptr_t *slot; PFN_CalcVM orig; unsigned calls, sane_run, insane, bad_run; float last[3]; int have_last; char cls[96]; };
+static struct vm_hook g_vm_h[VM_MAXH];
+static int g_vm_nh, g_vm_state, g_vm_win = -1, g_vm_armed, g_vm_dead, g_vm_junk_said;
+static unsigned g_vm_next_try, g_vm_hook_tick, g_vm_calls, g_vm_applied, g_vm_skipped;
+static char g_vm_flag_path[512];
+static int g_vm_flag_on;
+
+static int vm_readable(const void *p, size_t n)
+{
+    struct bmvr_map m;
+    if (!p || ((uintptr_t)p & 3u)) return 0;
+    if (!bmvr_maps_find((uintptr_t)p, &m) || m.perms[0] != 'r') return 0;
+    return (uintptr_t)p + n <= m.hi;
+}
+
+/* deep = learning: look at the memory. Otherwise (already proven) only the cheap checks. */
+static int vm_args_sane(const void *owner, const float *pos, const float *ang, int deep)
+{
+    if (!owner || !pos || !ang) return 0;
+    if (deep && (!vm_readable(owner, 4) || !vm_readable(pos, 12) || !vm_readable(ang, 12))) return 0;
+    if (!deep && (((uintptr_t)pos & 3u) || ((uintptr_t)ang & 3u))) return 0;
+    for (int i = 0; i < 3; i++) if (!(fabsf(pos[i]) < 65536.0f)) return 0;          /* also rejects NaN */
+    if (!(fabsf(ang[0]) <= 180.0f) || !(fabsf(ang[1]) <= 720.0f) || !(fabsf(ang[2]) <= 720.0f)) return 0;
+    return 1;
+}
+
+/* The substitute eye for this call, or 0 to leave the call alone. */
+static int vm_place(const float *pos, const float *ang, float np[3], float na[3])
+{
+    struct bmvr_xfer_input in;
+    if (!g_st_rig.have_ref || !bmvr_get_input(&in)) return 0;
+    const int w = g_ic_weapon_left ? 0 : 1;
+    if (!(in.flags & (w ? BMVR_XFER_INPUT_POSE_R : BMVR_XFER_INPUT_POSE_L))) return 0;
+    const float gyaw = (g_ic_aim && g_ic_body_valid && g_ic_armed && !g_ic_dead) ? g_ic_body_yaw : ang[1];
+    const float go[3] = { pos[0], pos[1], pos[2] };
+    if (!bmvr_viewmodel_eye(&g_st_rig, in.grip[w], in.aim[w], go, gyaw, g_vm_off, g_vm_rot, np, na)) return 0;
+    static int said;
+    if (!said) {
+        said = 1;
+        bmvr_log("viewmodel: first placement: the engine's eye (%.1f %.1f %.1f) yaw %.1f becomes (%.1f %.1f %.1f) angles (%.1f %.1f %.1f); offset %.1f,%.1f,%.1f rot %.1f,%.1f,%.1f",
+                 (double)pos[0], (double)pos[1], (double)pos[2], (double)ang[1], (double)np[0], (double)np[1], (double)np[2], (double)na[0], (double)na[1], (double)na[2],
+                 (double)g_vm_off[0], (double)g_vm_off[1], (double)g_vm_off[2], (double)g_vm_rot[0], (double)g_vm_rot[1], (double)g_vm_rot[2]);
+    }
+    return 1;
+}
+
+#if defined(__i386__)
+__attribute__((force_align_arg_pointer))
+#endif
+static void vm_detour_n(int i, void *self, void *owner, const float *pos, const float *ang)
+{
+    struct vm_hook *h = &g_vm_h[i];
+    h->calls++;
+    g_vm_calls++;
+    if (g_vm_armed && g_vm_win == i && !g_vm_dead) {
+        if (vm_args_sane(owner, pos, ang, 0)) {
+            h->bad_run = 0;
+            float np[3], na[3];
+            if (vm_place(pos, ang, np, na)) { g_vm_applied++; h->orig(self, owner, np, na); return; }
+            g_vm_skipped++;
+        } else if (++h->bad_run >= 3) {
+            g_vm_dead = 1;
+            bmvr_log("viewmodel: a call of the hooked slot no longer looks like CalcViewModelView; the viewmodel is NOT moved for the rest of this launch (wrong vm_slot=?)");
+        }
+        h->orig(self, owner, pos, ang);
+        return;
+    }
+    /* learning: judge the arguments BEFORE the call (the original may rewrite them), never substitute */
+    float cur[3] = { 0, 0, 0 };
+    const int sane = vm_args_sane(owner, pos, ang, 1);
+    if (sane) { cur[0] = pos[0]; cur[1] = pos[1]; cur[2] = pos[2]; }
+    h->orig(self, owner, pos, ang);
+    if (g_vm_armed) return;
+    if (sane) {
+        const float d = h->have_last ? sqrtf((cur[0] - h->last[0]) * (cur[0] - h->last[0]) + (cur[1] - h->last[1]) * (cur[1] - h->last[1]) + (cur[2] - h->last[2]) * (cur[2] - h->last[2])) : 0.0f;
+        if (d < 400.0f) {
+            h->last[0] = cur[0]; h->last[1] = cur[1]; h->last[2] = cur[2]; h->have_last = 1;
+            if (++h->sane_run == VM_LEARN) {
+                g_vm_win = i;
+                g_vm_armed = 1;
+                bmvr_log("viewmodel: the hooked slot %d of %s looks like CalcViewModelView (%d consecutive calls with a plausible, smoothly moving eye position and angles). "
+                         "The weapon is now placed at the weapon controller.", g_vm_slot, h->cls, VM_LEARN);
+                for (int j = 0; j < g_vm_nh; j++)
+                    if (j != i && g_vm_h[j].slot) { uintptr_t old; bmvr_vtable_patch(g_vm_h[j].slot, (uintptr_t)g_vm_h[j].orig, &old); g_vm_h[j].slot = NULL; }
+                if (g_vm_flag_path[0]) { int fd = open(g_vm_flag_path, O_WRONLY | O_CREAT, 0644); if (fd >= 0) { close(fd); g_vm_flag_on = 1; } }
+            }
+        } else { h->sane_run = 0; h->have_last = 0; h->insane++; }
+    } else {
+        h->sane_run = 0; h->have_last = 0;
+        if (!h->insane++ && !g_vm_junk_said++) bmvr_log("viewmodel: the arguments of the hooked slot's calls do not look like (owner, eye position, eye angles) yet (watching; nothing is changed)");
+    }
+}
+#define VM_TR(n) static void vm_tr##n(void *s, void *o, const float *p, const float *a) { vm_detour_n(n, s, o, p, a); }
+VM_TR(0) VM_TR(1) VM_TR(2) VM_TR(3)
+static const PFN_CalcVM g_vm_tr[VM_MAXH] = { vm_tr0, vm_tr1, vm_tr2, vm_tr3 };
+
+static void __attribute__((destructor)) vm_atexit(void)
+{
+    if (g_vm_flag_on) unlink(g_vm_flag_path);
+}
+
+
+/* ---- finding the slot: transparent probes (linux/bmvr_probe.h) on the slots around vm_slot=, then the proper hook on the one that proves itself.
+ * The probes never change a call (a thunk that ends in a jump to the original), so probing a slot that is some other virtual is harmless; the first slot whose
+ * calls look like (this, owner, eye position, eye angles) VM_LEARN times in a row wins, the probes are removed, and vm_slot is set to it. */
+#define VM_PROBE_MAX 81
+struct vm_probe { int slot; uintptr_t *vslot; uintptr_t orig; unsigned calls, checked, plausible, run; float last[3]; int have_last; };
+static struct vm_probe g_vmp[VM_PROBE_MAX];
+static int g_vmp_n, g_vmp_win = -1, g_vm_probe_done;
+__attribute__((unused)) static uint8_t *g_vmp_page;
+
+#if defined(__i386__)
+__attribute__((force_align_arg_pointer))
+#endif
+__attribute__((unused)) static void vm_probe_cb(int k, const uint32_t *a)
+{
+    if (k < 0 || k >= g_vmp_n) return;
+    struct vm_probe *p = &g_vmp[k];
+    p->calls++;
+    if (g_vmp_win >= 0 || p->checked >= 400) return;      /* bounded work: the map lookups are not free */
+    p->checked++;
+    const float *pos = (const float *)(uintptr_t)a[2], *ang = (const float *)(uintptr_t)a[3];
+    const void *owner = (const void *)(uintptr_t)a[1];
+    if ((uintptr_t)owner < 0x10000u || (uintptr_t)pos < 0x10000u || (uintptr_t)ang < 0x10000u || !vm_args_sane(owner, pos, ang, 1)) { p->run = 0; p->have_last = 0; return; }
+    p->plausible++;
+    float d = 0.0f;
+    if (p->have_last) d = sqrtf((pos[0] - p->last[0]) * (pos[0] - p->last[0]) + (pos[1] - p->last[1]) * (pos[1] - p->last[1]) + (pos[2] - p->last[2]) * (pos[2] - p->last[2]));
+    p->last[0] = pos[0]; p->last[1] = pos[1]; p->last[2] = pos[2]; p->have_last = 1;
+    if (d >= 400.0f) { p->run = 0; return; }
+    if (++p->run >= VM_LEARN && g_vmp_win < 0) g_vmp_win = k;
+}
+
+static int vm_probe_install(uintptr_t *vt)
+{
+#if defined(__i386__)
+    const int lo = g_vm_slot - g_vm_probe_n > 2 ? g_vm_slot - g_vm_probe_n : 2, hi = g_vm_slot + g_vm_probe_n;
+    g_vmp_page = (uint8_t *)mmap(NULL, 4096 * 2, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (g_vmp_page == (uint8_t *)MAP_FAILED) { g_vmp_page = NULL; bmvr_log("viewmodel: probing: no executable memory; falling back to vm_slot= alone"); return 0; }
+    for (int i = lo; i <= hi && g_vmp_n < VM_PROBE_MAX; i++) {
+        if (!bmvr_addr_executable(vt[i])) break;            /* the end of the vtable */
+        struct vm_probe *p = &g_vmp[g_vmp_n];
+        p->slot = i; p->vslot = &vt[i]; p->orig = vt[i];
+        uint8_t *th = g_vmp_page + (size_t)g_vmp_n * BMVR_PROBE_THUNK_SIZE;
+        if (bmvr_probe_thunk(th, (uint32_t)g_vmp_n, vm_probe_cb, vt[i]) != BMVR_PROBE_THUNK_SIZE) continue;
+        uintptr_t old;
+        if (!bmvr_vtable_patch(&vt[i], (uintptr_t)th, &old)) continue;
+        g_vmp_n++;
+    }
+    if (!g_vmp_n) { bmvr_log("viewmodel: probing: no slot could be probed; falling back to vm_slot= alone"); return 0; }
+    if (g_vm_flag_path[0] && !g_vm_flag_on) { int fd = open(g_vm_flag_path, O_WRONLY | O_CREAT, 0644); if (fd >= 0) { close(fd); g_vm_flag_on = 1; } }   /* crash-sticky from the first probe on */
+    bmvr_log("viewmodel: PROBING slots %d..%d (%d slots) for CalcViewModelView: transparent probes only, nothing is changed in the game. The slot whose calls look like "
+             "(owner, eye position, eye angles) %d times in a row is then hooked for real.", g_vmp[0].slot, g_vmp[g_vmp_n - 1].slot, g_vmp_n, VM_LEARN);
+    return 1;
+#else
+    (void)vt;
+    bmvr_log("viewmodel: probing is only available on the 32-bit build; using vm_slot=%d alone", g_vm_slot);
+    return 0;
+#endif
+}
+
+static void vm_probe_tick(void)
+{
+    if (!g_vmp_n) return;
+    if (g_vmp_win >= 0) {
+        const int slot = g_vmp[g_vmp_win].slot;
+        for (int i = 0; i < g_vmp_n; i++) { uintptr_t old; bmvr_vtable_patch(g_vmp[i].vslot, g_vmp[i].orig, &old); }
+        bmvr_log("viewmodel: probing found it: slot %d (%u calls, %u plausible). Probes removed; hooking slot %d for real. Set vm_slot=%d vm_probe=0 to skip the search next time.",
+                 slot, g_vmp[g_vmp_win].calls, g_vmp[g_vmp_win].plausible, slot, slot);
+        g_vm_slot = slot;
+        g_vmp_n = 0; g_vmp_win = -1; g_vm_probe_done = 1;
+        g_vm_state = 0; g_vm_next_try = g_x_tick;
+        return;
+    }
+    if ((g_x_tick - g_vm_hook_tick) % 600) return;
+    int any = 0;
+    for (int i = 0; i < g_vmp_n; i++) if (g_vmp[i].calls) { any = 1; bmvr_log("viewmodel: probe slot %d: %u calls, %u plausible as (owner, eye position, eye angles), best run %u", g_vmp[i].slot, g_vmp[i].calls, g_vmp[i].plausible, g_vmp[i].run); }
+    if (!any) bmvr_log("viewmodel: probe: none of the %d probed slots (%d..%d) has been called yet (tick %u); the viewmodel is only updated while a map is loaded and a weapon is out",
+                       g_vmp_n, g_vmp[0].slot, g_vmp[g_vmp_n - 1].slot, g_x_tick);
+}
+
+static void vm_try_install(void)
+{
+    if (!g_vm_want || g_vm_state != 0 || g_x_tick < g_vm_next_try) return;
+    g_vm_state = -1;
+    char dir[400];
+    if (game_dir(dir, sizeof dir)) snprintf(g_vm_flag_path, sizeof g_vm_flag_path, "%s/bmvr_in_viewmodel.flag", dir);
+    if (g_vm_flag_path[0] && access(g_vm_flag_path, F_OK) == 0) {
+        unlink(g_vm_flag_path);
+        bmvr_log("viewmodel: bmvr_in_viewmodel.flag exists: the previous launch died while the viewmodel was being moved. It is OFF for this launch only "
+                 "(the flag is removed; the next launch tries again). If it repeats, set vm_slot= or viewmodel=0.");
+        return;
+    }
+    struct bmvr_map mod[BMVR_RTTI_MAX_RANGES];
+    if (!bmvr_maps_module(g_vm_module, mod, BMVR_RTTI_MAX_RANGES)) {
+        static int said;
+        if (!said) { said = 1; bmvr_log("viewmodel: no readable mapping of a module matching '%s' yet; trying again every 60 frames", g_vm_module); }
+        g_vm_state = 0;
+        g_vm_next_try = g_x_tick + 60;
+        return;
+    }
+    char mangled[80];
+    snprintf(mangled, sizeof mangled, "%u%s", (unsigned)strlen(g_vm_class), g_vm_class);
+    struct bmvr_vt_hit h[8];
+    int n = bmvr_rtti_find(g_vm_module, mangled, h, 8), prim = -1, nprim = 0;
+    for (int i = 0; i < n; i++) {
+        bmvr_log("viewmodel: RTTI %s: type_info %#lx vtable %#lx (module offset %#lx) %s", mangled, (unsigned long)h[i].typeinfo, (unsigned long)h[i].vtable,
+                 (unsigned long)(h[i].vtable - mod[0].lo), h[i].primary ? "primary" : "secondary");
+        if (h[i].primary) { prim = i; nprim++; }
+    }
+    if (nprim != 1) {
+        bmvr_log("viewmodel: class '%s' has %d primary vtables in '%s' (need exactly 1); the viewmodel is not moved. Classes whose name contains ViewModel:", g_vm_class, nprim, g_vm_module);
+        struct st_list l = { 0 };
+        bmvr_rtti_list(g_vm_module, "ViewModel", st_list_cb, &l);
+        if (!l.n) bmvr_log("viewmodel:   (none: the module may not carry RTTI, or vm_module= names the wrong file)");
+        else bmvr_log("viewmodel:   pick the one the game really uses with vm_class= (without the length prefix) and send me this log");
+        return;
+    }
+    uintptr_t *vt = (uintptr_t *)h[prim].vtable;
+    for (int i = g_vm_slot - 3; i <= g_vm_slot + 3; i++)
+        if (i >= 0) bmvr_log("viewmodel:   slot %3d -> %#lx (module offset %#lx)%s", i, (unsigned long)vt[i], (unsigned long)(vt[i] - mod[0].lo), i == g_vm_slot ? "   <- CalcViewModelView?" : "");
+    for (int i = 0; i <= g_vm_slot; i++)
+        if (!bmvr_addr_executable(vt[i])) { bmvr_log("viewmodel: vtable slot %d is not executable code: the vtable is shorter than vm_slot=%d; the viewmodel is not moved", i, g_vm_slot); return; }
+    if (g_vm_probe_n > 0 && !g_vm_probe_done && vm_probe_install(vt)) { g_vm_state = 2; g_vm_hook_tick = g_x_tick; return; }
+    g_vm_probe_done = 1;
+    uintptr_t old = 0;
+    {   struct vm_hook *hk = &g_vm_h[0];
+        hk->orig = (PFN_CalcVM)vt[g_vm_slot];
+        snprintf(hk->cls, sizeof hk->cls, "%s", mangled);
+        if (!bmvr_vtable_patch(&vt[g_vm_slot], (uintptr_t)g_vm_tr[0], &old)) { bmvr_log("viewmodel: could not patch the vtable slot (mprotect refused); the viewmodel is not moved"); return; }
+        hk->slot = &vt[g_vm_slot];
+        g_vm_nh = 1;
+    }
+    g_vm_state = 1;
+    g_vm_hook_tick = g_x_tick;
+    bmvr_log("viewmodel: hooked %s vtable slot %d (was %#lx). WATCHING ONLY until %d consecutive calls look like CalcViewModelView; then the weapon follows the controller. UNVERIFIED on this build.",
+             mangled, g_vm_slot, (unsigned long)old, VM_LEARN);
+    /* subclasses keep their own copy of the vtable: watch the same slot of each one that has the base layout */
+    struct bmvr_vt_hit dh[VM_MAXH];
+    const int nd = bmvr_rtti_derived(g_vm_module, h[prim].typeinfo, dh, VM_MAXH);
+    for (int ci = 0; ci < nd && g_vm_nh < VM_MAXH; ci++) {
+        const char *dname = (const char *)((const uintptr_t *)dh[ci].typeinfo)[1];
+        uintptr_t *dv = (uintptr_t *)dh[ci].vtable;
+        int ok = 1, same = 0;
+        for (int i = 0; i <= g_vm_slot; i++) { if (!bmvr_addr_executable(dv[i])) ok = 0; else if (dv[i] == (i == g_vm_slot ? (uintptr_t)g_vm_h[0].orig : vt[i])) same++; }
+        bmvr_log("viewmodel: candidate subclass %.63s: %d of %d slots identical, slot %d -> %#lx%s", dname, same, g_vm_slot + 1, g_vm_slot, (unsigned long)dv[g_vm_slot],
+                 dv[g_vm_slot] == (uintptr_t)g_vm_h[0].orig ? " (same function as the base)" : " (its own override)");
+        if (!ok || same * 5 < (g_vm_slot + 1) * 2) continue;
+        struct vm_hook *hk = &g_vm_h[g_vm_nh];
+        hk->orig = (PFN_CalcVM)dv[g_vm_slot];
+        snprintf(hk->cls, sizeof hk->cls, "%.63s", dname);
+        if (!bmvr_vtable_patch(&dv[g_vm_slot], (uintptr_t)g_vm_tr[g_vm_nh], &old)) continue;
+        hk->slot = &dv[g_vm_slot];
+        g_vm_nh++;
+        bmvr_log("viewmodel:   watched as well (hook %d)", g_vm_nh - 1);
+    }
+}
+
+static void vm_status_tick(void)
+{
+    if (g_vm_want && g_vm_state == 2) { vm_probe_tick(); return; }
+    if (!g_vm_want || g_vm_state != 1 || g_x_tick == g_vm_hook_tick) return;
+    if (!g_vm_calls && g_x_tick - g_vm_hook_tick >= 1800) {
+        static int warned;
+        if (!warned) { warned = 1; bmvr_log("viewmodel: WARNING: the hooked slot has not been called once in %u frames. If a map is loaded this is the wrong class or vm_slot= "
+                                           "(compare the slot dump above); nothing was changed in the game.", g_x_tick - g_vm_hook_tick); }
+    }
+    if ((g_x_tick - g_vm_hook_tick) % 600) return;
+    unsigned run = 0, ins = 0;
+    for (int i = 0; i < g_vm_nh; i++) { if (g_vm_h[i].sane_run > run) run = g_vm_h[i].sane_run; ins += g_vm_h[i].insane; }
+    bmvr_log("viewmodel: status tick %u: calls %u, plausible run %u (need %d), implausible %u, armed %d%s, placed %u, left alone %u",
+             g_x_tick, g_vm_calls, run, VM_LEARN, ins, g_vm_armed, g_vm_dead ? " (DEAD)" : "", g_vm_applied, g_vm_skipped);
+}
+
 /* Game menu control. Everything goes through SDL's event queue (the engine reads keyboard and mouse from there). Runs once per Present, not from CreateMove,
  * which does not run while a menu is up or the game is paused.
  *   Menu / view button : Escape (open / close the game menu, always)
@@ -2986,6 +3327,9 @@ static void xfer_tick(void)
     st_status_tick();
     ic_try_install();
     ic_status_tick();
+    vm_try_install();
+    vm_status_tick();
+    cfg_live_poll();
     ic_menu_tick();
     if (g_x_tick % g_x_every == 0) {
         if (g_st_sent) {

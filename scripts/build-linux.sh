@@ -213,8 +213,8 @@ INNER
   chmod +x "$GAME/bmvr-run.sh" "$GAME/bmvr-bms.sh"
   # Working stereo configuration (verified in the headset 2026-11-22). Written only when the file does not exist: an existing one is never touched.
   if [[ ! -e "$GAME/bmvr_target.txt" ]]; then
-    printf 'target=InternalRT0\nflip=0\nsync=sem\nevery=1\nstereo=1\nstereo_hook=inline\ninput=1\n' > "$GAME/bmvr_target.txt"
-    echo "Wrote default $GAME/bmvr_target.txt (stereo=1, stereo_hook=inline, input=1)"
+    printf 'target=InternalRT0\nflip=0\nsync=sem\nevery=1\nstereo=1\nstereo_hook=inline\ninput=1\nviewmodel=1\n' > "$GAME/bmvr_target.txt"
+    echo "Wrote default $GAME/bmvr_target.txt (stereo=1, stereo_hook=inline, input=1, viewmodel=1)"
   fi
   echo "Copied to $GAME/bin/bmvr_preload32.so and wrote bmvr-run.sh + bmvr-bms.sh (bms.sh untouched)"
   # The hand models (hands=1 in bmvr_target.txt) are read from <game folder>/VR/hands at run time.
