@@ -1,6 +1,6 @@
 /*
  * Black Mesa VR - native Linux port, stage 4a, milestone X2: the pair ring.
- * Design: docs/LINUX_OPENXR_CONSUMER.md, "Decision 2".
+ * Design: docs/linux/openxr-helper.md, "Decision 2".
  *
  * Pure bookkeeping, no Vulkan: it only decides WHICH slot may be written, which slot is the newest complete pair and
  * what the counters say. The GPU copies and the fences live in bmvr_xr_sink.c; this file is separate so the state machine

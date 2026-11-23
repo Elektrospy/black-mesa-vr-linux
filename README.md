@@ -82,8 +82,8 @@ Then, with SteamVR running and a headset connected, check it:
 
 It should end with `xr-probe: PASS`. With the headset on you can then run the frame-loop self-test, which needs no game:
 `"$HOME/.local/share/Steam/steamapps/common/Black Mesa/bmvr_xfer_helper" --selftest-xr` (left eye should be BLUE with an "L", right eye RED
-with an "R"; Ctrl-C ends it). Experimental: it passed on SteamVR with an RTX 3080 (one run). The game's picture also reaches the headset through `bmvr_xfer_helper --sink xr --eyes 2 --xr-layer projection` (tested on SteamVR 2.19.4 + RTX 3080; start SteamVR, put the headset on, start the helper, then the game): flat, one engine view for both eyes, no stereo or head tracking in the game yet. See `docs/LINUX_OPENXR_CONSUMER.md` (X2). (Observed: SteamVR/OpenXR 2.19.4, NVIDIA RTX 3080, session reaches READY. The probe
-submits no frames.) If it still says `UNAVAILABLE`, see `docs/LINUX_PORT.md` (Stage 4a).
+with an "R"; Ctrl-C ends it). Experimental: it passed on SteamVR with an RTX 3080 (one run). With the native Linux build, `scripts/build-linux.sh` installs a launcher that starts the helper for you; stereo and head tracking were confirmed in a headset on SteamVR 2.19.4 + RTX 3080 (controller gameplay is not verified yet). Overview and status: `docs/linux/README.md`. (Observed: SteamVR/OpenXR 2.19.4, NVIDIA RTX 3080, session reaches READY. The probe
+submits no frames.) If it still says `UNAVAILABLE`, see `docs/linux/openxr-results.md`.
 
 ## Black Mesa: Blue Shift
 

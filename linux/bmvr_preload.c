@@ -447,7 +447,7 @@ static int g_flip_mode = 2;      /* 0 / 1 = fixed, 2 = alternate per snapshot */
 static int g_flip2_mode = -1;    /* eye 1: -1 = same as eye 0, else as g_flip_mode */
 static int g_cfg_loaded;
 
-/* Stage 4b: stereo views (docs/LINUX_PORT.md, "Stage 4b"). All opt-in: nothing below does anything unless "stereo=1" is set. */
+/* Stage 4b: stereo views (docs/linux/stereo-views.md). All opt-in: nothing below does anything unless "stereo=1" is set. */
 static int g_st_want;                              /* config: stereo=1 (BMVR_STEREO=1) */
 static char g_st_module[96] = "/client.so";        /* stereo_module=: which loaded module holds the view class ("exe" = the main program) */
 static char g_st_class[64] = "CViewRender";        /* stereo_class=: class whose vtable holds RenderView (plain name; mangled here) */
@@ -456,7 +456,7 @@ static int g_st_slot = 6;                          /* stereo_slot=: vtable slot 
 static int g_st_hook_mode;                         /* stereo_hook=: 0 auto (vtable slot, then an inline detour if the slot is never called), 1 vtable only, 2 inline only */
 static float g_st_scale = BMVR_STEREO_DEFAULT_SCALE; /* stereo_scale=: Source units per metre */
 
-/* Slice 3b: controller input into the game (docs/LINUX_PORT.md). Opt-in: nothing below does anything unless "input=1" is set. The hook is on
+/* Slice 3b: controller input into the game (docs/linux/input.md). Opt-in: nothing below does anything unless "input=1" is set. The hook is on
  * IClientMode::CreateMove (ClientModeShared slot 21 on the Windows build; the Linux build has two destructor slots, so 22 is the first guess:
  * UNVERIFIED, the learning phase below says whether it is right before a single value is written). */
 static int g_ic_want;                              /* config: input=1 (BMVR_INPUT=1) */
@@ -493,7 +493,7 @@ static float g_hd_rot[3] = { 0.0f, 270.0f, 0.0f };      /* hands_rot=x,y,z in de
 static int g_vm_want;                              /* viewmodel=1 */
 static char g_vm_module[96] = "/client.so";        /* vm_module= */
 static char g_vm_class[64] = "C_BlackMesaViewModel";   /* vm_class= */
-static int g_vm_probe_n = 8;                       /* vm_probe=N: look for CalcViewModelView in slots vm_slot-N .. vm_slot+N with transparent probes (0 = trust vm_slot= only) */
+static int g_vm_probe_n = 24;                      /* vm_probe=N: look for CalcViewModelView in slots vm_slot-N .. vm_slot+N with transparent probes (0 = trust vm_slot= only) */
 static int g_vm_slot = 231;                        /* vm_slot=: CalcViewModelView. Windows build: 230; the Linux vtable has one more destructor slot (CreateMove: 21 -> 22) */
 static float g_vm_off[3] = { 16.0f, 3.0f, -2.0f }; /* vm_offset=fwd,right,up (Source units): where the gun sits relative to the eye in the engine's own placement. Live. */
 static float g_vm_rot[3] = { 0.0f, 0.0f, 0.0f };   /* vm_rot=pitch,yaw,roll (degrees) added to the aim pose. Live. */
@@ -671,7 +671,7 @@ static void load_cfg_once(void)
             else if (!strncmp(line, "viewmodel=", 10)) g_vm_want = line[10] == '1';
             else if (!strncmp(line, "vm_module=", 10)) snprintf(g_vm_module, sizeof g_vm_module, "%.95s", line + 10);
             else if (!strncmp(line, "vm_class=", 9)) snprintf(g_vm_class, sizeof g_vm_class, "%.63s", line + 9);
-            else if (!strncmp(line, "vm_probe=", 9)) { long v = strtol(line + 9, NULL, 10); if (v >= 0 && v <= 40) g_vm_probe_n = (int)v; else bmvr_log("viewmodel: bad vm_probe=%s (use 0..40); keeping %d", line + 9, g_vm_probe_n); }
+            else if (!strncmp(line, "vm_probe=", 9)) { long v = strtol(line + 9, NULL, 10); if (v >= 0 && v <= 100) g_vm_probe_n = (int)v; else bmvr_log("viewmodel: bad vm_probe=%s (use 0..100); keeping %d", line + 9, g_vm_probe_n); }
             else if (!strncmp(line, "vm_slot=", 8)) {
                 long v = strtol(line + 8, NULL, 10);
                 if (v >= 0 && v < 512) g_vm_slot = (int)v;
@@ -1791,7 +1791,7 @@ static void st_dump_view(const unsigned char *v)
  * linux/bmvr_hands.h is that logic without the engine. This section draws the result with plain OpenGL INTO the eye target the engine
  * just finished (st_try_stereo, after the eye's RenderView, before the blit to the helper), so the helper receives eyes that already
  * hold the hands. The game's own GL state is saved and restored around the draw (ToGL keeps cached state).
- * LIMITS (documented in docs/LINUX_PORT.md): the hands use their own depth buffer, so they are drawn OVER the world (a hand inside a wall
+ * LIMITS (documented in docs/linux/hands.md): the hands use their own depth buffer, so they are drawn OVER the world (a hand inside a wall
  * still shows); light is a fixed headlight, not the scene's; no hand tracking: fingers follow trigger and grip only.
  * STATUS: CPU half tested against the real files (tests/linux/hands_test.c); the GL half has not been run on a GPU. */
 #define GL_CURRENT_PROGRAM 0x8B8D
@@ -2881,11 +2881,28 @@ static void __attribute__((destructor)) vm_atexit(void)
 /* ---- finding the slot: transparent probes (linux/bmvr_probe.h) on the slots around vm_slot=, then the proper hook on the one that proves itself.
  * The probes never change a call (a thunk that ends in a jump to the original), so probing a slot that is some other virtual is harmless; the first slot whose
  * calls look like (this, owner, eye position, eye angles) VM_LEARN times in a row wins, the probes are removed, and vm_slot is set to it. */
-#define VM_PROBE_MAX 81
-struct vm_probe { int slot; uintptr_t *vslot; uintptr_t orig; unsigned calls, checked, plausible, run; float last[3]; int have_last; };
+#define VM_PROBE_MAX 201
+struct vm_probe { int slot; uintptr_t *vslot; uintptr_t orig; unsigned calls, checked, plausible, run, alt[2]; float last[3]; int have_last; };
 static struct vm_probe g_vmp[VM_PROBE_MAX];
 static int g_vmp_n, g_vmp_win = -1, g_vm_probe_done;
 __attribute__((unused)) static uint8_t *g_vmp_page;
+
+/* (position, angles) as two readable float triples that look like an eye position and view angles */
+static int vm_pair_sane(const float *pos, const float *ang)
+{
+    if ((uintptr_t)pos < 0x10000u || (uintptr_t)ang < 0x10000u || ((uintptr_t)pos & 3u) || ((uintptr_t)ang & 3u)) return 0;
+    if (!vm_readable(pos, 12) || !vm_readable(ang, 12)) return 0;
+    for (int i = 0; i < 3; i++) if (!(fabsf(pos[i]) < 65536.0f)) return 0;
+    return fabsf(ang[0]) <= 180.0f && fabsf(ang[1]) <= 720.0f && fabsf(ang[2]) <= 720.0f;
+}
+
+/* what one argument word points at, for the log: four floats when it is readable memory */
+static void vm_peek(char *out, size_t cap, uint32_t w)
+{
+    const float *f = (const float *)(uintptr_t)w;
+    if (w >= 0x10000u && !(w & 3u) && vm_readable(f, 16)) snprintf(out, cap, "[%.3g %.3g %.3g %.3g]", (double)f[0], (double)f[1], (double)f[2], (double)f[3]);
+    else snprintf(out, cap, "-");
+}
 
 #if defined(__i386__)
 __attribute__((force_align_arg_pointer))
@@ -2895,10 +2912,18 @@ __attribute__((unused)) static void vm_probe_cb(int k, const uint32_t *a)
     if (k < 0 || k >= g_vmp_n) return;
     struct vm_probe *p = &g_vmp[k];
     p->calls++;
-    if (g_vmp_win >= 0 || p->checked >= 400) return;      /* bounded work: the map lookups are not free */
+    if (p->calls == 1 || p->calls == 2 || p->calls == 3 || p->calls == 300 || p->calls == 3000) {   /* what does this function really receive? */
+        char d1[96], d2[96], d3[96];
+        vm_peek(d1, sizeof d1, a[1]); vm_peek(d2, sizeof d2, a[2]); vm_peek(d3, sizeof d3, a[3]);
+        bmvr_log("viewmodel: probe slot %d call %u: this=%#x a1=%#x a2=%#x a3=%#x a4=%#x a5=%#x | *a1=%s *a2=%s *a3=%s", p->slot, p->calls, a[0], a[1], a[2], a[3], a[4], a[5], d1, d2, d3);
+    }
+    if (g_vmp_win >= 0 || p->checked >= 150) return;      /* bounded work: the map lookups are not free */
     p->checked++;
     const float *pos = (const float *)(uintptr_t)a[2], *ang = (const float *)(uintptr_t)a[3];
     const void *owner = (const void *)(uintptr_t)a[1];
+    /* other layouts, only counted (the hook itself needs (owner, pos, ang)): (this, pos, ang, ...) and (this, x, pos, ang) */
+    if (vm_pair_sane((const float *)(uintptr_t)a[1], (const float *)(uintptr_t)a[2])) p->alt[0]++;
+    if (vm_pair_sane(pos, ang)) p->alt[1]++;
     if ((uintptr_t)owner < 0x10000u || (uintptr_t)pos < 0x10000u || (uintptr_t)ang < 0x10000u || !vm_args_sane(owner, pos, ang, 1)) { p->run = 0; p->have_last = 0; return; }
     p->plausible++;
     float d = 0.0f;
@@ -2912,7 +2937,7 @@ static int vm_probe_install(uintptr_t *vt)
 {
 #if defined(__i386__)
     const int lo = g_vm_slot - g_vm_probe_n > 2 ? g_vm_slot - g_vm_probe_n : 2, hi = g_vm_slot + g_vm_probe_n;
-    g_vmp_page = (uint8_t *)mmap(NULL, 4096 * 2, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    g_vmp_page = (uint8_t *)mmap(NULL, 8192, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (g_vmp_page == (uint8_t *)MAP_FAILED) { g_vmp_page = NULL; bmvr_log("viewmodel: probing: no executable memory; falling back to vm_slot= alone"); return 0; }
     for (int i = lo; i <= hi && g_vmp_n < VM_PROBE_MAX; i++) {
         if (!bmvr_addr_executable(vt[i])) break;            /* the end of the vtable */
@@ -2951,7 +2976,7 @@ static void vm_probe_tick(void)
     }
     if ((g_x_tick - g_vm_hook_tick) % 600) return;
     int any = 0;
-    for (int i = 0; i < g_vmp_n; i++) if (g_vmp[i].calls) { any = 1; bmvr_log("viewmodel: probe slot %d: %u calls, %u plausible as (owner, eye position, eye angles), best run %u", g_vmp[i].slot, g_vmp[i].calls, g_vmp[i].plausible, g_vmp[i].run); }
+    for (int i = 0; i < g_vmp_n; i++) if (g_vmp[i].calls) { any = 1; bmvr_log("viewmodel: probe slot %d: %u calls, %u plausible as (owner, eye position, eye angles), best run %u; other layouts: (this, pos, ang) %u, (this, x, pos, ang) %u", g_vmp[i].slot, g_vmp[i].calls, g_vmp[i].plausible, g_vmp[i].run, g_vmp[i].alt[0], g_vmp[i].alt[1]); }
     if (!any) bmvr_log("viewmodel: probe: none of the %d probed slots (%d..%d) has been called yet (tick %u); the viewmodel is only updated while a map is loaded and a weapon is out",
                        g_vmp_n, g_vmp[0].slot, g_vmp[g_vmp_n - 1].slot, g_x_tick);
 }

@@ -31,7 +31,7 @@
  *     GL:     wait(vk_done) [not before the first pair] -> blit eye 0 -> blit eye 1 -> signal(gl_ready) -> flush
  *     helper: wait(gl_ready) -> read both images -> signal(vk_done)
  * The shim uses eye 1 only when it was asked to (target2 in bmvr_target.txt) AND the helper offers two images; a
- * frame with eye_count == 1 on a two-image session only touches image 0. Design: docs/LINUX_STEREO_HANDOFF.md.
+ * frame with eye_count == 1 on a two-image session only touches image 0. Design: docs/linux/eye-pairs.md.
  *
  * Version 3 (stage 3a): GPU semaphores. When the helper offers them (hello.caps has
  * BMVR_XFER_CAP_SEMAPHORES) the hello carries THREE fds: the image memory, then two

@@ -1,6 +1,6 @@
 /*
  * Black Mesa VR - native Linux port, stage 4a: OpenXR sink (milestones X0: probe, X1: frame-loop self-test). See
- * bmvr_xr_sink.h and docs/LINUX_OPENXR_CONSUMER.md.
+ * bmvr_xr_sink.h and docs/linux/openxr-helper.md.
  *
  * Both libraries are loaded with dlopen (libopenxr_loader.so.1, libvulkan.so.1), like the helper already does for
  * Vulkan, so the helper still builds and runs on a machine without OpenXR. Only HEADERS are needed to build: the Khronos
@@ -1267,7 +1267,7 @@ int bmvr_xr_selftest(const struct bmvr_xr_selftest_opts *o)
 }
 
 /* ================================================================================================================ X2: socket sink
- * Design: docs/LINUX_OPENXR_CONSUMER.md, Decisions 1-4. What this part does:
+ * Design: docs/linux/openxr-helper.md, Decisions 1-4. What this part does:
  *
  *   - st_open() (the X1 code) creates the runtime-chosen Vulkan device; the shared images the game imports are created on THAT
  *     device (exportable opaque-fd memory), so the game's GL context and this process share one GPU object.

@@ -283,7 +283,7 @@ Stage 4a X1 (headset on, no game needed): "$GAME/bmvr_xfer_helper" --selftest-xr
 Stage 4a X2 (headset on, SteamVR active runtime, then start the game): "$GAME/bmvr_xfer_helper" --sink xr [--eyes 1|2]   (untested with the real game so far)
 shows a generated pattern: left eye BLUE with an "L", right eye RED with an "R", a frame counter on top (Ctrl-C ends it).
 Send me the output and what you saw in the headset.
-Design and milestones: docs/LINUX_OPENXR_CONSUMER.md.
+Design and milestones: docs/linux/openxr-helper.md.
 
 Kill test (game running, no helper running): ./tests/linux/test_kill_loop.sh -n 10   (needs sync=sem in bmvr_target.txt to be meaningful;
 add --eyes 2 for the two-eye case).

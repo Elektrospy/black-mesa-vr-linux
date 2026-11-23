@@ -1,7 +1,7 @@
 /*
  * Black Mesa VR - native Linux port, stage 4b: finding a class's vtable in a stripped module, and patching one slot.
  *
- * The native client is stripped (docs/LINUX_PORT.md: `client.so` exports 383 symbols, but its RTTI names survive: `11CViewRender`,
+ * The native client is stripped (docs/linux/native-build.md: `client.so` exports 383 symbols, but its RTTI names survive: `11CViewRender`,
  * `15C_BaseViewModel`). There is no symbol to dlsym and no address from a static analysis that would survive a game update, so
  * the vtable is found at RUN TIME from the Itanium C++ ABI's RTTI layout, with no offsets:
  *

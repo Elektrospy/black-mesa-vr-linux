@@ -8,7 +8,7 @@ into `build/` (git-ignored) and runs it.
 | `mock_gl.c` | "libSDL2-2.0.so.0": `SDL_GL_GetProcAddress` + a small GL state machine (FBOs, textures, renderbuffers, memory objects, semaphores) that records every call to `$MOCK_TRACE` |
 | `fake_togl.cpp`, `decls.h` | stand-in `libtogl.so` with the real C++ signatures (so the mangled names match) and ToGL's lazy FBO binding |
 | `fake_game.cpp` | loading frames, then gameplay frames with many `SetRenderTarget(0)` switches ending on the back buffer, then (optional 3rd arg) a second loading screen |
-| `mock_helper.c` | helper stand-in: real unix socket + `SCM_RIGHTS`, protocol v5 (`--sem`, `--eyes N`, `--poses`, `--version N`, `--die-after N`, `--die-idle-after N` = exit right after acking frame N) |
+| `mock_helper.c` | helper stand-in: real unix socket + `SCM_RIGHTS`, the current protocol (v7; `--sem`, `--eyes N`, `--poses`, `--input`, `--version N`, `--die-after N`, `--die-idle-after N` = exit right after acking frame N) |
 | `lock_test.c` | the helper's one-instance `flock()` guard (`linux/bmvr_single_instance.h`), no Vulkan needed |
 | `client.c` | drives the REAL helper like the shim would |
 | `suite.py`, `run_case.sh` | the cases and assertions (call ordering, fallbacks, state restore, trace trigger) |
@@ -24,7 +24,7 @@ headless Monado (simulated HMD, null compositor; refuses to run if a Monado is a
 helper with `kill -9` in a loop and checks that the shim notices and reconnects (`--eyes 2` for the two-eye case). Run it as a program from any shell.
 
 `BMVR_TEST_NATIVE=1 tests/linux/run-tests.sh` builds everything for the host (64-bit) instead of `-m32`, so it runs without multilib.
-It covers all the shim logic (T1-T19) but not the 32-bit build; the plain run is the authoritative one. A build directory deeper than
+It covers the shim logic (T1-T40, minus the 32-bit-only probe case T40) but not the 32-bit build; the plain run is the authoritative one. A build directory deeper than
 55 characters is replaced by a temporary one (unix socket paths are limited to 107 characters).
 T14-T19 are the stage 3d two-eye cases (`fake_game` takes `FAKE_SKIP_RT` / `FAKE_SKIP_AFTER` to stop rendering one target).
 
@@ -37,3 +37,6 @@ Stage 4b (stereo views): `stereo_test.c` (`cc -O2 -std=gnu11 -I linux -o stereo_
 T20 (in `suite.py', run by `run-tests.sh`) covers the `every=N` key of `bmvr_target.txt` (delivery cadence of the shim).
 
 T21-T23 (X4, in `suite.py`) cover the protocol v5 pose channel through `mock_helper --poses` (acks carry pose id n+1; the shim must stamp frames with a pose it has already seen). `pose_test.c` (run by `run-tests.sh`, no GPU) stress-tests `linux/bmvr_pose_store.h`; also with `-fsanitize=thread`.
+
+
+Stage 5 and later: `input_map_test.c`, `hands_test.c`, `viewmodel_test.c` (pure maths, run by `run-tests.sh`) and `probe_test.c` (a freestanding `-m32` program that runs the transparent call probe for real; skipped without `gcc -m32`). Suite T32-T36 cover the `CreateMove` hook, T37 hands, T38-T40 the viewmodel hook and slot probe. Overview of all test layers: `docs/linux/testing.md`.

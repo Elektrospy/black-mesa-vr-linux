@@ -1,6 +1,6 @@
 /*
  * Black Mesa VR - native Linux port, stage 4a, milestone X4: the pose table.
- * Design: docs/LINUX_OPENXR_CONSUMER.md, "Decision 5" and "X4".
+ * Design: docs/linux/openxr-helper.md, "Decision 5"; docs/linux/protocol.md.
  *
  * Pure bookkeeping, no Vulkan/OpenXR (same style as bmvr_pair_ring.h, so tests/linux/pose_test.c can stress it without a GPU).
  * The XR thread puts a pose per frame (the table assigns a fresh, non-zero id); the transport thread reads the latest one for the

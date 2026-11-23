@@ -1,6 +1,6 @@
 /*
  * Black Mesa VR - native Linux port, stage 4a: OpenXR sink for the 64-bit helper.
- * Design: docs/LINUX_OPENXR_CONSUMER.md. This file is the interface the helper (bmvr_xfer_helper.c) uses.
+ * Design: docs/linux/openxr-helper.md. This file is the interface the helper (bmvr_xfer_helper.c) uses.
  *
  * Milestone X0 (this file's current content): --xr-probe. It opens the OpenXR runtime the way the real sink will
  * (loader -> instance -> system -> runtime-chosen Vulkan device -> session -> swapchain) but submits no frames, and

@@ -10,7 +10,7 @@
 # Options:  -n N        cycles (default 30)
 #           -g DIR      game folder (default: ~/.local/share/Steam/steamapps/common/Black Mesa, or $BMVR_GAME)
 #           --eyes 2    start the helper with two shared images (stage 3d). The game side needs `target2=...` in
-#                       bmvr_target.txt (see docs/LINUX_STEREO_HANDOFF.md); a cycle only passes when the shim
+#                       bmvr_target.txt (see docs/linux/eye-pairs.md); a cycle only passes when the shim
 #                       actually imported both eyes, so a missing target2 is reported instead of silently testing one eye
 #           --no-game-check   do not require a running bms_linux (for the stand-in tests only)
 #           -h          help
@@ -18,7 +18,7 @@
 # Start Black Mesa from Steam first (with the bmvr-run.sh launch option) and get past the startup, ideally
 # into a map. Do NOT start the helper yourself: this script starts and kills its own.
 # The script reads "$GAME/bmvr_linux_log.txt" (written by the shim) to decide PASS/FAIL per cycle.
-# If a cycle makes the game's GPU hang (the semaphore risk in docs/LINUX_PORT.md), the shim stops logging and
+# If a cycle makes the game's GPU hang (the semaphore risk in docs/linux/gpu-sync.md), the shim stops logging and
 # the cycle is reported as FAIL "shim did not notice"; restart the game afterwards.
 
 set -u

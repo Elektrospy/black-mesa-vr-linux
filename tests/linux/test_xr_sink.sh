@@ -15,7 +15,7 @@
 #   X2-g  kill -9 loop (N rounds)              -> the game process never hangs, reconnects after each kill, ticks keep counting
 #
 # What this does NOT show: the semaphore path (lavapipe has no semaphore export), the picture in a headset (Monado's null compositor
-# shows nothing), SteamVR, GL import in the real shim, or the game. See docs/LINUX_OPENXR_CONSUMER.md "X2 results".
+# shows nothing), SteamVR, GL import in the real shim, or the game. See docs/linux/openxr-results.md "X2 results".
 set -u
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 BUILD="$ROOT/build_linux_native"; SOFT=0; ROUNDS=10

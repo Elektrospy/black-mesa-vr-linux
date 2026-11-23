@@ -1,6 +1,6 @@
 /*
  * Black Mesa VR - native Linux port, stage 4b: stereo views.
- * Design: docs/LINUX_PORT.md, "Stage 4b".
+ * Design: docs/linux/stereo-views.md.
  *
  * Pure math, no engine, no GL, no libc beyond <math.h> (same style as bmvr_pose_store.h, so tests/linux/stereo_test.c can
  * check every convention without a game): turns the helper's OpenXR eye poses (struct bmvr_xfer_pose, v5) into the values the
