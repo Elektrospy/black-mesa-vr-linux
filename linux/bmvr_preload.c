@@ -497,7 +497,10 @@ static int game_dir(char *out, size_t cap)
     char *slash = strrchr(exe, '/');
     if (!slash) return 0;
     *slash = 0;
-    snprintf(out, cap, "%s", exe);
+    if (strlen(exe) >= cap) {
+        return 0;   /* a path that does not fit is no path */
+    }
+    memcpy(out, exe, strlen(exe) + 1);
     return 1;
 }
 
@@ -1904,27 +1907,46 @@ static int hd_upload(struct hd_gpu *g, const struct bh_asset *a)
 /* Loads the assets and builds the GPU objects. Runs once, inside an eye pass (the GL context is current). State is saved and restored. */
 static int hd_init(void)
 {
-    if (g_hd.state) return g_hd.state > 0;
+    if (g_hd.state) {
+        return g_hd.state > 0;
+    }
+
     g_hd.state = -1;
-    if (!xfer_resolve_gl() || !hd_resolve()) return 0;
-    char dir[400];
-    if (g_hd_dir[0]) snprintf(dir, sizeof dir, "%s", g_hd_dir);
+
+    if (!xfer_resolve_gl() || !hd_resolve()) { 
+        return 0; 
+    }
+
+    char dir[512];
+
+    if (g_hd_dir[0]) {
+        snprintf(dir, sizeof dir, "%s", g_hd_dir);
+    }
     else {
-        char gd[300];
-        if (!game_dir(gd, sizeof gd)) { bmvr_log("hands: the game folder is unknown; set hands_dir="); return 0; }
+        char gd[400];
+        if (!game_dir(gd, sizeof gd)) { 
+            bmvr_log("hands: the game folder is unknown; set hands_dir=");
+            return 0; 
+        }
         snprintf(dir, sizeof dir, "%s/VR/hands", gd);
     }
+
     static const char *const nm[2] = { "left", "right" };
+
     for (int h = 0; h < 2; h++) {
-        char path[520]; size_t n = 0;
+        char path[640]; 
+        size_t n = 0;
         snprintf(path, sizeof path, "%s/%s_%s_model.glb", dir, g_hd_bare ? "bare_hand" : "hev_glove", nm[h]);
         uint8_t *buf = bh_read_file(path, &n);
         const char *err = "cannot read the file";
         if (!buf || !bh_load_glb(&g_hd.a[h], buf, n, &err)) { bmvr_log("hands: cannot load %s: %s", path, err); free(buf); return 0; }
         free(buf);
         bmvr_log("hands: loaded %s (%d vertices, %d joints, texture %dx%d, rig %s)", path, g_hd.a[h].nv, g_hd.a[h].nj, g_hd.a[h].tw, g_hd.a[h].th, g_hd.a[h].rig_ok ? "ok" : "MISSING");
-        if (!g_hd.a[h].rig_ok) return 0;
+        if (!g_hd.a[h].rig_ok) {
+            return 0;
+        }
     }
+
     int vao = 0, abuf = 0, tex = 0, atex = 0, sam = 0, unp = 0, rl = 0, al = 4;
     xgl.GetIntegerv(GL_VERTEX_ARRAY_BINDING, &vao); xgl.GetIntegerv(GL_ARRAY_BUFFER_BINDING, &abuf);
     xgl.GetIntegerv(GL_ACTIVE_TEXTURE, &atex);
@@ -1933,10 +1955,17 @@ static int hd_init(void)
     xgl.GetIntegerv(GL_TEXTURE_BINDING_2D, &tex);
     if (hgl.BindSampler) { xgl.GetIntegerv(GL_SAMPLER_BINDING, &sam); hgl.BindSampler(0, 0); }
     hgl.BindBuffer(GL_PIXEL_UNPACK_BUFFER, 0); hgl.PixelStorei(GL_UNPACK_ROW_LENGTH, 0); hgl.PixelStorei(GL_UNPACK_ALIGNMENT, 4);
-    while (xgl.GetError()) { }
+    
+    while (xgl.GetError()) { 
+        // do nothing and wait for the error queue to clear
+    }
+    
     int ok = 1;
     unsigned vs = hd_shader(GL_VERTEX_SHADER, hd_vs), fs = hd_shader(GL_FRAGMENT_SHADER, hd_fs);
-    if (!vs || !fs) ok = 0;
+    if (!vs || !fs) {
+        ok = 0;
+    }
+
     if (ok) {
         g_hd.prog = hgl.CreateProgram();
         hgl.AttachShader(g_hd.prog, vs); hgl.AttachShader(g_hd.prog, fs);
@@ -1944,7 +1973,9 @@ static int hd_init(void)
         for (unsigned i = 0; i < 5; i++) hgl.BindAttribLocation(g_hd.prog, i, an[i]);
         hgl.LinkProgram(g_hd.prog);
         int lk = 0; hgl.GetProgramiv(g_hd.prog, GL_LINK_STATUS, &lk);
-        if (!lk) { char log[512] = { 0 }; hgl.GetProgramInfoLog(g_hd.prog, sizeof log - 1, NULL, log); bmvr_log("hands: the shader program does not link: %s", log); ok = 0; }
+        if (!lk) { 
+            char log[512] = { 0 }; hgl.GetProgramInfoLog(g_hd.prog, sizeof log - 1, NULL, log); bmvr_log("hands: the shader program does not link: %s", log); ok = 0; 
+        }
         else {
             g_hd.u_vp = hgl.GetUniformLocation(g_hd.prog, "uVP"); g_hd.u_world = hgl.GetUniformLocation(g_hd.prog, "uWorld");
             g_hd.u_pal = hgl.GetUniformLocation(g_hd.prog, "uPal[0]"); if (g_hd.u_pal < 0) g_hd.u_pal = hgl.GetUniformLocation(g_hd.prog, "uPal");

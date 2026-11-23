@@ -433,8 +433,10 @@ static inline int bh_load_glb(struct bh_asset *a, const uint8_t *d, size_t n, co
             jnode[j] = (int)bj_num(&doc, bj_at(&doc, joints, j), -1);
             const int nd = bj_at(&doc, nodes, jnode[j]);
             const int nn = bj_get(&doc, nd, "name");
-            if (nd < 0 || nn < 0) { ok = 0; e = "a joint node is missing"; break; }
-            snprintf(a->name[j], sizeof a->name[j], "%.*s", doc.v[nn].slen, doc.v[nn].s);
+            if (nd < 0 || nn < 0) { ok = 0; e = "a joint node is missing"; break; } { 
+                const size_t L = (size_t)doc.v[nn].slen < sizeof a->name[j] - 1 ? (size_t)doc.v[nn].slen : sizeof a->name[j] - 1;
+                memcpy(a->name[j], doc.v[nn].s, L); a->name[j][L] = 0; 
+            }
             a->parent[j] = -1;
         }
         for (int j = 0; ok && j < nj; j++) {
