@@ -54,6 +54,10 @@ echo "== controller -> game action mapping (slice 3a; no GPU, no game, no headse
 cc -O2 -Wall -Wextra -std=gnu11 -I"$ROOT/linux" -o "$B/input_map_test" "$T/input_map_test.c" -lm
 "$B/input_map_test" | sed 's/^/  /'
 
+echo "== hand models: inflate, PNG, GLB, finger rig, controller placement (slice 5; real VR/hands files, no GPU)"
+cc -O2 -Wall -Wextra -std=gnu11 -I"$ROOT/linux" -o "$B/hands_test" "$T/hands_test.c" -lm
+"$B/hands_test" "$ROOT/VR/hands" | sed 's/^/  /'
+
 echo "== RTTI vtable finder and slot patcher (stage 4b; real g++ RTTI as ground truth)"
 g++ -O0 -Wall -Wextra -I"$ROOT/linux" -o "$B/rtti_test" "$T/rtti_test.cpp"
 "$B/rtti_test" | sed 's/^/  /'

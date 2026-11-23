@@ -221,4 +221,25 @@ static inline int bmvr_stereo_eyes(struct bmvr_stereo_rig *r, const struct bmvr_
     return 1;
 }
 
+/* A tracked point (a controller) in the game's world, with the SAME rule the eye views use: relative to the head reference, turned by
+ * (game yaw - reference yaw) about +Z, added to the game's camera origin. pos is OpenXR metres, quat xyzw. out_f / out_r / out_u: the
+ * pose's forward / right / up axes in Source space. Returns 0 for an unusable quaternion or when there is no reference yet. */
+static inline int bmvr_stereo_pose_world(const struct bmvr_stereo_rig *r, const float pos[3], const float quat[4], const float game_origin[3],
+                                         float game_yaw_deg, float out_origin[3], float out_f[3], float out_r[3], float out_u[3])
+{
+    float q[4], f[3], l[3], u[3], p[3], rel[3], rot[3];
+    if (!r->have_ref || !bmvr_quat_ok(quat, q)) return 0;
+    const float turn = game_yaw_deg - r->ref_yaw;
+    bmvr_xr_to_src(pos, p);
+    for (int i = 0; i < 3; i++) rel[i] = p[i] * r->scale - r->ref_pos[i];
+    bmvr_rot_z(rel, turn, rot);
+    for (int i = 0; i < 3; i++) out_origin[i] = game_origin[i] + rot[i];
+    bmvr_eye_basis(q, f, l, u);
+    bmvr_rot_z(f, turn, out_f);
+    bmvr_rot_z(l, turn, rot);
+    for (int i = 0; i < 3; i++) out_r[i] = -rot[i];
+    bmvr_rot_z(u, turn, out_u);
+    return 1;
+}
+
 #endif

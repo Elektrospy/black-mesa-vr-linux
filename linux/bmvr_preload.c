@@ -39,6 +39,7 @@
 #include "bmvr_rtti.h"
 #include "bmvr_inline.h"
 #include "bmvr_input_map.h"
+#include "bmvr_hands.h"
 
 /* Portability: this library is loaded into the game, which Steam may run inside an OLDER
  * glibc (Steam Linux Runtime). Built on a modern distro it would require dlsym@GLIBC_2.34
@@ -475,6 +476,14 @@ static volatile int g_ic_body_valid;
 static float g_ic_last_yaw;                        /* the yaw we wrote into the last cmd */
 static int g_ic_aim_said;
 static int g_ic_armed, g_ic_dead;                  /* defined with their comments further down (tentative definitions; the stereo code reads them) */
+static int g_hd_want;                              /* hands=1: draw the glove / hand models at the controllers (opt-in; UNVERIFIED in the game) */
+static int g_hd_bare;                              /* hands_model=bare (default: hev) */
+static int g_hd_right;                             /* hands_right=1: also draw the weapon hand */
+static float g_hd_scale = 0.85f;                   /* hands_scale= (src/bmvr_flags.cpp g_VrHandsModelScale) */
+static float g_hd_roll = 90.0f;                    /* hands_roll= (g_VrHandsRollDeg) */
+static float g_hd_off[3] = { 0.0f, -0.008f, -0.10f };   /* hands_offset=x,y,z in metres, local to the controller (g_VrHandsPoseOff*) */
+static float g_hd_rot[3] = { 0.0f, 180.0f, 0.0f };      /* hands_rot=x,y,z in degrees (g_VrHandsPoseRot*) */
+static char g_hd_dir[400];                         /* hands_dir= (default <game folder>/VR/hands) */
 static volatile int g_st_recenter_req;             /* the right stick click asks the stereo rig to recenter on its next frame */
 
 static int game_dir(char *out, size_t cap)
@@ -606,6 +615,14 @@ static void load_cfg_once(void)
             else if (!strncmp(line, "input_module=", 13)) snprintf(g_ic_module, sizeof g_ic_module, "%.95s", line + 13);
             else if (!strncmp(line, "input_class=", 12)) { snprintf(g_ic_class, sizeof g_ic_class, "%.63s", line + 12); g_ic_class_explicit = 1; }
             else if (!strncmp(line, "input_turn_analog=", 18)) g_ic_turn_analog = line[18] != '0';
+            else if (!strncmp(line, "hands=", 6)) g_hd_want = line[6] == '1';
+            else if (!strncmp(line, "hands_model=", 12)) g_hd_bare = !strcmp(line + 12, "bare");
+            else if (!strncmp(line, "hands_right=", 12)) g_hd_right = line[12] == '1';
+            else if (!strncmp(line, "hands_scale=", 12)) { float v = (float)atof(line + 12); if (v >= 0.2f && v <= 3.0f) g_hd_scale = v; else bmvr_log("hands: bad hands_scale=%s (use 0.2..3)", line + 12); }
+            else if (!strncmp(line, "hands_roll=", 11)) g_hd_roll = (float)atof(line + 11);
+            else if (!strncmp(line, "hands_offset=", 13)) { float a, b, c; if (sscanf(line + 13, "%f,%f,%f", &a, &b, &c) == 3) { g_hd_off[0] = a; g_hd_off[1] = b; g_hd_off[2] = c; } else bmvr_log("hands: bad hands_offset=%s (use x,y,z metres)", line + 13); }
+            else if (!strncmp(line, "hands_rot=", 10)) { float a, b, c; if (sscanf(line + 10, "%f,%f,%f", &a, &b, &c) == 3) { g_hd_rot[0] = a; g_hd_rot[1] = b; g_hd_rot[2] = c; } else bmvr_log("hands: bad hands_rot=%s (use x,y,z degrees)", line + 10); }
+            else if (!strncmp(line, "hands_dir=", 10)) snprintf(g_hd_dir, sizeof g_hd_dir, "%s", line + 10);
             else if (!strncmp(line, "input_aim=", 10)) g_ic_aim = line[10] == '1';
             else if (!strncmp(line, "input_weapon_hand=", 18)) g_ic_weapon_left = !strcmp(line + 18, "left");
             else if (!strncmp(line, "input_move_hand=", 16)) g_ic_move_hand = !strcmp(line + 16, "left") ? 0 : !strcmp(line + 16, "right") ? 1 : -1;
@@ -1711,6 +1728,343 @@ static void st_dump_view(const unsigned char *v)
 }
 
 /* Draw the pair. Returns 1 when the game's own RenderView must NOT be called afterwards (the eyes were drawn). */
+/* ====================================================================== stage 5, slice 5: hand models
+ * The Windows mod draws ripped GLB hands (VR/hands/NAME.glb) at the controllers with fingers bent by trigger / grip (src/vr_hands.cpp).
+ * linux/bmvr_hands.h is that logic without the engine. This section draws the result with plain OpenGL INTO the eye target the engine
+ * just finished (st_try_stereo, after the eye's RenderView, before the blit to the helper), so the helper receives eyes that already
+ * hold the hands. The game's own GL state is saved and restored around the draw (ToGL keeps cached state).
+ * LIMITS (documented in docs/LINUX_PORT.md): the hands use their own depth buffer, so they are drawn OVER the world (a hand inside a wall
+ * still shows); light is a fixed headlight, not the scene's; no hand tracking: fingers follow trigger and grip only.
+ * STATUS: CPU half tested against the real files (tests/linux/hands_test.c); the GL half has not been run on a GPU. */
+#define GL_CURRENT_PROGRAM 0x8B8D
+#define GL_VERTEX_ARRAY_BINDING 0x85B5
+#define GL_ARRAY_BUFFER_BINDING 0x8894
+#define GL_ARRAY_BUFFER 0x8892
+#define GL_ELEMENT_ARRAY_BUFFER 0x8893
+#define GL_ACTIVE_TEXTURE 0x84E0
+#define GL_TEXTURE0 0x84C0
+#define GL_SAMPLER_BINDING 0x8919
+#define GL_DEPTH_TEST 0x0B71
+#define GL_CULL_FACE 0x0B44
+#define GL_BLEND 0x0BE2
+#define GL_STENCIL_TEST 0x0B90
+#define GL_DEPTH_FUNC 0x0B74
+#define GL_DEPTH_WRITEMASK 0x0B72
+#define GL_COLOR_WRITEMASK 0x0C23
+#define GL_FRAMEBUFFER_SRGB 0x8DB9
+#define GL_PIXEL_UNPACK_BUFFER 0x88EC
+#define GL_PIXEL_UNPACK_BUFFER_BINDING 0x88EF
+#define GL_UNPACK_ROW_LENGTH 0x0CF2
+#define GL_UNPACK_ALIGNMENT 0x0CF5
+#define GL_DEPTH_ATTACHMENT 0x8D00
+#define GL_DEPTH_COMPONENT24 0x81A6
+#define GL_DEPTH 0x1801
+#define GL_VERTEX_SHADER 0x8B31
+#define GL_FRAGMENT_SHADER 0x8B30
+#define GL_COMPILE_STATUS 0x8B81
+#define GL_LINK_STATUS 0x8B82
+#define GL_STATIC_DRAW 0x88E4
+#define GL_FLOAT_T 0x1406
+#define GL_UNSIGNED_INT_T 0x1405
+#define GL_TRIANGLES_T 0x0004
+#define GL_LESS_T 0x0201
+#define GL_RGBA8 0x8058
+#define GL_RGBA_T 0x1908
+#define GL_UNSIGNED_BYTE_T 0x1401
+#define GL_TEXTURE_MIN_FILTER 0x2801
+#define GL_TEXTURE_MAG_FILTER 0x2800
+#define GL_TEXTURE_WRAP_S 0x2802
+#define GL_TEXTURE_WRAP_T 0x2803
+#define GL_CLAMP_TO_EDGE 0x812F
+#define GL_REPEAT_T 0x2901
+
+static struct {
+    unsigned (*CreateShader)(unsigned);
+    void (*ShaderSource)(unsigned, int, const char *const *, const int *);
+    void (*CompileShader)(unsigned);
+    void (*GetShaderiv)(unsigned, unsigned, int *);
+    void (*GetShaderInfoLog)(unsigned, int, int *, char *);
+    unsigned (*CreateProgram)(void);
+    void (*AttachShader)(unsigned, unsigned);
+    void (*BindAttribLocation)(unsigned, unsigned, const char *);
+    void (*LinkProgram)(unsigned);
+    void (*GetProgramiv)(unsigned, unsigned, int *);
+    void (*GetProgramInfoLog)(unsigned, int, int *, char *);
+    void (*UseProgram)(unsigned);
+    void (*DeleteShader)(unsigned);
+    int (*GetUniformLocation)(unsigned, const char *);
+    void (*UniformMatrix4fv)(int, int, unsigned char, const float *);
+    void (*Uniform1i)(int, int);
+    void (*Uniform1f)(int, float);
+    void (*Uniform3f)(int, float, float, float);
+    void (*GenBuffers)(int, unsigned *);
+    void (*BindBuffer)(unsigned, unsigned);
+    void (*BufferData)(unsigned, long, const void *, unsigned);
+    void (*GenVertexArrays)(int, unsigned *);
+    void (*BindVertexArray)(unsigned);
+    void (*VertexAttribPointer)(unsigned, int, unsigned, unsigned char, int, const void *);
+    void (*EnableVertexAttribArray)(unsigned);
+    void (*DrawElements)(unsigned, int, unsigned, const void *);
+    void (*TexImage2D)(unsigned, int, int, int, int, int, unsigned, unsigned, const void *);
+    void (*ActiveTexture)(unsigned);
+    void (*Viewport)(int, int, int, int);
+    void (*DepthMask)(unsigned char);
+    void (*DepthFunc)(unsigned);
+    void (*ColorMask)(unsigned char, unsigned char, unsigned char, unsigned char);
+    void (*ClearBufferfv)(unsigned, int, const float *);
+    void (*GenRenderbuffers)(int, unsigned *);
+    void (*RenderbufferStorage)(unsigned, unsigned, int, int);
+    void (*BindSampler)(unsigned, unsigned);
+    void (*PixelStorei)(unsigned, int);
+} hgl;
+
+struct hd_gpu { unsigned vao, vbo, ibo, tex; int ni; };
+static struct { int state; struct bh_asset a[2]; struct hd_gpu g[2]; unsigned prog, fbo, rb, rbw, rbh; int u_vp, u_world, u_pal, u_tex, u_hastex; unsigned drawn; } g_hd;   /* a[0] left, a[1] right */
+
+static const char *const hd_vs =
+    "#version 150\n"
+    "uniform mat4 uVP; uniform mat4 uWorld; uniform mat4 uPal[32];\n"
+    "in vec3 aPos; in vec3 aNrm; in vec2 aUv; in vec4 aJ; in vec4 aW;\n"
+    "out vec2 vUv; out vec3 vN;\n"
+    "void main() {\n"
+    "  mat4 s = uPal[int(aJ.x + 0.5)] * aW.x + uPal[int(aJ.y + 0.5)] * aW.y + uPal[int(aJ.z + 0.5)] * aW.z + uPal[int(aJ.w + 0.5)] * aW.w;\n"
+    "  vec4 p = s * vec4(aPos, 1.0);\n"
+    "  vN = normalize(mat3(uWorld) * (mat3(s) * aNrm));\n"
+    "  gl_Position = uVP * (uWorld * p);\n"
+    "  vUv = aUv;\n"
+    "}\n";
+static const char *const hd_fs =
+    "#version 150\n"
+    "uniform sampler2D uTex; uniform float uHasTex;\n"
+    "in vec2 vUv; in vec3 vN; out vec4 oc;\n"
+    "void main() {\n"
+    "  vec3 base = mix(vec3(0.78, 0.60, 0.50), texture(uTex, vUv).rgb, uHasTex);\n"
+    "  float l = 0.42 + 0.58 * abs(dot(normalize(vN), normalize(vec3(0.25, -0.2, 0.95))));\n"
+    "  oc = vec4(base * l, 1.0);\n"
+    "}\n";
+
+static int hd_resolve(void)
+{
+    PFN_SDL_GL_GetProcAddress gp = g_getproc;
+    if (!gp) return 0;
+#define H(field, name) hgl.field = (void *)gp(name); if (!hgl.field) { bmvr_log("hands: GL entry point %s missing", name); return 0; }
+    H(CreateShader, "glCreateShader") H(ShaderSource, "glShaderSource") H(CompileShader, "glCompileShader") H(GetShaderiv, "glGetShaderiv")
+    H(GetShaderInfoLog, "glGetShaderInfoLog") H(CreateProgram, "glCreateProgram") H(AttachShader, "glAttachShader") H(BindAttribLocation, "glBindAttribLocation")
+    H(LinkProgram, "glLinkProgram") H(GetProgramiv, "glGetProgramiv") H(GetProgramInfoLog, "glGetProgramInfoLog") H(UseProgram, "glUseProgram")
+    H(DeleteShader, "glDeleteShader") H(GetUniformLocation, "glGetUniformLocation") H(UniformMatrix4fv, "glUniformMatrix4fv") H(Uniform1i, "glUniform1i")
+    H(Uniform1f, "glUniform1f") H(Uniform3f, "glUniform3f") H(GenBuffers, "glGenBuffers") H(BindBuffer, "glBindBuffer") H(BufferData, "glBufferData")
+    H(GenVertexArrays, "glGenVertexArrays") H(BindVertexArray, "glBindVertexArray") H(VertexAttribPointer, "glVertexAttribPointer")
+    H(EnableVertexAttribArray, "glEnableVertexAttribArray") H(DrawElements, "glDrawElements") H(TexImage2D, "glTexImage2D") H(ActiveTexture, "glActiveTexture")
+    H(Viewport, "glViewport") H(DepthMask, "glDepthMask") H(DepthFunc, "glDepthFunc") H(ColorMask, "glColorMask") H(ClearBufferfv, "glClearBufferfv")
+    H(GenRenderbuffers, "glGenRenderbuffers") H(RenderbufferStorage, "glRenderbufferStorage") H(PixelStorei, "glPixelStorei")
+#undef H
+    hgl.BindSampler = (void *)gp("glBindSampler");   /* optional */
+    return 1;
+}
+
+static unsigned hd_shader(unsigned type, const char *src)
+{
+    unsigned sh = hgl.CreateShader(type);
+    hgl.ShaderSource(sh, 1, &src, NULL);
+    hgl.CompileShader(sh);
+    int ok = 0;
+    hgl.GetShaderiv(sh, GL_COMPILE_STATUS, &ok);
+    if (!ok) { char log[512] = { 0 }; hgl.GetShaderInfoLog(sh, sizeof log - 1, NULL, log); bmvr_log("hands: the %s shader does not compile: %s", type == GL_VERTEX_SHADER ? "vertex" : "fragment", log); return 0; }
+    return sh;
+}
+
+static int hd_upload(struct hd_gpu *g, const struct bh_asset *a)
+{
+    hgl.GenVertexArrays(1, &g->vao);
+    hgl.BindVertexArray(g->vao);
+    hgl.GenBuffers(1, &g->vbo);
+    hgl.BindBuffer(GL_ARRAY_BUFFER, g->vbo);
+    hgl.BufferData(GL_ARRAY_BUFFER, (long)sizeof(float) * 16 * a->nv, a->vert, GL_STATIC_DRAW);
+    static const struct { int n, off; } at[5] = { { 3, 0 }, { 3, 12 }, { 2, 24 }, { 4, 32 }, { 4, 48 } };
+    for (unsigned i = 0; i < 5; i++) { hgl.VertexAttribPointer(i, at[i].n, GL_FLOAT_T, 0, 64, (const void *)(uintptr_t)at[i].off); hgl.EnableVertexAttribArray(i); }
+    hgl.GenBuffers(1, &g->ibo);
+    hgl.BindBuffer(GL_ELEMENT_ARRAY_BUFFER, g->ibo);
+    hgl.BufferData(GL_ELEMENT_ARRAY_BUFFER, (long)sizeof(uint32_t) * a->ni, a->idx, GL_STATIC_DRAW);
+    g->ni = a->ni;
+    if (a->tex) {
+        xgl.GenTextures(1, &g->tex);
+        xgl.BindTexture(GL_TEXTURE_2D, g->tex);
+        xgl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        xgl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        xgl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        xgl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        hgl.TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, a->tw, a->th, 0, GL_RGBA_T, GL_UNSIGNED_BYTE_T, a->tex);
+    }
+    return 1;
+}
+
+/* Loads the assets and builds the GPU objects. Runs once, inside an eye pass (the GL context is current). State is saved and restored. */
+static int hd_init(void)
+{
+    if (g_hd.state) return g_hd.state > 0;
+    g_hd.state = -1;
+    if (!xfer_resolve_gl() || !hd_resolve()) return 0;
+    char dir[400];
+    if (g_hd_dir[0]) snprintf(dir, sizeof dir, "%s", g_hd_dir);
+    else {
+        char gd[300];
+        if (!game_dir(gd, sizeof gd)) { bmvr_log("hands: the game folder is unknown; set hands_dir="); return 0; }
+        snprintf(dir, sizeof dir, "%s/VR/hands", gd);
+    }
+    static const char *const nm[2] = { "left", "right" };
+    for (int h = 0; h < 2; h++) {
+        char path[520]; size_t n = 0;
+        snprintf(path, sizeof path, "%s/%s_%s_model.glb", dir, g_hd_bare ? "bare_hand" : "hev_glove", nm[h]);
+        uint8_t *buf = bh_read_file(path, &n);
+        const char *err = "cannot read the file";
+        if (!buf || !bh_load_glb(&g_hd.a[h], buf, n, &err)) { bmvr_log("hands: cannot load %s: %s", path, err); free(buf); return 0; }
+        free(buf);
+        bmvr_log("hands: loaded %s (%d vertices, %d joints, texture %dx%d, rig %s)", path, g_hd.a[h].nv, g_hd.a[h].nj, g_hd.a[h].tw, g_hd.a[h].th, g_hd.a[h].rig_ok ? "ok" : "MISSING");
+        if (!g_hd.a[h].rig_ok) return 0;
+    }
+    int vao = 0, abuf = 0, tex = 0, atex = 0, sam = 0, unp = 0, rl = 0, al = 4;
+    xgl.GetIntegerv(GL_VERTEX_ARRAY_BINDING, &vao); xgl.GetIntegerv(GL_ARRAY_BUFFER_BINDING, &abuf);
+    xgl.GetIntegerv(GL_ACTIVE_TEXTURE, &atex);
+    xgl.GetIntegerv(GL_PIXEL_UNPACK_BUFFER_BINDING, &unp); xgl.GetIntegerv(GL_UNPACK_ROW_LENGTH, &rl); xgl.GetIntegerv(GL_UNPACK_ALIGNMENT, &al);
+    hgl.ActiveTexture(GL_TEXTURE0);
+    xgl.GetIntegerv(GL_TEXTURE_BINDING_2D, &tex);
+    if (hgl.BindSampler) { xgl.GetIntegerv(GL_SAMPLER_BINDING, &sam); hgl.BindSampler(0, 0); }
+    hgl.BindBuffer(GL_PIXEL_UNPACK_BUFFER, 0); hgl.PixelStorei(GL_UNPACK_ROW_LENGTH, 0); hgl.PixelStorei(GL_UNPACK_ALIGNMENT, 4);
+    while (xgl.GetError()) { }
+    int ok = 1;
+    unsigned vs = hd_shader(GL_VERTEX_SHADER, hd_vs), fs = hd_shader(GL_FRAGMENT_SHADER, hd_fs);
+    if (!vs || !fs) ok = 0;
+    if (ok) {
+        g_hd.prog = hgl.CreateProgram();
+        hgl.AttachShader(g_hd.prog, vs); hgl.AttachShader(g_hd.prog, fs);
+        static const char *const an[5] = { "aPos", "aNrm", "aUv", "aJ", "aW" };
+        for (unsigned i = 0; i < 5; i++) hgl.BindAttribLocation(g_hd.prog, i, an[i]);
+        hgl.LinkProgram(g_hd.prog);
+        int lk = 0; hgl.GetProgramiv(g_hd.prog, GL_LINK_STATUS, &lk);
+        if (!lk) { char log[512] = { 0 }; hgl.GetProgramInfoLog(g_hd.prog, sizeof log - 1, NULL, log); bmvr_log("hands: the shader program does not link: %s", log); ok = 0; }
+        else {
+            g_hd.u_vp = hgl.GetUniformLocation(g_hd.prog, "uVP"); g_hd.u_world = hgl.GetUniformLocation(g_hd.prog, "uWorld");
+            g_hd.u_pal = hgl.GetUniformLocation(g_hd.prog, "uPal[0]"); if (g_hd.u_pal < 0) g_hd.u_pal = hgl.GetUniformLocation(g_hd.prog, "uPal");
+            g_hd.u_tex = hgl.GetUniformLocation(g_hd.prog, "uTex"); g_hd.u_hastex = hgl.GetUniformLocation(g_hd.prog, "uHasTex");
+        }
+    }
+    if (vs) hgl.DeleteShader(vs);
+    if (fs) hgl.DeleteShader(fs);
+    if (ok) for (int h = 0; h < 2 && ok; h++) ok = hd_upload(&g_hd.g[h], &g_hd.a[h]);
+    if (ok) { xgl.GenFramebuffers(1, &g_hd.fbo); hgl.GenRenderbuffers(1, &g_hd.rb); }
+    if (!ok || xgl.GetError()) { if (ok) bmvr_log("hands: a GL error while building the GPU objects"); ok = 0; }
+    while (xgl.GetError()) { }
+    hgl.BindVertexArray((unsigned)vao); hgl.BindBuffer(GL_ARRAY_BUFFER, (unsigned)abuf);
+    xgl.BindTexture(GL_TEXTURE_2D, (unsigned)tex); hgl.ActiveTexture((unsigned)atex);
+    if (hgl.BindSampler) hgl.BindSampler(0, (unsigned)sam);
+    hgl.BindBuffer(GL_PIXEL_UNPACK_BUFFER, (unsigned)unp); hgl.PixelStorei(GL_UNPACK_ROW_LENGTH, rl); hgl.PixelStorei(GL_UNPACK_ALIGNMENT, al);
+    if (!ok) { bmvr_log("hands: disabled (see above); the game is unaffected"); return 0; }
+    g_hd.state = 1;
+    return 1;
+}
+
+/* Draws the hands into eye `e`'s target. Every GL state it touches is restored. */
+static void hd_draw_eye(unsigned e, const struct captarget *cap, const struct bmvr_view *ev, const float go[3], float game_yaw)
+{
+    if (!g_hd_want || g_hd.state < 0) return;
+    struct bmvr_xfer_input in;
+    if (!bmvr_get_input(&in) || !g_st_rig.have_ref) return;
+    int use[2] = { 0, 0 };
+    const int weapon = g_ic_weapon_left ? 0 : 1;
+    for (int h = 0; h < 2; h++) use[h] = ((in.flags & (h ? BMVR_XFER_INPUT_POSE_R : BMVR_XFER_INPUT_POSE_L)) != 0) && (g_hd_right || h != weapon);
+    if (!use[0] && !use[1]) return;
+    if (!hd_init()) return;
+
+    /* save */
+    int fbd = 0, fbr = 0, prog = 0, vao = 0, abuf = 0, atex = 0, tex = 0, sam = 0, vp[4] = { 0, 0, 0, 0 }, rbo = 0, dfunc = GL_LESS_T, dmask = 1, cmask[4] = { 1, 1, 1, 1 };
+    xgl.GetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &fbd); xgl.GetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &fbr);
+    xgl.GetIntegerv(GL_CURRENT_PROGRAM, &prog); xgl.GetIntegerv(GL_VERTEX_ARRAY_BINDING, &vao); xgl.GetIntegerv(GL_ARRAY_BUFFER_BINDING, &abuf);
+    xgl.GetIntegerv(GL_ACTIVE_TEXTURE, &atex); xgl.GetIntegerv(GL_VIEWPORT, vp); xgl.GetIntegerv(GL_RENDERBUFFER_BINDING, &rbo);
+    xgl.GetIntegerv(GL_DEPTH_FUNC, &dfunc); xgl.GetIntegerv(GL_DEPTH_WRITEMASK, &dmask); xgl.GetIntegerv(GL_COLOR_WRITEMASK, cmask);
+    hgl.ActiveTexture(GL_TEXTURE0);
+    xgl.GetIntegerv(GL_TEXTURE_BINDING_2D, &tex);
+    if (hgl.BindSampler) { xgl.GetIntegerv(GL_SAMPLER_BINDING, &sam); hgl.BindSampler(0, 0); }
+    const unsigned char en_depth = xgl.IsEnabled(GL_DEPTH_TEST), en_cull = xgl.IsEnabled(GL_CULL_FACE), en_blend = xgl.IsEnabled(GL_BLEND),
+                        en_sten = xgl.IsEnabled(GL_STENCIL_TEST), en_scis = xgl.IsEnabled(GL_SCISSOR_TEST), en_srgb = xgl.IsEnabled(GL_FRAMEBUFFER_SRGB);
+    while (xgl.GetError()) { }
+
+    int ok = 1;
+    if (g_hd.rbw != cap->w || g_hd.rbh != cap->h) {
+        xgl.BindRenderbuffer(GL_RENDERBUFFER, g_hd.rb);
+        hgl.RenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, (int)cap->w, (int)cap->h);
+        g_hd.rbw = cap->w; g_hd.rbh = cap->h;
+    }
+    xgl.BindFramebuffer(GL_DRAW_FRAMEBUFFER, g_hd.fbo);
+    if (cap->type == GL_TEXTURE_OBJ) xgl.FramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, cap->name, 0);
+    else xgl.FramebufferRenderbuffer(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, cap->name);
+    xgl.FramebufferRenderbuffer(GL_DRAW_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, g_hd.rb);
+    if (xgl.CheckFramebufferStatus(GL_DRAW_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+        static unsigned told; if (told++ < 3) bmvr_log("hands: the framebuffer on '%s' is not complete; no hands this frame", cap->label);
+        ok = 0;
+    }
+    if (ok) {
+        const int flip = xfer_pick_flip((int)e);
+        float P[16], V[16], VP[16];
+        float cf[3], cr[3], cu[3];
+        bmvr_angle_vectors(ev->angles, cf, cr, cu);
+        bh_projection(ev->fov_deg, ev->aspect, ev->frac, 1.0f, 4000.0f, !flip, P);   /* flip = 0: the target is stored top row first, as D3D wrote it */
+        bh_view(ev->origin, cr, cu, cf, V);
+        bh_mul(P, V, VP);
+
+        xgl.Disable(GL_SCISSOR_TEST); xgl.Disable(GL_CULL_FACE); xgl.Disable(GL_BLEND); xgl.Disable(GL_STENCIL_TEST); xgl.Disable(GL_FRAMEBUFFER_SRGB);
+        xgl.Enable(GL_DEPTH_TEST);
+        hgl.DepthFunc(GL_LESS_T); hgl.DepthMask(1); hgl.ColorMask(1, 1, 1, 1);
+        hgl.Viewport(0, 0, (int)cap->w, (int)cap->h);
+        const float one = 1.0f;
+        hgl.ClearBufferfv(GL_DEPTH, 0, &one);
+        hgl.UseProgram(g_hd.prog);
+        hgl.UniformMatrix4fv(g_hd.u_vp, 1, 1, VP);
+        hgl.Uniform1i(g_hd.u_tex, 0);
+
+        for (int h = 0; h < 2; h++) {
+            if (!use[h]) continue;
+            const float *aim = in.grip[h];
+            float org[3], f[3], r[3], u[3];
+            if (!bmvr_stereo_pose_world(&g_st_rig, aim, aim + 3, go, game_yaw, org, f, r, u)) continue;
+            /* the glove roll of src/vr_hands.cpp: around the controller's forward axis, mirrored per hand */
+            float ang[3], l[3] = { -r[0], -r[1], -r[2] };
+            bmvr_basis_to_angles(f, l, u, ang);
+            ang[2] += h ? g_hd_roll : -g_hd_roll;
+            bmvr_angle_vectors(ang, f, r, u);
+            float world[16], pal[BH_MAXJ][16], curls[5];
+            bh_controller_world(org, r, u, f, g_st_scale, g_hd_scale, g_hd_off, g_hd_rot, world);
+            bh_curls_from_input(in.trigger[h], in.squeeze[h], curls);
+            if (!bh_palette(&g_hd.a[h], curls, pal)) continue;
+            hgl.UniformMatrix4fv(g_hd.u_world, 1, 1, world);
+            hgl.UniformMatrix4fv(g_hd.u_pal, g_hd.a[h].nj, 1, &pal[0][0]);
+            hgl.Uniform1f(g_hd.u_hastex, g_hd.g[h].tex ? 1.0f : 0.0f);
+            xgl.BindTexture(GL_TEXTURE_2D, g_hd.g[h].tex);
+            hgl.BindVertexArray(g_hd.g[h].vao);
+            hgl.DrawElements(GL_TRIANGLES_T, g_hd.g[h].ni, GL_UNSIGNED_INT_T, 0);
+            if (g_hd.drawn++ == 0) bmvr_log("hands: first hand drawn: hand %d, eye %u, origin (%.1f %.1f %.1f), curls %.2f %.2f %.2f, scale %.1f units/m", h, e, (double)org[0], (double)org[1], (double)org[2], (double)curls[0], (double)curls[1], (double)curls[2], (double)g_st_scale);
+        }
+        if (xgl.GetError()) { static unsigned told; if (told++ < 3) bmvr_log("hands: a GL error while drawing"); }
+    }
+    /* detach and restore */
+    if (cap->type == GL_TEXTURE_OBJ) xgl.FramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
+    else xgl.FramebufferRenderbuffer(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, 0);
+    xgl.FramebufferRenderbuffer(GL_DRAW_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, 0);
+    xgl.BindFramebuffer(GL_READ_FRAMEBUFFER, (unsigned)fbr); xgl.BindFramebuffer(GL_DRAW_FRAMEBUFFER, (unsigned)fbd);
+    xgl.BindRenderbuffer(GL_RENDERBUFFER, (unsigned)rbo);
+    hgl.UseProgram((unsigned)prog); hgl.BindVertexArray((unsigned)vao); hgl.BindBuffer(GL_ARRAY_BUFFER, (unsigned)abuf);
+    xgl.BindTexture(GL_TEXTURE_2D, (unsigned)tex); hgl.ActiveTexture((unsigned)atex);
+    if (hgl.BindSampler) hgl.BindSampler(0, (unsigned)sam);
+    hgl.Viewport(vp[0], vp[1], vp[2], vp[3]);
+    hgl.DepthFunc((unsigned)dfunc); hgl.DepthMask((unsigned char)dmask); hgl.ColorMask((unsigned char)cmask[0], (unsigned char)cmask[1], (unsigned char)cmask[2], (unsigned char)cmask[3]);
+    if (en_depth) xgl.Enable(GL_DEPTH_TEST); else xgl.Disable(GL_DEPTH_TEST);
+    if (en_cull) xgl.Enable(GL_CULL_FACE); else xgl.Disable(GL_CULL_FACE);
+    if (en_blend) xgl.Enable(GL_BLEND); else xgl.Disable(GL_BLEND);
+    if (en_sten) xgl.Enable(GL_STENCIL_TEST); else xgl.Disable(GL_STENCIL_TEST);
+    if (en_scis) xgl.Enable(GL_SCISSOR_TEST); else xgl.Disable(GL_SCISSOR_TEST);
+    if (en_srgb) xgl.Enable(GL_FRAMEBUFFER_SRGB); else xgl.Disable(GL_FRAMEBUFFER_SRGB);
+    while (xgl.GetError()) { }
+}
+
 static int st_try_stereo(void *self, void *view, int clear, int what)
 {
     if (g_st_state != 1 || g_x_state != 1 || g_x_neyes != 2) return 0;
@@ -1741,7 +2095,8 @@ static int st_try_stereo(void *self, void *view, int clear, int what)
     const uint32_t pose_id = g_x_pose_pending;
     float go[3] = { vs_f(vv, VS_ORIGIN), vs_f(vv, VS_ORIGIN + 4), vs_f(vv, VS_ORIGIN + 8) };
     struct bmvr_view ev[2];
-    if (!bmvr_stereo_eyes(&g_st_rig, &pose, go, (g_ic_aim && g_ic_body_valid && g_ic_armed && !g_ic_dead) ? g_ic_body_yaw : vs_f(vv, VS_ANGLES + 4), ev)) { st_note(3, "the pose is unusable (bad quaternion or field of view)"); return 0; }
+    const float gyaw = (g_ic_aim && g_ic_body_valid && g_ic_armed && !g_ic_dead) ? g_ic_body_yaw : vs_f(vv, VS_ANGLES + 4);
+    if (!bmvr_stereo_eyes(&g_st_rig, &pose, go, gyaw, ev)) { st_note(3, "the pose is unusable (bad quaternion or field of view)"); return 0; }
 
     if (!g_st_flag_on && g_st_flag_path[0]) {        /* crash-sticky: present until ST_FLAG_CLEAR_FRAMES good frames or a clean exit */
         int fd = open(g_st_flag_path, O_WRONLY | O_CREAT, 0644);
@@ -1770,6 +2125,7 @@ static int st_try_stereo(void *self, void *view, int clear, int what)
         if (!st_find_target(&cap[e])) { st_fail_eye(e); ok = 0; break; }
         if (g_st_frames < 3 && cap[e].w != (unsigned)vs_i(vv, VS_W))
             bmvr_log("stereo: eye %u: the target '%s' is %ux%u but the view is %dx%d; the whole target is blitted", e, cap[e].label, cap[e].w, cap[e].h, vs_i(vv, VS_W), vs_i(vv, VS_H));
+        hd_draw_eye(e, &cap[e], &ev[e], go, gyaw);
         xfer_gl_save(&gs);
         ok = xfer_blit_eye(e, &cap[e], &synced, &ei[e]);
         xfer_gl_restore(&gs);

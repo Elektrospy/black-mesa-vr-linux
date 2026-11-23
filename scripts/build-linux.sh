@@ -217,6 +217,8 @@ INNER
     echo "Wrote default $GAME/bmvr_target.txt (stereo=1, stereo_hook=inline, input=1)"
   fi
   echo "Copied to $GAME/bin/bmvr_preload32.so and wrote bmvr-run.sh + bmvr-bms.sh (bms.sh untouched)"
+  # The hand models (hands=1 in bmvr_target.txt) are read from <game folder>/VR/hands at run time.
+  if [[ -d "$ROOT/VR/hands" ]]; then mkdir -p "$GAME/VR/hands" && cp -f "$ROOT"/VR/hands/*.glb "$GAME/VR/hands/" && echo "Copied the hand models to $GAME/VR/hands"; fi
   if [[ -n "$HELPER" ]]; then cp -f "$HELPER" "$GAME/bmvr_xfer_helper" && chmod +x "$GAME/bmvr_xfer_helper" && echo "Installed $GAME/bmvr_xfer_helper (64-bit, stages 2a-3a)"; fi
 
   # End-to-end self-test in a folder WITH A SPACE: fake game dir, fake bms.sh, same argument shape Steam uses.

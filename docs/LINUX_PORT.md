@@ -769,3 +769,22 @@ Shots follow the weapon hand's pointing direction instead of the head's.
 
 **Still open:** hands / viewmodel at the controller pose (the weapon is still drawn where the engine draws it, in front of the head), a wheel graphic with the
 real weapon list, pointing at menus with a controller ray.
+
+## Stage 5, slice 5: hand models (opt-in `hands=1`; CPU half tested against the real files, GL half NOT run on a GPU)
+
+The same ripped GLB hands as the Windows mod (`VR/hands/hev_glove_*_model.glb`, `bare_hand_*_model.glb`), drawn at the controllers with the fingers bent by trigger and grip.
+
+- **`linux/bmvr_hands.h`** (no engine, no GL): inflate + PNG decoder (the GLB embeds its texture), a small JSON reader, the GLB loader (one skinned mesh), the finger rig
+  and curl palette (same joint names, hinge limits and ValveBiped sign as `src/vr_hands.cpp BuildSummaryCurlPalette`), `bh_controller_world` (= `BuildControllerWorld`),
+  an off-centre per-eye projection. `bmvr_stereo_pose_world` (`bmvr_stereo.h`) puts a controller in the world with the same rule as the eyes.
+- **Drawing** (`bmvr_preload.c`, section "hands"): after each eye's RenderView, before the blit to the helper, `hd_draw_eye` draws both hands with a small GL 3.2 shader
+  (GPU skinning, 32 joint matrices) into the eye's target through a private FBO, then restores every piece of GL state it touched. The helper receives eyes that already hold the hands.
+- **Config** (`bmvr_target.txt`): `hands=1`; `hands_model=hev|bare` (default hev); `hands_right=1` also draws the weapon hand (default: only the other hand, like the Windows default);
+  `hands_scale=0.85`; `hands_roll=90` (glove roll about the controller's forward axis, mirrored per hand); `hands_offset=x,y,z` metres (default 0,-0.008,-0.10);
+  `hands_rot=x,y,z` degrees (default 0,180,0); `hands_dir=` (default `<game folder>/VR/hands`). `build-linux.sh` copies `VR/hands` into the game folder.
+- **Fingers** follow the analog trigger (index) and grip (middle, ring, pinky; thumb a little), the Windows OpenXR fallback formulas. No hand tracking, no gun-grip pose.
+- **Limits:** drawn OVER the world (own depth buffer; a hand inside a wall still shows); fixed headlight instead of the scene light; the weapon viewmodel is still drawn by the engine where it was.
+- **Not verified:** all GL drawing (shader compile on the real driver, the FBO on the engine's target, restored state, hand placement and size, texture orientation, the flip rule `!xfer_pick_flip`).
+  If the log says `hands: ... disabled`, the game is unaffected. `hands: first hand drawn: ...` appears once the first draw ran. Tune with `hands_offset` / `hands_rot` / `hands_scale` first.
+- **Tests:** `tests/linux/hands_test.c` (67 checks): all four GLBs load, PNG decodes, weights and joints are sane, open curls give the bind pose, a fist moves the fingertips and not the palm,
+  curls from trigger / grip, controller placement, projection, `pose_world`.
