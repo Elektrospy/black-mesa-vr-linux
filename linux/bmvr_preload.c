@@ -491,6 +491,7 @@ static float g_hd_rot[3] = { 0.0f, 270.0f, 0.0f };      /* hands_rot=x,y,z in de
                                                           * sat 90 degrees about the palm normal toward the thumb, so the Linux default is 0,270,0 (rotating 90 degrees back). Live: edit the file while the game runs. */
 /* The weapon viewmodel at the weapon controller (linux/bmvr_viewmodel.h). Opt-in: viewmodel=1. */
 static int g_vm_want;                              /* viewmodel=1 */
+static int g_vm_direct = 1;                        /* vm_direct=0 turns off writing the viewmodel entity's origin/angles directly (used while CalcViewModelView is not hooked) */
 static char g_vm_module[96] = "/client.so";        /* vm_module= */
 static char g_vm_class[64] = "C_BlackMesaViewModel";   /* vm_class= */
 static int g_vm_probe_n = 24;                      /* vm_probe=N: look for CalcViewModelView in slots vm_slot-N .. vm_slot+N with transparent probes (0 = trust vm_slot= only) */
@@ -669,6 +670,7 @@ static void load_cfg_once(void)
             else if (!strncmp(line, "input_turn_analog=", 18)) g_ic_turn_analog = line[18] != '0';
             else if (live_parse_line(line)) { }
             else if (!strncmp(line, "viewmodel=", 10)) g_vm_want = line[10] == '1';
+            else if (!strncmp(line, "vm_direct=", 10)) g_vm_direct = line[10] == '1';
             else if (!strncmp(line, "vm_module=", 10)) snprintf(g_vm_module, sizeof g_vm_module, "%.95s", line + 10);
             else if (!strncmp(line, "vm_class=", 9)) snprintf(g_vm_class, sizeof g_vm_class, "%.63s", line + 9);
             else if (!strncmp(line, "vm_probe=", 9)) { long v = strtol(line + 9, NULL, 10); if (v >= 0 && v <= 100) g_vm_probe_n = (int)v; else bmvr_log("viewmodel: bad vm_probe=%s (use 0..100); keeping %d", line + 9, g_vm_probe_n); }
@@ -1673,6 +1675,10 @@ typedef void (*PFN_RenderView)(void *, void *, int, int);
 static int g_st_state;                  /* 0 = not tried, 1 = hooked, -1 = refused / failed */
 static PFN_RenderView g_st_orig;
 static struct bmvr_stereo_rig g_st_rig;
+/* The game's own (mono) view origin as of the last stereo frame: the viewmodel slot search compares candidate eye positions against it. */
+static float g_st_view_org[3];
+static int g_st_view_org_valid;
+static float g_st_view_ang[3];
 static volatile int g_st_depth;         /* RenderView nesting on the thread that is inside the hook */
 static long g_st_tid;
 static int g_st_sent;                   /* this frame's pair was delivered from inside the hook */
@@ -2158,6 +2164,8 @@ static void hd_draw_eye(unsigned e, const struct captarget *cap, const struct bm
     while (xgl.GetError()) { }
 }
 
+static void vm_direct_apply(const float go[3], float gyaw);
+
 static int st_try_stereo(void *self, void *view, int clear, int what)
 {
     if (g_st_state != 1 || g_x_state != 1 || g_x_neyes != 2) return 0;
@@ -2188,6 +2196,8 @@ static int st_try_stereo(void *self, void *view, int clear, int what)
     const uint32_t pose_id = g_x_pose_pending;
     float go[3] = { vs_f(vv, VS_ORIGIN), vs_f(vv, VS_ORIGIN + 4), vs_f(vv, VS_ORIGIN + 8) };
     struct bmvr_view ev[2];
+    g_st_view_org[0] = go[0]; g_st_view_org[1] = go[1]; g_st_view_org[2] = go[2]; g_st_view_org_valid = 1;
+    g_st_view_ang[0] = vs_f(vv, VS_ANGLES); g_st_view_ang[1] = vs_f(vv, VS_ANGLES + 4); g_st_view_ang[2] = vs_f(vv, VS_ANGLES + 8);
     const float gyaw = (g_ic_aim && g_ic_body_valid && g_ic_armed && !g_ic_dead) ? g_ic_body_yaw : vs_f(vv, VS_ANGLES + 4);
     if (!bmvr_stereo_eyes(&g_st_rig, &pose, go, gyaw, ev)) { st_note(3, "the pose is unusable (bad quaternion or field of view)"); return 0; }
 
@@ -2208,6 +2218,7 @@ static int st_try_stereo(void *self, void *view, int clear, int what)
     struct captarget cap[XFER_EYES];
     memset(ei, 0, sizeof ei);
     int ok = 1, synced = 0;
+    vm_direct_apply(go, gyaw);   /* the gun to the weapon controller before either eye draws it (only while the CalcViewModelView hook is not armed) */
     g_x_t0 = now_ns();
     for (unsigned e = 0; e < 2 && ok; e++) {
         unsigned char buf[ST_VS_COPY];
@@ -2798,6 +2809,13 @@ static int vm_args_sane(const void *owner, const float *pos, const float *ang, i
     if (deep && (!vm_readable(owner, 4) || !vm_readable(pos, 12) || !vm_readable(ang, 12))) return 0;
     if (!deep && (((uintptr_t)pos & 3u) || ((uintptr_t)ang & 3u))) return 0;
     for (int i = 0; i < 3; i++) if (!(fabsf(pos[i]) < 65536.0f)) return 0;          /* also rejects NaN */
+    /* Learning only: the real CalcViewModelView receives the player's eye position, which is within a few units of the game's own view origin.
+     * Without this check a bone function (this, ptr, bone position, bone quaternion) passed as "plausible" (real log 2026-11-24: slot 244). */
+    if (deep) {
+        if (!g_st_view_org_valid) return 0;
+        const float dx = pos[0] - g_st_view_org[0], dy = pos[1] - g_st_view_org[1], dz = pos[2] - g_st_view_org[2];
+        if (!(dx * dx + dy * dy + dz * dz < 96.0f * 96.0f)) return 0;
+    }
     if (!(fabsf(ang[0]) <= 180.0f) || !(fabsf(ang[1]) <= 720.0f) || !(fabsf(ang[2]) <= 720.0f)) return 0;
     return 1;
 }
@@ -2882,7 +2900,7 @@ static void __attribute__((destructor)) vm_atexit(void)
  * The probes never change a call (a thunk that ends in a jump to the original), so probing a slot that is some other virtual is harmless; the first slot whose
  * calls look like (this, owner, eye position, eye angles) VM_LEARN times in a row wins, the probes are removed, and vm_slot is set to it. */
 #define VM_PROBE_MAX 201
-struct vm_probe { int slot; uintptr_t *vslot; uintptr_t orig; unsigned calls, checked, plausible, run, alt[2]; float last[3]; int have_last; };
+struct vm_probe { int slot; uintptr_t *vslot; uintptr_t orig; unsigned calls, checked, plausible, run, alt[2], nearlog; float last[3]; int have_last; };
 static struct vm_probe g_vmp[VM_PROBE_MAX];
 static int g_vmp_n, g_vmp_win = -1, g_vm_probe_done;
 __attribute__((unused)) static uint8_t *g_vmp_page;
@@ -2904,6 +2922,154 @@ static void vm_peek(char *out, size_t cap, uint32_t w)
     else snprintf(out, cap, "-");
 }
 
+/* ---- Direct placement. Real log 2026-11-24/25: CalcViewModelView is NOT reached through any probed slot (207..255; slot 231 never called), so it
+ * cannot be hooked yet. The probes are transparent and stay installed; each call tells us `this`, the C_BlackMesaViewModel entity. Once per delivered
+ * stereo pair, before the eyes draw, this writes the weapon controller's pose into the entity's absolute origin / angles.
+ *
+ * The first version trusted the Windows offsets (+0x294 / +0x2D0) with a loose check and CRASHED the game: on Linux those hold other data ((32.4 32.2 0.0) at
+ * both), the real origin was at +0x284. So now the offsets are FOUND, not assumed: the origin is the one float triple in the entity within 16 units of the
+ * game's view origin (the viewmodel's origin is the eye, 0.2 units off in the real log) and the angles are a float triple just after it within 12 degrees of
+ * the game's view angles; both must be the same offsets, unique, for 30 frames in a row before anything is written. After the first write the engine's
+ * own value is no longer near the eye, so the guard becomes "the value is what we wrote last frame, or near the eye again"; anything else stops the
+ * writes for that entity for good (something else owns the field). */
+#define VM_ENTS 4
+#define VM_PAIRS 3
+struct vm_pair_f { unsigned org, ang; float last[3]; int have_last; };
+static struct vm_ent { uintptr_t p; unsigned tick, good, writes, recheck; int npr; struct vm_pair_f pr[VM_PAIRS]; int dead, said_scan, said_write; } g_vm_ent[VM_ENTS];
+
+static int vm_writable(const void *p, size_t n)
+{
+    struct bmvr_map m;
+    if (!p || ((uintptr_t)p & 3u)) return 0;
+    if (!bmvr_maps_find((uintptr_t)p, &m) || m.perms[0] != 'r' || m.perms[1] != 'w') return 0;
+    return (uintptr_t)p + n <= m.hi;
+}
+
+static void vm_note_ent(uint32_t th)
+{
+    if (th < 0x10000u || (th & 3u)) return;
+    for (int i = 0; i < VM_ENTS; i++) if (g_vm_ent[i].p == th) { g_vm_ent[i].tick = g_x_tick; return; }
+    for (int i = 0; i < VM_ENTS; i++)
+        if (!g_vm_ent[i].p || g_x_tick - g_vm_ent[i].tick > 600) { memset(&g_vm_ent[i], 0, sizeof g_vm_ent[i]); g_vm_ent[i].p = th; g_vm_ent[i].tick = g_x_tick; return; }
+}
+
+static int vm_near_view(const float *v, float r)
+{
+    for (int i = 0; i < 3; i++) if (!(fabsf(v[i]) < 65536.0f)) return 0;
+    const float dx = v[0] - g_st_view_org[0], dy = v[1] - g_st_view_org[1], dz = v[2] - g_st_view_org[2];
+    return dx * dx + dy * dy + dz * dz < r * r;
+}
+
+static float vm_angdiff(float a, float b)
+{
+    float d = fmodf(a - b, 360.0f);
+    if (d > 180.0f) d -= 360.0f;
+    if (d < -180.0f) d += 360.0f;
+    return fabsf(d);
+}
+
+static int vm_near_view_ang(const float *a, float deg)
+{
+    for (int i = 0; i < 3; i++) if (!(fabsf(a[i]) < 1000.0f)) return 0;
+    return vm_angdiff(a[0], g_st_view_ang[0]) < deg && vm_angdiff(a[1], g_st_view_ang[1]) < deg && vm_angdiff(a[2], g_st_view_ang[2]) < deg + 10.0f;
+}
+
+/* Every origin-like triple (within 16 units of the view origin) that has an angles-like triple 0x10..0x80 bytes after it. Real logs: the viewmodel
+ * entity can hold TWO eye-like origins (+0x254 and +0x284 on 2026-11-25), so a unique-candidate rule found nothing; every such pair is a field set
+ * the engine keeps in step (local and absolute origin), and all of them are written. Returns the number of pairs (0..VM_PAIRS); *norg = origin-like triples seen. */
+static int vm_ent_find(const struct vm_ent *e, struct vm_pair_f out[VM_PAIRS], int *norg)
+{
+    const unsigned char *b = (const unsigned char *)e->p;
+    int n = 0;
+    *norg = 0;
+    if (!vm_readable(b, 0x500)) return 0;
+    for (unsigned off = 0x100; off + 12 <= 0x500; off += 4) {
+        if (!vm_near_view((const float *)(b + off), 16.0f)) continue;
+        (*norg)++;
+        for (unsigned ao = off + 0x10; ao <= off + 0x80 && ao + 12 <= 0x500; ao += 4)
+            if (vm_near_view_ang((const float *)(b + ao), 12.0f)) {
+                if (n < VM_PAIRS) { memset(&out[n], 0, sizeof out[n]); out[n].org = off; out[n].ang = ao; n++; }
+                break;
+            }
+    }
+    if (*norg > VM_PAIRS) return 0;      /* too many look-alikes: not an origin */
+    return n;
+}
+
+static void vm_ent_say(struct vm_ent *e, int norg)
+{
+    if (e->said_scan++) return;
+    const unsigned char *b = (const unsigned char *)e->p;
+    if (!vm_readable(b, 0x500)) { bmvr_log("viewmodel: direct: entity %#lx: the first 0x500 bytes are not readable", (unsigned long)e->p); return; }
+    int hits = 0;
+    for (unsigned off = 0x100; off + 12 <= 0x500 && hits < 8; off += 4) {
+        const float *v = (const float *)(b + off);
+        if (vm_near_view(v, 16.0f)) { hits++; bmvr_log("viewmodel: direct: entity %#lx +%#x = (%.1f %.1f %.1f) is within 16 units of the view origin (%.1f %.1f %.1f)", (unsigned long)e->p, off, (double)v[0], (double)v[1], (double)v[2], (double)g_st_view_org[0], (double)g_st_view_org[1], (double)g_st_view_org[2]); }
+    }
+    bmvr_log("viewmodel: direct: entity %#lx: %d origin candidate(s); view angles %.1f %.1f %.1f", (unsigned long)e->p, norg, (double)g_st_view_ang[0], (double)g_st_view_ang[1], (double)g_st_view_ang[2]);
+}
+
+static void vm_direct_apply(const float go[3], float gyaw)
+{
+    if (!g_vm_direct || !g_vm_want || g_vm_armed || !g_st_rig.have_ref || !g_st_view_org_valid) return;
+    struct bmvr_xfer_input in;
+    if (!bmvr_get_input(&in)) return;
+    const int w = g_ic_weapon_left ? 0 : 1;
+    if (!(in.flags & (w ? BMVR_XFER_INPUT_POSE_R : BMVR_XFER_INPUT_POSE_L))) return;
+    float np[3], na[3];
+    if (!bmvr_viewmodel_eye(&g_st_rig, in.grip[w], in.aim[w], go, gyaw, g_vm_off, g_vm_rot, np, na)) return;
+    for (int i = 0; i < VM_ENTS; i++) {
+        struct vm_ent *e = &g_vm_ent[i];
+        if (!e->p || e->dead) continue;
+        if (g_x_tick - e->tick > 300) { e->good = 0; continue; }
+        if (e->good < 30) {                                     /* discovery: nothing is written */
+            struct vm_pair_f f[VM_PAIRS];
+            int norg = 0;
+            const int n = vm_ent_find(e, f, &norg);
+            if (!n) { e->good = 0; e->npr = 0; vm_ent_say(e, norg); continue; }
+            int same = (n == e->npr);
+            for (int k = 0; same && k < n; k++) if (f[k].org != e->pr[k].org || f[k].ang != e->pr[k].ang) same = 0;
+            if (!same) { e->good = 0; e->npr = n; for (int k = 0; k < n; k++) e->pr[k] = f[k]; }
+            if (++e->good == 1) vm_ent_say(e, norg);
+            if (e->good == 30) {
+                bmvr_log("viewmodel: direct: entity %#lx: %d field set(s) found and stable for 30 frames; the weapon is now written to the controller pose", (unsigned long)e->p, e->npr);
+                for (int k = 0; k < e->npr; k++) bmvr_log("viewmodel: direct:   origin +%#x, angles +%#x", e->pr[k].org, e->pr[k].ang);
+            }
+            continue;
+        }
+        if (e->recheck == 0) {
+            int ok = 1;
+            for (int k = 0; k < e->npr; k++)
+                if (!vm_writable((float *)(e->p + e->pr[k].org), 12) || !vm_writable((float *)(e->p + e->pr[k].ang), 12)) ok = 0;
+            if (!ok) { e->dead = 1; bmvr_log("viewmodel: direct: entity %#lx: the fields are not writable any more; writes stopped for it", (unsigned long)e->p); continue; }
+            e->recheck = 120;
+        } else e->recheck--;
+        int bad = 0;
+        for (int k = 0; k < e->npr; k++) {
+            const float *org = (const float *)(e->p + e->pr[k].org);
+            if (e->pr[k].have_last) {
+                const float dx = org[0] - e->pr[k].last[0], dy = org[1] - e->pr[k].last[1], dz = org[2] - e->pr[k].last[2];
+                if (!(dx * dx + dy * dy + dz * dz < 1.0f) && !vm_near_view(org, 40.0f)) {
+                    bad = 1;
+                    bmvr_log("viewmodel: direct: entity %#lx +%#x holds (%.1f %.1f %.1f), neither what we wrote nor near the eye; writes stopped for this entity", (unsigned long)e->p, e->pr[k].org, (double)org[0], (double)org[1], (double)org[2]);
+                }
+            }
+        }
+        if (bad) { e->dead = 1; continue; }
+        for (int k = 0; k < e->npr; k++) {
+            float *org = (float *)(e->p + e->pr[k].org), *ang = (float *)(e->p + e->pr[k].ang);
+            if (!e->said_write)
+                bmvr_log("viewmodel: direct: first write to entity %#lx +%#x/+%#x: origin (%.1f %.1f %.1f) -> (%.1f %.1f %.1f), angles (%.1f %.1f %.1f) -> (%.1f %.1f %.1f)", (unsigned long)e->p, e->pr[k].org, e->pr[k].ang,
+                         (double)org[0], (double)org[1], (double)org[2], (double)np[0], (double)np[1], (double)np[2], (double)ang[0], (double)ang[1], (double)ang[2], (double)na[0], (double)na[1], (double)na[2]);
+            org[0] = np[0]; org[1] = np[1]; org[2] = np[2];
+            ang[0] = na[0]; ang[1] = na[1]; ang[2] = na[2];
+            e->pr[k].last[0] = np[0]; e->pr[k].last[1] = np[1]; e->pr[k].last[2] = np[2]; e->pr[k].have_last = 1;
+        }
+        e->said_write = 1;
+        e->writes++;
+    }
+}
+
 #if defined(__i386__)
 __attribute__((force_align_arg_pointer))
 #endif
@@ -2912,6 +3078,7 @@ __attribute__((unused)) static void vm_probe_cb(int k, const uint32_t *a)
     if (k < 0 || k >= g_vmp_n) return;
     struct vm_probe *p = &g_vmp[k];
     p->calls++;
+    vm_note_ent(a[0]);
     if (p->calls == 1 || p->calls == 2 || p->calls == 3 || p->calls == 300 || p->calls == 3000) {   /* what does this function really receive? */
         char d1[96], d2[96], d3[96];
         vm_peek(d1, sizeof d1, a[1]); vm_peek(d2, sizeof d2, a[2]); vm_peek(d3, sizeof d3, a[3]);
@@ -2919,6 +3086,20 @@ __attribute__((unused)) static void vm_probe_cb(int k, const uint32_t *a)
     }
     if (g_vmp_win >= 0 || p->checked >= 150) return;      /* bounded work: the map lookups are not free */
     p->checked++;
+    /* Which argument (if any) carries the player's eye position? The real CalcViewModelView gets a vector within a few units of the game's view
+     * origin; logged per slot so the real layout can be read off the log even when no slot passes the (owner, pos, ang) test. */
+    if (g_st_view_org_valid && p->nearlog < 4)
+        for (int k = 1; k <= 3; k++) {
+            const float *v = (const float *)(uintptr_t)a[k];
+            if ((uintptr_t)v < 0x10000u || ((uintptr_t)v & 3u) || !vm_readable(v, 12)) continue;
+            const float dx = v[0] - g_st_view_org[0], dy = v[1] - g_st_view_org[1], dz = v[2] - g_st_view_org[2];
+            if (dx * dx + dy * dy + dz * dz < 96.0f * 96.0f) {
+                p->nearlog++;
+                bmvr_log("viewmodel: probe slot %d: argument a%d points at (%.1f %.1f %.1f), within 96 units of the game's view origin (%.1f %.1f %.1f): a candidate eye position; a1=%#x a2=%#x a3=%#x a4=%#x",
+                         p->slot, k, (double)v[0], (double)v[1], (double)v[2], (double)g_st_view_org[0], (double)g_st_view_org[1], (double)g_st_view_org[2], a[1], a[2], a[3], a[4]);
+                break;
+            }
+        }
     const float *pos = (const float *)(uintptr_t)a[2], *ang = (const float *)(uintptr_t)a[3];
     const void *owner = (const void *)(uintptr_t)a[1];
     /* other layouts, only counted (the hook itself needs (owner, pos, ang)): (this, pos, ang, ...) and (this, x, pos, ang) */
@@ -2977,6 +3158,7 @@ static void vm_probe_tick(void)
     if ((g_x_tick - g_vm_hook_tick) % 600) return;
     int any = 0;
     for (int i = 0; i < g_vmp_n; i++) if (g_vmp[i].calls) { any = 1; bmvr_log("viewmodel: probe slot %d: %u calls, %u plausible as (owner, eye position, eye angles), best run %u; other layouts: (this, pos, ang) %u, (this, x, pos, ang) %u", g_vmp[i].slot, g_vmp[i].calls, g_vmp[i].plausible, g_vmp[i].run, g_vmp[i].alt[0], g_vmp[i].alt[1]); }
+    for (int i = 0; i < VM_ENTS; i++) if (g_vm_ent[i].p) bmvr_log("viewmodel: direct: entity %#lx: %u good frames, %u writes, last seen %u ticks ago", (unsigned long)g_vm_ent[i].p, g_vm_ent[i].good, g_vm_ent[i].writes, g_x_tick - g_vm_ent[i].tick);
     if (!any) bmvr_log("viewmodel: probe: none of the %d probed slots (%d..%d) has been called yet (tick %u); the viewmodel is only updated while a map is loaded and a weapon is out",
                        g_vmp_n, g_vmp[0].slot, g_vmp[g_vmp_n - 1].slot, g_x_tick);
 }
@@ -2987,7 +3169,7 @@ static void vm_try_install(void)
     g_vm_state = -1;
     char dir[400];
     if (game_dir(dir, sizeof dir)) snprintf(g_vm_flag_path, sizeof g_vm_flag_path, "%s/bmvr_in_viewmodel.flag", dir);
-    if (g_vm_flag_path[0] && access(g_vm_flag_path, F_OK) == 0) {
+    if (g_vm_flag_path[0] && !g_vm_flag_on && access(g_vm_flag_path, F_OK) == 0) {   /* !g_vm_flag_on: a flag THIS launch wrote (the probe) is not a crash */
         unlink(g_vm_flag_path);
         bmvr_log("viewmodel: bmvr_in_viewmodel.flag exists: the previous launch died while the viewmodel was being moved. It is OFF for this launch only "
                  "(the flag is removed; the next launch tries again). If it repeats, set vm_slot= or viewmodel=0.");
