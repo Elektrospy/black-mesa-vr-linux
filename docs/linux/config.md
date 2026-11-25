@@ -84,6 +84,8 @@ turns the port on.
 | `vm_extra` | `0,0,0` | forward,right,up added to the table's offsets (Windows `ViewmodelPosOffsetX/Y/Z`; live) |
 | `vm_aspect` | `1` | make the gun use the eye's aspect: finds the engine's `GetScreenAspectRatio` with transparent probes (about 300 stereo frames), tries the best 3 candidates and hooks the one that returns the window aspect; also hooks `GetViewModelFOV`. `0` turns both off |
 | `aspect_module`, `aspect_class`, `aspect_slot` | `/engine.so`, `CEngineClient`, search around 96 | where the aspect function is looked for; giving `aspect_slot` skips the search and tries that slot only |
+| `flashlight_fix`, `flashlight_class`, `flashlight_slot` | `1`, `CClientShadowMgr`, `21` | hooks `IClientShadowMgr::UpdateFlashlightState` and rewrites the player's flashlight origin and orientation with the headset pose (the beam and its shadows otherwise follow the body and lag in the left eye). `flashlight_fix=0` turns it off; slot 21 is for the 2026-11-25 `client.so` |
+| `eyes_offcenter` | `0` | `0`: each eye is drawn as the centred union frustum and its rectangle is cut out when the picture is blitted (no culling errors). `1`: the engine draws each eye as an off-centre sub-frustum (sharper, but doorway/room culling and prop culling go wrong: objects vanish while in view and return when close) |
 | `vmfov_slot_delta` | 11 | `GetViewModelFOV` is the CreateMove slot + 11 in the same vtable (Windows 32 vs 21) |
 
 Live keys (`hands_scale`, `hands_roll`, `hands_offset`, `hands_rot`, `hands_right`, `vm_offset`, `vm_rot`) are re-read when `bmvr_target.txt`

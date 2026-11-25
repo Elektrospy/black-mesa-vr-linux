@@ -500,6 +500,10 @@ static int g_vm_table = 1;                         /* vm_table=0: ignore the per
 static float g_vm_touch_ox = 5.5f;                 /* vm_touch_ox=: Windows ViewmodelPosOffsetXTouch; Steam Frame / Touch aim origin is ahead of the grip */
 static float g_vm_extra[3];                        /* vm_extra=fwd,right,up: added to the table's offsets (Windows ViewmodelPosOffsetX/Y/Z). Live. */
 static int g_ar_slot_explicit;                     /* aspect_slot= was given: no search */
+static int g_st_offc;                              /* eyes_offcenter=1: draw each eye as an off-centre sub-frustum (the Windows build's mode). 0 (default): draw the centred union frustum and crop the eye's rectangle when blitting */
+static int g_fl_want = 1;                          /* flashlight_fix=0 turns off the flashlight-state hook */
+static char g_fl_class[64] = "CClientShadowMgr";   /* flashlight_class= */
+static int g_fl_slot = 21;                         /* flashlight_slot=: IClientShadowMgr::UpdateFlashlightState (client.so 2026-11-25 build: vtable of 16CClientShadowMgr, slot 21 = module offset 0x47b5e0) */
 static int g_vm_direct = 1;                        /* vm_direct=0 turns off writing the viewmodel entity's origin/angles directly (used while CalcViewModelView is not hooked) */
 static char g_vm_module[96] = "/client.so";        /* vm_module= */
 static char g_vm_class[64] = "C_BlackMesaViewModel";   /* vm_class= */
@@ -685,6 +689,10 @@ static void load_cfg_once(void)
             else if (!strncmp(line, "vm_touch_ox=", 12)) g_vm_touch_ox = (float)atof(line + 12);
             else if (!strncmp(line, "vm_extra=", 9)) { float a, b, c; if (sscanf(line + 9, "%f,%f,%f", &a, &b, &c) == 3) { g_vm_extra[0] = a; g_vm_extra[1] = b; g_vm_extra[2] = c; } }
             else if (!strncmp(line, "vmfov_slot_delta=", 17)) { const long v = strtol(line + 17, NULL, 0); if (v > 0 && v < 100) g_vf_slot_delta = (int)v; }
+            else if (!strncmp(line, "eyes_offcenter=", 15)) g_st_offc = line[15] == '1';
+            else if (!strncmp(line, "flashlight_fix=", 15)) g_fl_want = line[15] == '1';
+            else if (!strncmp(line, "flashlight_class=", 17)) snprintf(g_fl_class, sizeof g_fl_class, "%.63s", line + 17);
+            else if (!strncmp(line, "flashlight_slot=", 16)) { const long v = strtol(line + 16, NULL, 0); if (v >= 0 && v < 400) g_fl_slot = (int)v; }
             else if (!strncmp(line, "aspect_module=", 14)) snprintf(g_ar_module, sizeof g_ar_module, "%.95s", line + 14);
             else if (!strncmp(line, "aspect_class=", 13)) snprintf(g_ar_class, sizeof g_ar_class, "%.63s", line + 13);
             else if (!strncmp(line, "aspect_slot=", 12)) { const long v = strtol(line + 12, NULL, 0); if (v >= 0 && v < 400) { g_ar_slot = (int)v; g_ar_slot_explicit = 1; } }
@@ -1570,7 +1578,7 @@ static void xfer_gl_restore(const struct glstate *g)
 
 /* Blit one captured target into the shared image of eye `e`. The caller saved the GL state. *synced: the wait for the helper's
  * previous read is issued once per pair, before the first blit. Returns 1 on success. */
-static int xfer_blit_eye(unsigned e, const struct captarget *cap, int *synced, struct eyeinfo *ei)
+static int xfer_blit_eye(unsigned e, const struct captarget *cap, int *synced, struct eyeinfo *ei, const float *crop /* l, r, b, t of the centred picture, or NULL */)
 {
     int ok = 1;
     int flip = xfer_pick_flip((int)e);
@@ -1581,7 +1589,14 @@ static int xfer_blit_eye(unsigned e, const struct captarget *cap, int *synced, s
     if (st == GL_FRAMEBUFFER_COMPLETE && xfer_gl_ok("attach target")) {
         xgl.BindFramebuffer(GL_DRAW_FRAMEBUFFER, g_x_fbo[e]);
         if (!*synced) { xfer_sync_before_blit(); *synced = 1; }   /* ONE wait before the first blit of the pair */
-        xgl.BlitFramebuffer(0, 0, (int)cap->w, (int)cap->h, 0, flip ? (int)g_x_h : 0, (int)g_x_w, flip ? 0 : (int)g_x_h,
+        int sx0 = 0, sy0 = 0, sx1 = (int)cap->w, sy1 = (int)cap->h;
+        if (crop && crop[1] > crop[0] && crop[3] > crop[2]) {      /* the eye's rectangle of a centred (union) picture; rows are top-first unless the target is flipped */
+            const float W = (float)cap->w, H = (float)cap->h;
+            sx0 = (int)(crop[0] * W + 0.5f); sx1 = (int)(crop[1] * W + 0.5f);
+            sy0 = (int)((flip ? crop[2] : 1.0f - crop[3]) * H + 0.5f); sy1 = (int)((flip ? crop[3] : 1.0f - crop[2]) * H + 0.5f);
+            if (sx1 <= sx0 || sy1 <= sy0) { sx0 = 0; sy0 = 0; sx1 = (int)cap->w; sy1 = (int)cap->h; }
+        }
+        xgl.BlitFramebuffer(sx0, sy0, sx1, sy1, 0, flip ? (int)g_x_h : 0, (int)g_x_w, flip ? 0 : (int)g_x_h,
                             GL_COLOR_BUFFER_BIT, GL_LINEAR);
         ok = xfer_gl_ok("glBlitFramebuffer (target)");
     } else {
@@ -1640,7 +1655,7 @@ static void xfer_snapshot_target(void)
     int ok = 1, synced = 0;
     struct eyeinfo ei[XFER_EYES];
     memset(ei, 0, sizeof ei);
-    for (unsigned e = 0; e < neyes && ok; e++) ok = xfer_blit_eye(e, &cap[e], &synced, &ei[e]);
+    for (unsigned e = 0; e < neyes && ok; e++) ok = xfer_blit_eye(e, &cap[e], &synced, &ei[e], NULL);
     unsigned semflag = ok ? xfer_sync_publish() : 0u;   /* ONE signal (or one glFinish) for the whole pair */
     xfer_gl_restore(&gs);
     if (!ok) return;
@@ -1746,11 +1761,14 @@ static void st_apply(unsigned char *v, const struct bmvr_view *e)
     vs_setf(v, VS_FOV, e->fov_deg);
     vs_setf(v, VS_FOVVM, e->fov_deg);
     vs_setf(v, VS_ASPECT, e->aspect);
-    v[VS_OFFC] = 1;
-    vs_setf(v, VS_OC_LEFT, e->frac[0]);
-    vs_setf(v, VS_OC_RIGHT, e->frac[1]);
-    vs_setf(v, VS_OC_BOTTOM, e->frac[2]);
-    vs_setf(v, VS_OC_TOP, e->frac[3]);
+    /* Off-centre views make the engine's areaportal setup and culling project doorways and props into the wrong part of the window: rooms and objects
+     * vanish while in view and return when you step close (the Windows build has hooks for this, see src/hooks.cpp dComputeViewMatrices). A centred
+     * (union) frustum has none of that; the eye's rectangle is cut out of the picture when it is blitted (xfer_blit_eye). */
+    v[VS_OFFC] = g_st_offc ? 1 : 0;
+    vs_setf(v, VS_OC_LEFT, g_st_offc ? e->frac[0] : 0.0f);
+    vs_setf(v, VS_OC_RIGHT, g_st_offc ? e->frac[1] : 1.0f);
+    vs_setf(v, VS_OC_BOTTOM, g_st_offc ? e->frac[2] : 0.0f);
+    vs_setf(v, VS_OC_TOP, g_st_offc ? e->frac[3] : 1.0f);
 }
 
 /* Why the hook let a view through untouched: logged once per reason (a game frame has many RenderViews). */
@@ -2122,7 +2140,7 @@ static void hd_draw_eye(unsigned e, const struct captarget *cap, const struct bm
         float P[16], V[16], VP[16];
         float cf[3], cr[3], cu[3];
         bmvr_angle_vectors(ev->angles, cf, cr, cu);
-        bh_projection(ev->fov_deg, ev->aspect, ev->frac, 1.0f, 4000.0f, !flip, P);   /* flip = 0: the target is stored top row first, as D3D wrote it */
+        { static const float full[4] = { 0.0f, 1.0f, 0.0f, 1.0f }; bh_projection(ev->fov_deg, ev->aspect, g_st_offc ? ev->frac : full, 1.0f, 4000.0f, !flip, P); }   /* flip = 0: the target is stored top row first, as D3D wrote it */
         bh_view(ev->origin, cr, cu, cf, V);
         bh_mul(P, V, VP);
 
@@ -2260,7 +2278,7 @@ static int st_try_stereo(void *self, void *view, int clear, int what)
             bmvr_log("stereo: eye %u: the target '%s' is %ux%u but the view is %dx%d; the whole target is blitted", e, cap[e].label, cap[e].w, cap[e].h, vs_i(vv, VS_W), vs_i(vv, VS_H));
         hd_draw_eye(e, &cap[e], &ev[e], go, gyaw);
         xfer_gl_save(&gs);
-        ok = xfer_blit_eye(e, &cap[e], &synced, &ei[e]);
+        ok = xfer_blit_eye(e, &cap[e], &synced, &ei[e], g_st_offc ? NULL : ev[e].frac);
         xfer_gl_restore(&gs);
     }
     g_x_armed = 0;
@@ -3283,6 +3301,90 @@ static void ar_tick(void)
     }
 }
 
+/* ---- UpdateFlashlightState (IClientShadowMgr, virtual; client.so slot 21 of 16CClientShadowMgr). The game fills FlashlightState_t (origin at +0, orientation
+ * quaternion x y z w at +0xC) from the player's BODY eye position and angles, while the eyes are drawn from the headset pose: the beam and above all its
+ * shadow depth texture follow the body, one step behind the head (seen in the left eye, which is drawn first). The Windows build hooks the same
+ * function and retargets the state to the HMD view. Here the state is rewritten in place with the head pose (the middle of the two eyes) computed from
+ * the helper's newest pose, only when the state's origin is within FL_NEAR units of the player's view origin (env_projectedtexture lights use the same
+ * function and are left alone). UNVERIFIED in the game: the log says what it did. */
+#define FL_NEAR 48.0f
+typedef void (*PFN_fl)(void *, uint32_t, void *);
+static PFN_fl g_fl_orig;
+static uintptr_t *g_fl_vt, *g_fl_vslot;
+static int g_fl_state;                     /* 0 not started, 1 hooked, -1 off */
+static unsigned g_fl_next_try, g_fl_calls, g_fl_applied, g_fl_skipped_far;
+
+static void fl_angle_quat(const float a[3], float q[4])
+{
+    const float d2r = 0.5f * 3.14159265358979f / 180.0f;
+    const float sp = sinf(a[0] * d2r), cp = cosf(a[0] * d2r), sy = sinf(a[1] * d2r), cy = cosf(a[1] * d2r), sr = sinf(a[2] * d2r), cr = cosf(a[2] * d2r);
+    q[0] = sr * cp * cy - cr * sp * sy;
+    q[1] = cr * sp * cy + sr * cp * sy;
+    q[2] = cr * cp * sy - sr * sp * cy;
+    q[3] = cr * cp * cy + sr * sp * sy;
+}
+
+#if defined(__i386__)
+__attribute__((force_align_arg_pointer))
+#endif
+static void fl_detour(void *self, uint32_t handle, void *state)
+{
+    g_fl_calls++;
+    if (state && g_st_state == 1 && g_x_neyes == 2 && g_x_poses_on && g_x_pose_pending && g_st_view_org_valid
+        && (g_x_pose_pending_data.flags & BMVR_XFER_POSE_LOCAL)) {
+        float *f = (float *)state;
+        const float org[3] = { f[0], f[1], f[2] };
+        if (fin(org[0]) && fin(org[1]) && fin(org[2])) {
+            const float dx = org[0] - g_st_view_org[0], dy = org[1] - g_st_view_org[1], dz = org[2] - g_st_view_org[2];
+            if (dx * dx + dy * dy + dz * dz <= FL_NEAR * FL_NEAR) {
+                const struct bmvr_xfer_pose pose = g_x_pose_pending_data;
+                const float gyaw = (g_ic_aim && g_ic_body_valid && g_ic_armed && !g_ic_dead) ? g_ic_body_yaw : g_st_view_ang[1];
+                struct bmvr_view ev[2];
+                if (bmvr_stereo_eyes(&g_st_rig, &pose, org, gyaw, ev)) {      /* this frame's body position, not last frame's */
+                    float q[4], mid[3];
+                    for (unsigned i = 0; i < 3; i++) mid[i] = 0.5f * (ev[0].origin[i] + ev[1].origin[i]);
+                    fl_angle_quat(ev[0].angles, q);
+                    if (g_fl_applied < 4)
+                        bmvr_log("flashlight: state %p handle %u: origin (%.1f %.1f %.1f) quat (%.3f %.3f %.3f %.3f) -> head origin (%.1f %.1f %.1f) quat (%.3f %.3f %.3f %.3f)",
+                                 state, (unsigned)(handle & 0xffff), (double)org[0], (double)org[1], (double)org[2], (double)f[3], (double)f[4], (double)f[5], (double)f[6],
+                                 (double)mid[0], (double)mid[1], (double)mid[2], (double)q[0], (double)q[1], (double)q[2], (double)q[3]);
+                    f[0] = mid[0]; f[1] = mid[1]; f[2] = mid[2];
+                    f[3] = q[0]; f[4] = q[1]; f[5] = q[2]; f[6] = q[3];
+                    g_fl_applied++;
+                }
+            } else if (!g_fl_skipped_far++) bmvr_log("flashlight: a light %.0f units from the view origin was left alone (not the player's flashlight)", (double)sqrtf(dx * dx + dy * dy + dz * dz));
+        }
+    }
+    g_fl_orig(self, handle, state);
+}
+
+static void fl_try_install(void)
+{
+    if (!g_fl_want || g_fl_state != 0 || g_st_state != 1 || g_x_tick < g_fl_next_try) return;
+    g_fl_state = -1;
+#if defined(__i386__)
+    char mangled[96];
+    snprintf(mangled, sizeof mangled, "%u%s", (unsigned)strlen(g_fl_class), g_fl_class);
+    struct bmvr_map mod[BMVR_RTTI_MAX_RANGES];
+    if (!bmvr_maps_module(g_st_module, mod, BMVR_RTTI_MAX_RANGES)) { g_fl_state = 0; g_fl_next_try = g_x_tick + 120; return; }
+    struct bmvr_vt_hit h[8];
+    const int n = bmvr_rtti_find(g_st_module, mangled, h, 8);
+    int prim = -1, nprim = 0;
+    for (int i = 0; i < n; i++) if (h[i].primary) { prim = i; nprim++; }
+    if (nprim != 1) { bmvr_log("flashlight: class '%s' has %d primary vtables in '%s' (need exactly 1); the flashlight keeps the game's body-based state", g_fl_class, nprim, g_st_module); return; }
+    g_fl_vt = (uintptr_t *)h[prim].vtable;
+    for (int i = 0; i <= g_fl_slot; i++)
+        if (!bmvr_addr_executable(g_fl_vt[i])) { bmvr_log("flashlight: vtable slot %d is not executable code: the vtable is shorter than flashlight_slot=%d", i, g_fl_slot); return; }
+    g_fl_orig = (PFN_fl)g_fl_vt[g_fl_slot];
+    uintptr_t old = 0;
+    if (!bmvr_vtable_patch(&g_fl_vt[g_fl_slot], (uintptr_t)fl_detour, &old)) { bmvr_log("flashlight: could not patch vtable slot %d (mprotect refused)", g_fl_slot); g_fl_orig = NULL; return; }
+    g_fl_vslot = &g_fl_vt[g_fl_slot];
+    g_fl_state = 1;
+    bmvr_log("flashlight: hooked %s vtable slot %d (module offset %#lx; the 2026-11-25 client.so has UpdateFlashlightState at 0x47b5e0). The player's flashlight state now follows the headset. UNVERIFIED on other builds.",
+             mangled, g_fl_slot, (unsigned long)((uintptr_t)old - mod[0].lo));
+#endif
+}
+
 /* ---- GetViewModelFOV (IClientMode). Black Mesa reads its own ~54 degrees here, whatever CViewSetup::fovViewmodel says (Windows build: dGetViewModelFOV
  * returns the eye FOV). Same safety rules as the aspect hook: 4 forwarded words, substitution only after 20 plausible originals (20..130 degrees). */
 static PFN_ar g_vf_orig;
@@ -3889,6 +3991,7 @@ static void xfer_tick(void)
     vm_status_tick();
     ar_try_install();
     ar_tick();
+    fl_try_install();
     vf_try_install();
     cfg_live_poll();
     ic_menu_tick();
