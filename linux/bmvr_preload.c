@@ -3108,12 +3108,13 @@ static void vm_direct_apply(const float go[3], float gyaw)
  *            the window's aspect (the mono view's width / height) 20 times in a row; a slot that returns anything else is taken out again at once.
  * aspect_slot= skips stage A and trusts that slot (stage B's check still applies). */
 typedef float (*PFN_ar)(void *, uint32_t, uint32_t, uint32_t, uint32_t);
+#define AR_CAND_MAX 12
 static PFN_ar g_ar_orig;
 static uintptr_t *g_ar_vslot, *g_ar_vt;
 static int g_ar_state, g_ar_verified;     /* state: 0 not started, 1 a candidate is hooked, 2 next candidate pending, 3 probing, -1 off */
 static unsigned g_ar_next_try, g_ar_calls, g_ar_good, g_ar_bad, g_ar_used, g_ar_trial_frames, g_ar_frames0;
-static int g_ar_cand[3], g_ar_ncand, g_ar_ci;
-#define AR_PROBE_MAX 64
+static int g_ar_cand[AR_CAND_MAX], g_ar_ncand, g_ar_ci;
+#define AR_PROBE_MAX 96
 struct ar_probe { int slot; uintptr_t *vslot; uintptr_t orig; unsigned eye_client, eye_other, out_client, out_other; };
 static struct ar_probe g_arp[AR_PROBE_MAX];
 static int g_arp_n;
@@ -3183,7 +3184,7 @@ static int ar_probe_start(void)
     if (!g_ar_nclient) return 0;
     g_arp_page = (uint8_t *)mmap(NULL, 4096, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (g_arp_page == (uint8_t *)MAP_FAILED) { g_arp_page = NULL; return 0; }
-    const int lo = g_ar_slot - 24 > 2 ? g_ar_slot - 24 : 2, hi = g_ar_slot + 24;
+    const int lo = g_ar_slot - 40 > 2 ? g_ar_slot - 40 : 2, hi = g_ar_slot + 40;
     for (int i = lo; i <= hi && g_arp_n < AR_PROBE_MAX; i++) {
         if (!bmvr_addr_executable(g_ar_vt[i])) break;
         struct ar_probe *p = &g_arp[g_arp_n];
@@ -3256,8 +3257,8 @@ static void ar_tick(void)
             cand[nc].slot = p->slot; cand[nc].score = d2 < d4 ? d2 : d4; nc++;
         }
         int nb = 0;
-        struct { int slot; float score; } best[3];
-        while (nb < 3 && nc > 0) {                         /* the three whose per-frame rate is closest to 2 or 4 */
+        struct { int slot; float score; } best[AR_CAND_MAX];
+        while (nb < AR_CAND_MAX && nc > 0) {               /* the candidates whose per-frame rate is closest to 2 or 4; on the real Linux run five slots tied at 2.00, so try all of them */
             int bi = 0;
             for (int i = 1; i < nc; i++) if (cand[i].score < cand[bi].score) bi = i;
             best[nb].slot = cand[bi].slot; best[nb].score = cand[bi].score; nb++;
