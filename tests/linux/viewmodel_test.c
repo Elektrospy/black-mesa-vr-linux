@@ -53,6 +53,18 @@ int main(void)
     struct bmvr_stereo_rig none; bmvr_stereo_rig_init(&none, 39.37f);
     CHECK(!bmvr_viewmodel_eye(&none, grip, aim, go, 0.0f, off, rot0, pos, ang), "no head reference is refused");
 
+    /* the Windows-style tuned placement: with no tuning it is the aim pose minus the offset along the aim basis */
+    {
+        const float tune0[3] = { 0, 0, 0 };
+        float p2[3], a2[3];
+        CHECK(bmvr_viewmodel_eye_tuned(&rig, aim, go, 0.0f, off, tune0, rot0, p2, a2), "tuned placement succeeds");
+        CHECK(near(a2[0], 0, 0.01f) && near(a2[1], 0, 0.01f) && near(a2[2], 0, 0.01f), "tuned angles %.2f %.2f %.2f, expected 0 0 0", a2[0], a2[1], a2[2]);
+        CHECK(near(p2[0], 100.0f + 39.37f - 16.0f, 0.05f) && near(p2[1], 200.0f - 9.8425f + 3.0f, 0.05f) && near(p2[2], 62.0f, 0.05f), "tuned position %.2f %.2f %.2f", p2[0], p2[1], p2[2]);
+        const float tune_y[3] = { 0, 10.0f, 0 };      /* ay 10: yaw 10 degrees to the left about up */
+        CHECK(bmvr_viewmodel_eye_tuned(&rig, aim, go, 0.0f, off, tune_y, rot0, p2, a2) && near(a2[1], 10.0f, 0.05f), "ay 10 turns the yaw by 10 (got %.2f)", a2[1]);
+        const float tune_x[3] = { 10.0f, 0, 0 };      /* ax 10: muzzle up = pitch -10 in Source */
+        CHECK(bmvr_viewmodel_eye_tuned(&rig, aim, go, 0.0f, off, tune_x, rot0, p2, a2) && near(a2[0], -10.0f, 0.05f), "ax 10 pitches the muzzle up (got %.2f)", a2[0]);
+    }
     printf("viewmodel_test: %d checks, %d failed\n", checks, fails);
     return fails ? 1 : 0;
 }

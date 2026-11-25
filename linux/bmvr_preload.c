@@ -496,6 +496,10 @@ static char g_ar_module[96] = "/engine.so";        /* aspect_module= */
 static char g_ar_class[64] = "CEngineClient";      /* aspect_class= */
 static int g_ar_slot = 96;                         /* aspect_slot=: IVEngineClient::GetScreenAspectRatio is slot 96 on the Windows build; UNVERIFIED on Linux */
 static int g_vf_slot_delta = 11;                   /* vmfov_slot_delta=: GetViewModelFOV is IClientMode slot 32, CreateMove slot 21 on the Windows build: CreateMove's slot + 11 */
+static int g_vm_table = 1;                         /* vm_table=0: ignore the per-weapon table, use vm_offset / the grip pose as before */
+static float g_vm_touch_ox = 5.5f;                 /* vm_touch_ox=: Windows ViewmodelPosOffsetXTouch; Steam Frame / Touch aim origin is ahead of the grip */
+static float g_vm_extra[3];                        /* vm_extra=fwd,right,up: added to the table's offsets (Windows ViewmodelPosOffsetX/Y/Z). Live. */
+static int g_ar_slot_explicit;                     /* aspect_slot= was given: no search */
 static int g_vm_direct = 1;                        /* vm_direct=0 turns off writing the viewmodel entity's origin/angles directly (used while CalcViewModelView is not hooked) */
 static char g_vm_module[96] = "/client.so";        /* vm_module= */
 static char g_vm_class[64] = "C_BlackMesaViewModel";   /* vm_class= */
@@ -677,10 +681,13 @@ static void load_cfg_once(void)
             else if (!strncmp(line, "viewmodel=", 10)) g_vm_want = line[10] == '1';
             else if (!strncmp(line, "vm_direct=", 10)) g_vm_direct = line[10] == '1';
             else if (!strncmp(line, "vm_aspect=", 10)) g_ar_want = line[10] == '1';
+            else if (!strncmp(line, "vm_table=", 9)) g_vm_table = line[9] == '1';
+            else if (!strncmp(line, "vm_touch_ox=", 12)) g_vm_touch_ox = (float)atof(line + 12);
+            else if (!strncmp(line, "vm_extra=", 9)) { float a, b, c; if (sscanf(line + 9, "%f,%f,%f", &a, &b, &c) == 3) { g_vm_extra[0] = a; g_vm_extra[1] = b; g_vm_extra[2] = c; } }
             else if (!strncmp(line, "vmfov_slot_delta=", 17)) { const long v = strtol(line + 17, NULL, 0); if (v > 0 && v < 100) g_vf_slot_delta = (int)v; }
             else if (!strncmp(line, "aspect_module=", 14)) snprintf(g_ar_module, sizeof g_ar_module, "%.95s", line + 14);
             else if (!strncmp(line, "aspect_class=", 13)) snprintf(g_ar_class, sizeof g_ar_class, "%.63s", line + 13);
-            else if (!strncmp(line, "aspect_slot=", 12)) { const long v = strtol(line + 12, NULL, 0); if (v >= 0 && v < 400) g_ar_slot = (int)v; }
+            else if (!strncmp(line, "aspect_slot=", 12)) { const long v = strtol(line + 12, NULL, 0); if (v >= 0 && v < 400) { g_ar_slot = (int)v; g_ar_slot_explicit = 1; } }
             else if (!strncmp(line, "vm_module=", 10)) snprintf(g_vm_module, sizeof g_vm_module, "%.95s", line + 10);
             else if (!strncmp(line, "vm_class=", 9)) snprintf(g_vm_class, sizeof g_vm_class, "%.63s", line + 9);
             else if (!strncmp(line, "vm_probe=", 9)) { long v = strtol(line + 9, NULL, 10); if (v >= 0 && v <= 100) g_vm_probe_n = (int)v; else bmvr_log("viewmodel: bad vm_probe=%s (use 0..100); keeping %d", line + 9, g_vm_probe_n); }
@@ -1694,6 +1701,7 @@ static float g_st_view_ang[3];
 static int g_ar_in_eye;
 static float g_ar_eye_aspect;
 static float g_ar_eye_fov;
+static float g_ar_win_aspect;                       /* the mono view's width / height: what the engine's GetScreenAspectRatio returns */
 static volatile int g_st_depth;         /* RenderView nesting on the thread that is inside the hook */
 static long g_st_tid;
 static int g_st_sent;                   /* this frame's pair was delivered from inside the hook */
@@ -2180,6 +2188,8 @@ static void hd_draw_eye(unsigned e, const struct captarget *cap, const struct bm
 }
 
 static void vm_direct_apply(const float go[3], float gyaw);
+static void vm_model_tick(void);
+static void ar_tick(void);
 
 static int st_try_stereo(void *self, void *view, int clear, int what)
 {
@@ -2212,6 +2222,7 @@ static int st_try_stereo(void *self, void *view, int clear, int what)
     float go[3] = { vs_f(vv, VS_ORIGIN), vs_f(vv, VS_ORIGIN + 4), vs_f(vv, VS_ORIGIN + 8) };
     struct bmvr_view ev[2];
     g_st_view_org[0] = go[0]; g_st_view_org[1] = go[1]; g_st_view_org[2] = go[2]; g_st_view_org_valid = 1;
+    g_ar_win_aspect = vs_i(vv, VS_H) > 0 ? (float)vs_i(vv, VS_W) / (float)vs_i(vv, VS_H) : 0.0f;
     g_st_view_ang[0] = vs_f(vv, VS_ANGLES); g_st_view_ang[1] = vs_f(vv, VS_ANGLES + 4); g_st_view_ang[2] = vs_f(vv, VS_ANGLES + 8);
     const float gyaw = (g_ic_aim && g_ic_body_valid && g_ic_armed && !g_ic_dead) ? g_ic_body_yaw : vs_f(vv, VS_ANGLES + 4);
     if (!bmvr_stereo_eyes(&g_st_rig, &pose, go, gyaw, ev)) { st_note(3, "the pose is unusable (bad quaternion or field of view)"); return 0; }
@@ -2233,6 +2244,7 @@ static int st_try_stereo(void *self, void *view, int clear, int what)
     struct captarget cap[XFER_EYES];
     memset(ei, 0, sizeof ei);
     int ok = 1, synced = 0;
+    vm_model_tick();
     vm_direct_apply(go, gyaw);   /* the gun to the weapon controller before either eye draws it (only while the CalcViewModelView hook is not armed) */
     g_x_t0 = now_ns();
     for (unsigned e = 0; e < 2 && ok; e++) {
@@ -2837,6 +2849,8 @@ static int vm_args_sane(const void *owner, const float *pos, const float *ang, i
     return 1;
 }
 
+static int vm_pose(const struct bmvr_xfer_input *in, const float go[3], float gyaw, float np[3], float na[3]);
+
 /* The substitute eye for this call, or 0 to leave the call alone. */
 static int vm_place(const float *pos, const float *ang, float np[3], float na[3])
 {
@@ -2846,7 +2860,7 @@ static int vm_place(const float *pos, const float *ang, float np[3], float na[3]
     if (!(in.flags & (w ? BMVR_XFER_INPUT_POSE_R : BMVR_XFER_INPUT_POSE_L))) return 0;
     const float gyaw = (g_ic_aim && g_ic_body_valid && g_ic_armed && !g_ic_dead) ? g_ic_body_yaw : ang[1];
     const float go[3] = { pos[0], pos[1], pos[2] };
-    if (!bmvr_viewmodel_eye(&g_st_rig, in.grip[w], in.aim[w], go, gyaw, g_vm_off, g_vm_rot, np, na)) return 0;
+    if (!vm_pose(&in, go, gyaw, np, na)) return 0;
     static int said;
     if (!said) {
         said = 1;
@@ -3034,7 +3048,7 @@ static void vm_direct_apply(const float go[3], float gyaw)
     const int w = g_ic_weapon_left ? 0 : 1;
     if (!(in.flags & (w ? BMVR_XFER_INPUT_POSE_R : BMVR_XFER_INPUT_POSE_L))) return;
     float np[3], na[3];
-    if (!bmvr_viewmodel_eye(&g_st_rig, in.grip[w], in.aim[w], go, gyaw, g_vm_off, g_vm_rot, np, na)) return;
+    if (!vm_pose(&in, go, gyaw, np, na)) return;
     for (int i = 0; i < VM_ENTS; i++) {
         struct vm_ent *e = &g_vm_ent[i];
         if (!e->p || e->dead) continue;
@@ -3087,30 +3101,43 @@ static void vm_direct_apply(const float go[3], float gyaw)
     }
 }
 
-/* ---- GetScreenAspectRatio. The detour forwards 4 argument words so it is indifferent to the real argument count, and it only starts to substitute
- * after the original returned a plausible aspect (0.5..3.5) 20 times: a wrong slot returns something else, which switches the hook off again within 2 calls. */
+/* ---- GetScreenAspectRatio. Real log 2026-11-25: slot 96 of CEngineClient (the Windows slot) is never called, so the slot is searched for:
+ *   stage A  transparent probes (the safe jmp thunk of bmvr_probe.h) on slots 96-24 .. 96+24 count, per slot, the calls that come from client.so while an eye is
+ *            being drawn (the return address is args[-1]). DrawViewModels asks for the aspect once per viewmodel per eye: a few calls per frame.
+ *   stage B  the best candidates (at most 3) are tried one after another with a detour that forwards 4 argument words and only believes a slot that returns
+ *            the window's aspect (the mono view's width / height) 20 times in a row; a slot that returns anything else is taken out again at once.
+ * aspect_slot= skips stage A and trusts that slot (stage B's check still applies). */
 typedef float (*PFN_ar)(void *, uint32_t, uint32_t, uint32_t, uint32_t);
 static PFN_ar g_ar_orig;
-static uintptr_t *g_ar_vslot;
-static int g_ar_state, g_ar_verified;
-static unsigned g_ar_next_try, g_ar_calls, g_ar_good, g_ar_bad, g_ar_used;
+static uintptr_t *g_ar_vslot, *g_ar_vt;
+static int g_ar_state, g_ar_verified;     /* state: 0 not started, 1 a candidate is hooked, 2 next candidate pending, 3 probing, -1 off */
+static unsigned g_ar_next_try, g_ar_calls, g_ar_good, g_ar_bad, g_ar_used, g_ar_trial_frames, g_ar_frames0;
+static int g_ar_cand[3], g_ar_ncand, g_ar_ci;
+#define AR_PROBE_MAX 64
+struct ar_probe { int slot; uintptr_t *vslot; uintptr_t orig; unsigned eye_client, eye_other, out_client, out_other; };
+static struct ar_probe g_arp[AR_PROBE_MAX];
+static int g_arp_n;
+static uint8_t *g_arp_page;
+static struct bmvr_map g_ar_client[BMVR_RTTI_MAX_RANGES];
+static int g_ar_nclient;
+
+static void ar_unhook(void)
+{
+    if (g_ar_vslot) { uintptr_t old; bmvr_vtable_patch(g_ar_vslot, (uintptr_t)g_ar_orig, &old); g_ar_vslot = NULL; }
+}
 
 static float ar_detour(void *self, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t a4)
 {
     const float r = g_ar_orig(self, a1, a2, a3, a4);
     g_ar_calls++;
     if (!g_ar_verified) {
-        if (r > 0.5f && r < 3.5f) {
-            if (++g_ar_good >= 20) { g_ar_verified = 1; bmvr_log("aspect: slot %d returns a plausible screen aspect (%.3f) 20 times in a row: it is GetScreenAspectRatio. During the eye passes it now returns the eye's aspect.", g_ar_slot, (double)r); }
-        } else {
-            g_ar_good = 0;
-            if (++g_ar_bad >= 2 && g_ar_vslot) {
-                uintptr_t old;
-                bmvr_vtable_patch(g_ar_vslot, (uintptr_t)g_ar_orig, &old);
-                g_ar_vslot = NULL;
-                g_ar_state = -1;
-                bmvr_log("aspect: slot %d does not return a screen aspect (%.3f); the hook is removed (set aspect_slot= or vm_aspect=0)", g_ar_slot, (double)r);
-            }
+        const int ok = g_ar_win_aspect > 0.3f ? fabsf(r - g_ar_win_aspect) < 0.03f : (r > 0.5f && r < 3.5f);
+        if (ok) {
+            if (++g_ar_good >= 20) { g_ar_verified = 1; bmvr_log("aspect: slot %d returns the window's aspect (%.3f) 20 times in a row: it is GetScreenAspectRatio. During the eye passes it now returns the eye's aspect.", g_ar_slot, (double)r); }
+        } else if (g_ar_vslot) {
+            ar_unhook();
+            bmvr_log("aspect: slot %d returned %.3f, not the window aspect %.3f; the hook is removed", g_ar_slot, (double)r, (double)g_ar_win_aspect);
+            g_ar_state = g_ar_slot_explicit ? -1 : 2;
         }
         return r;
     }
@@ -3119,6 +3146,63 @@ static float ar_detour(void *self, uint32_t a1, uint32_t a2, uint32_t a3, uint32
         return g_ar_eye_aspect;
     }
     return r;
+}
+
+static int ar_hook(int slot)
+{
+    g_ar_slot = slot;
+    g_ar_orig = (PFN_ar)g_ar_vt[slot];
+    g_ar_good = g_ar_bad = 0; g_ar_verified = 0;
+    uintptr_t old = 0;
+    if (!bmvr_vtable_patch(&g_ar_vt[slot], (uintptr_t)ar_detour, &old)) { bmvr_log("aspect: could not patch vtable slot %d (mprotect refused)", slot); g_ar_orig = NULL; return 0; }
+    g_ar_vslot = &g_ar_vt[slot];
+    g_ar_state = 1;
+    g_ar_trial_frames = g_st_frames;
+    if (g_vm_flag_path[0] && !g_vm_flag_on) { int fd = open(g_vm_flag_path, O_WRONLY | O_CREAT, 0644); if (fd >= 0) { close(fd); g_vm_flag_on = 1; } }
+    bmvr_log("aspect: trying vtable slot %d (was %#lx): it only substitutes after returning the window aspect 20 times", slot, (unsigned long)old);
+    return 1;
+}
+
+#if defined(__i386__)
+__attribute__((force_align_arg_pointer))
+#endif
+static void ar_probe_cb(int k, const uint32_t *a)
+{
+    if (k < 0 || k >= g_arp_n) return;
+    struct ar_probe *p = &g_arp[k];
+    const uintptr_t ret = a[-1];
+    int cl = 0;
+    for (int i = 0; i < g_ar_nclient; i++) if (ret >= g_ar_client[i].lo && ret < g_ar_client[i].hi) cl = 1;
+    if (g_ar_in_eye) { if (cl) p->eye_client++; else p->eye_other++; } else { if (cl) p->out_client++; else p->out_other++; }
+}
+
+static int ar_probe_start(void)
+{
+#if defined(__i386__)
+    g_ar_nclient = bmvr_maps_module(g_st_module, g_ar_client, BMVR_RTTI_MAX_RANGES);
+    if (!g_ar_nclient) return 0;
+    g_arp_page = (uint8_t *)mmap(NULL, 4096, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (g_arp_page == (uint8_t *)MAP_FAILED) { g_arp_page = NULL; return 0; }
+    const int lo = g_ar_slot - 24 > 2 ? g_ar_slot - 24 : 2, hi = g_ar_slot + 24;
+    for (int i = lo; i <= hi && g_arp_n < AR_PROBE_MAX; i++) {
+        if (!bmvr_addr_executable(g_ar_vt[i])) break;
+        struct ar_probe *p = &g_arp[g_arp_n];
+        p->slot = i; p->vslot = &g_ar_vt[i]; p->orig = g_ar_vt[i];
+        uint8_t *th = g_arp_page + (size_t)g_arp_n * BMVR_PROBE_THUNK_SIZE;
+        if (bmvr_probe_thunk(th, (uint32_t)g_arp_n, ar_probe_cb, g_ar_vt[i]) != BMVR_PROBE_THUNK_SIZE) continue;
+        uintptr_t old;
+        if (!bmvr_vtable_patch(&g_ar_vt[i], (uintptr_t)th, &old)) continue;
+        g_arp_n++;
+    }
+    if (!g_arp_n) return 0;
+    g_ar_state = 3;
+    g_ar_frames0 = g_st_frames;
+    if (g_vm_flag_path[0] && !g_vm_flag_on) { int fd = open(g_vm_flag_path, O_WRONLY | O_CREAT, 0644); if (fd >= 0) { close(fd); g_vm_flag_on = 1; } }
+    bmvr_log("aspect: PROBING engine vtable slots %d..%d (%d slots) for GetScreenAspectRatio: transparent probes, nothing is changed. Evaluated after 300 stereo frames.", g_arp[0].slot, g_arp[g_arp_n - 1].slot, g_arp_n);
+    return 1;
+#else
+    return 0;
+#endif
 }
 
 static void ar_try_install(void)
@@ -3147,18 +3231,55 @@ static void ar_try_install(void)
         bmvr_rtti_list(g_ar_module, "EngineClient", st_list_cb, &l);
         return;
     }
-    uintptr_t *vt = (uintptr_t *)h[prim].vtable;
+    g_ar_vt = (uintptr_t *)h[prim].vtable;
     for (int i = 0; i <= g_ar_slot; i++)
-        if (!bmvr_addr_executable(vt[i])) { bmvr_log("aspect: vtable slot %d is not executable code: the vtable is shorter than aspect_slot=%d", i, g_ar_slot); return; }
-    for (int i = g_ar_slot - 1; i <= g_ar_slot + 1; i++)
-        if (i >= 0 && bmvr_addr_executable(vt[i])) bmvr_log("aspect:   slot %3d -> %#lx (module offset %#lx)%s", i, (unsigned long)vt[i], (unsigned long)(vt[i] - mod[0].lo), i == g_ar_slot ? "   <- GetScreenAspectRatio?" : "");
-    g_ar_orig = (PFN_ar)vt[g_ar_slot];
-    uintptr_t old = 0;
-    if (!bmvr_vtable_patch(&vt[g_ar_slot], (uintptr_t)ar_detour, &old)) { bmvr_log("aspect: could not patch the vtable slot (mprotect refused)"); g_ar_orig = NULL; return; }
-    g_ar_vslot = &vt[g_ar_slot];
-    g_ar_state = 1;
-    if (g_vm_flag_path[0] && !g_vm_flag_on) { int fd = open(g_vm_flag_path, O_WRONLY | O_CREAT, 0644); if (fd >= 0) { close(fd); g_vm_flag_on = 1; } }
-    bmvr_log("aspect: hooked %s vtable slot %d (was %#lx). It only substitutes after the original has returned a plausible aspect 20 times. UNVERIFIED on this build.", mangled, g_ar_slot, (unsigned long)old);
+        if (!bmvr_addr_executable(g_ar_vt[i])) { bmvr_log("aspect: vtable slot %d is not executable code: the vtable is shorter than aspect_slot=%d", i, g_ar_slot); return; }
+    if (g_ar_slot_explicit) { ar_hook(g_ar_slot); return; }
+    if (!ar_probe_start()) { bmvr_log("aspect: could not start probing (32-bit build only); trying slot %d alone", g_ar_slot); ar_hook(g_ar_slot); }
+}
+
+static void ar_tick(void)
+{
+    if (g_ar_state == 3) {
+        const unsigned fr = g_st_frames - g_ar_frames0;
+        if (fr < 300) return;
+        struct { int slot; float score; } cand[AR_PROBE_MAX];
+        int nc = 0;
+        for (int i = 0; i < g_arp_n; i++) {
+            const struct ar_probe *p = &g_arp[i];
+            if (p->eye_client || p->eye_other || p->out_client || p->out_other)
+                bmvr_log("aspect: probe slot %d: %u calls from client.so in the eye passes (%.2f per frame), %u from elsewhere in them, %u / %u outside them (client.so / other)",
+                         p->slot, p->eye_client, (double)p->eye_client / fr, p->eye_other, p->out_client, p->out_other);
+            const float rt = (float)p->eye_client / (float)fr;
+            if (rt < 1.5f || rt > 12.0f) continue;
+            const float d2 = fabsf(rt - 2.0f), d4 = fabsf(rt - 4.0f);
+            cand[nc].slot = p->slot; cand[nc].score = d2 < d4 ? d2 : d4; nc++;
+        }
+        int nb = 0;
+        struct { int slot; float score; } best[3];
+        while (nb < 3 && nc > 0) {                         /* the three whose per-frame rate is closest to 2 or 4 */
+            int bi = 0;
+            for (int i = 1; i < nc; i++) if (cand[i].score < cand[bi].score) bi = i;
+            best[nb].slot = cand[bi].slot; best[nb].score = cand[bi].score; nb++;
+            nc--; cand[bi].slot = cand[nc].slot; cand[bi].score = cand[nc].score;
+        }
+        for (int i = 0; i < g_arp_n; i++) { uintptr_t old; bmvr_vtable_patch(g_arp[i].vslot, g_arp[i].orig, &old); }
+        g_arp_n = 0;
+        g_ar_ncand = nb; g_ar_ci = 0;
+        for (int i = 0; i < nb; i++) g_ar_cand[i] = best[i].slot;
+        if (!nb) { bmvr_log("aspect: no slot in the probed range is called 1.5..12 times per frame from client.so during the eye passes; the gun keeps the window aspect"); g_ar_state = -1; return; }
+        bmvr_log("aspect: %d candidate slot(s) from the probes; trying them one at a time (set aspect_slot= to the one that verifies to skip this next time)", nb);
+        g_ar_state = 2;
+    }
+    if (g_ar_state == 1 && !g_ar_verified && !g_ar_slot_explicit && g_st_frames - g_ar_trial_frames > 200) {
+        ar_unhook();
+        bmvr_log("aspect: slot %d was not called 20 times in 200 frames; the hook is removed", g_ar_slot);
+        g_ar_state = 2;
+    }
+    if (g_ar_state == 2) {
+        if (g_ar_ci >= g_ar_ncand) { bmvr_log("aspect: none of the candidates is GetScreenAspectRatio; the gun keeps the window aspect"); g_ar_state = -1; return; }
+        if (!ar_hook(g_ar_cand[g_ar_ci++])) g_ar_state = 2;
+    }
 }
 
 /* ---- GetViewModelFOV (IClientMode). Black Mesa reads its own ~54 degrees here, whatever CViewSetup::fovViewmodel says (Windows build: dGetViewModelFOV
@@ -3211,6 +3332,92 @@ static void vf_try_install(void)
     if (g_vm_flag_path[0] && !g_vm_flag_on) { int fd = open(g_vm_flag_path, O_WRONLY | O_CREAT, 0644); if (fd >= 0) { close(fd); g_vm_flag_on = 1; } }
     bmvr_log("viewmodel fov: hooked the CreateMove class's vtable slot %d (CreateMove %d + %d; was %#lx). It only substitutes after the original has returned a plausible FOV 20 times. UNVERIFIED on this build.",
              g_vf_slot, g_ic_slot, g_vf_slot_delta, (unsigned long)old);
+}
+
+/* ---- Per-weapon placement: the Windows build's ClassifyViewmodel table (HMD-tuned, "2026-08-28 saved poses" plus later retunes). ox/oy/oz: Source units
+ * back / left / down of the controller along the turned basis (positive ox pulls back); ax/ay/az: degrees (pitch about right, yaw about up, roll about forward). */
+struct vm_cls { float ox, oy, oz, ax, ay, az; const char *key; };
+static struct vm_cls g_vm_cls;
+static int g_vm_cls_ok;
+static char g_vm_model[100];
+
+static int vm_classify(const char *name, struct vm_cls *c)
+{
+    char m[160];
+    size_t n = 0;
+    for (; n + 1 < sizeof m && name[n]; n++) m[n] = (char)((name[n] >= 'A' && name[n] <= 'Z') ? name[n] + 32 : name[n]);
+    m[n] = 0;
+#define HAS(x) (strstr(m, x) != NULL)
+#define SETC(a, b, c_, d, e, f, k) do { c->ox = a; c->oy = b; c->oz = c_; c->ax = d; c->ay = e; c->az = f; c->key = k; return 1; } while (0)
+    if (HAS("crowbar") || HAS("wrench")) SETC(12.5f, 8.f, -8.5f, -24.5f, -6.5f, -6.f, "crowbar");
+    if (HAS("glock") || HAS("pistol") || HAS("9mm") || HAS("beretta")) SETC(16.5f, 4.f, -7.f, 0.f, 0.f, 0.f, "glock");
+    if (HAS("357") || HAS("python") || HAS("revolver")) SETC(10.f, 3.5f, -5.5f, 0.5f, 0.f, 0.f, "357");
+    if (HAS("mp5") || HAS("smg")) SETC(9.f, 4.5f, -9.f, 2.f, -1.5f, 0.f, "mp5");
+    if (HAS("shotgun") || HAS("spas") || HAS("pump")) SETC(9.f, 8.f, -9.5f, -1.5f, -4.5f, 0.f, "shotgun");
+    if (HAS("crossbow")) SETC(12.5f, 11.35f, -13.f, 1.5f, -3.5f, -3.f, "crossbow");
+    if (HAS("rpg") || HAS("rocket")) SETC(12.f, 10.5f, -6.5f, -1.f, 0.f, 0.f, "rpg");
+    if (HAS("gauss") || HAS("tau")) SETC(15.f, 11.5f, -16.5f, -5.5f, -8.f, 0.f, "gauss");
+    if (HAS("egon") || HAS("gluon")) SETC(19.f, 8.f, -2.f, -1.5f, -2.f, 0.f, "gluon");
+    if (HAS("hgun") || HAS("hive") || HAS("hornet")) SETC(19.5f, 11.34f, -17.69f, -1.5f, -2.f, 0.f, "hgun");
+    if (HAS("grenade") || HAS("frag")) SETC(15.f, 6.5f, -8.f, 0.f, 0.f, 0.f, "grenade");
+    if (HAS("satchel")) SETC(19.f, -10.f, -12.f, 0.f, 0.f, 0.f, "satchel");
+    if (HAS("tripmine") || HAS("trip")) SETC(12.5f, 4.5f, -9.5f, 0.f, 0.f, 0.f, "tripmine");
+    if (HAS("squeak") || HAS("snark")) SETC(15.f, 7.5f, -6.5f, 0.f, 0.f, 0.f, "snark");
+#undef SETC
+#undef HAS
+    return 0;
+}
+
+/* The model path of a viewmodel entity: C_BaseEntity holds a model_t* (path at +4, or the path itself). The offset is not known on Linux, so look for it. */
+static int vm_find_model(uintptr_t ent, char *out, size_t n)
+{
+    const unsigned char *b = (const unsigned char *)ent;
+    if (!vm_readable(b, 0x400)) return 0;
+    for (unsigned off = 0x20; off + 4 <= 0x400; off += 4) {
+        uint32_t v;
+        memcpy(&v, b + off, 4);
+        if (v < 0x10000u || (v & 3u) || v > 0xfff00000u) continue;
+        for (int pass = 0; pass < 2; pass++) {
+            const char *nm = (const char *)(uintptr_t)(v + (pass == 0 ? 4u : 0u));
+            if (!vm_readable(nm, 48)) continue;
+            if (!strncasecmp(nm, "models/", 7) || !strncasecmp(nm, "models\\", 7)) {
+                size_t k = 0;
+                while (k + 1 < n && k < 95 && nm[k] >= 32 && nm[k] < 127) { out[k] = nm[k]; k++; }
+                out[k] = 0;
+                if (strstr(out, ".mdl")) return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+static void vm_model_tick(void)
+{
+    if (!g_vm_table || !g_vm_want || (g_st_frames % 90) != 5) return;
+    for (int i = 0; i < VM_ENTS; i++) {
+        if (!g_vm_ent[i].p || g_x_tick - g_vm_ent[i].tick > 300) continue;
+        char name[100];
+        if (!vm_find_model(g_vm_ent[i].p, name, sizeof name)) { static int said; if (!said++) bmvr_log("viewmodel: table: no model path found in the entity %#lx (first 0x400 bytes); the per-weapon table is not used", (unsigned long)g_vm_ent[i].p); continue; }
+        struct vm_cls c;
+        if (vm_classify(name, &c) && (strcmp(name, g_vm_model) || !g_vm_cls_ok)) {
+            g_vm_cls = c; g_vm_cls_ok = 1;
+            snprintf(g_vm_model, sizeof g_vm_model, "%s", name);
+            bmvr_log("viewmodel: table: '%s' is a %s: offset %.1f+%.1f(touch) %.1f %.1f, angles %.1f %.1f %.1f", name, c.key, (double)c.ox, (double)g_vm_touch_ox, (double)c.oy, (double)c.oz, (double)c.ax, (double)c.ay, (double)c.az);
+        } else if (!g_vm_cls_ok) {
+            static unsigned said; if (said++ < 4) bmvr_log("viewmodel: table: '%s' is not in the weapon table", name);
+        }
+    }
+}
+
+static int vm_pose(const struct bmvr_xfer_input *in, const float go[3], float gyaw, float np[3], float na[3])
+{
+    const int w = g_ic_weapon_left ? 0 : 1;
+    if (g_vm_table && g_vm_cls_ok) {
+        const float off[3] = { g_vm_cls.ox + g_vm_touch_ox + g_vm_extra[0], g_vm_cls.oy + g_vm_extra[1], g_vm_cls.oz + g_vm_extra[2] };
+        const float tune[3] = { g_vm_cls.ax, g_vm_cls.ay, g_vm_cls.az };
+        return bmvr_viewmodel_eye_tuned(&g_st_rig, in->aim[w], go, gyaw, off, tune, g_vm_rot, np, na);
+    }
+    return bmvr_viewmodel_eye(&g_st_rig, in->grip[w], in->aim[w], go, gyaw, g_vm_off, g_vm_rot, np, na);
 }
 
 #if defined(__i386__)
@@ -3680,6 +3887,7 @@ static void xfer_tick(void)
     vm_try_install();
     vm_status_tick();
     ar_try_install();
+    ar_tick();
     vf_try_install();
     cfg_live_poll();
     ic_menu_tick();

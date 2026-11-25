@@ -39,4 +39,42 @@ static inline int bmvr_viewmodel_eye(const struct bmvr_stereo_rig *rig, const fl
     return 1;
 }
 
+/* Rodrigues rotation of v about the unit vector k (the Windows build's VectorRotate). */
+static inline void bmvr_vec_rotate(const float v[3], const float k[3], float deg, float o[3])
+{
+    const float r = deg * BMVR_PI_F / 180.0f, c = cosf(r), s = sinf(r);
+    const float cr[3] = { k[1] * v[2] - k[2] * v[1], k[2] * v[0] - k[0] * v[2], k[0] * v[1] - k[1] * v[0] };
+    const float d = k[0] * v[0] + k[1] * v[1] + k[2] * v[2];
+    for (int i = 0; i < 3; i++) o[i] = v[i] * c + cr[i] * s + k[i] * d * (1.0f - c);
+}
+
+/* The Windows build's weapon placement (VR::GetRecommendedViewmodelAbsPos / ApplyViewmodelBasisOffsets), for Touch-style controllers and the Steam Frame:
+ * the AIM pose gives both the position and the basis; the per-weapon angle offsets tune[] = (ax, ay, az) turn the basis (ay about up, ax about right, az about
+ * forward, in that order); the eye is placed off[] (forward, right, up: ox + the Touch extra, oy, oz) back from the controller along the turned basis.
+ * rot[] (pitch, yaw, roll) is an extra on top, as in bmvr_viewmodel_eye(). */
+static inline int bmvr_viewmodel_eye_tuned(const struct bmvr_stereo_rig *rig, const float aim[7], const float game_origin[3], float game_yaw_deg,
+                                           const float off[3], const float tune[3], const float rot[3], float out_pos[3], float out_ang[3])
+{
+    float aorg[3], f[3], r[3], u[3], t[3];
+    if (!bmvr_stereo_pose_world(rig, aim, aim + 3, game_origin, game_yaw_deg, aorg, f, r, u)) return 0;
+    bmvr_vec_rotate(f, u, tune[1], t); for (int i = 0; i < 3; i++) f[i] = t[i];
+    bmvr_vec_rotate(r, u, tune[1], t); for (int i = 0; i < 3; i++) r[i] = t[i];
+    bmvr_vec_rotate(f, r, tune[0], t); for (int i = 0; i < 3; i++) f[i] = t[i];
+    bmvr_vec_rotate(u, r, tune[0], t); for (int i = 0; i < 3; i++) u[i] = t[i];
+    bmvr_vec_rotate(r, f, tune[2], t); for (int i = 0; i < 3; i++) r[i] = t[i];
+    bmvr_vec_rotate(u, f, tune[2], t); for (int i = 0; i < 3; i++) u[i] = t[i];
+    const float left[3] = { -r[0], -r[1], -r[2] };
+    float ang[3];
+    bmvr_basis_to_angles(f, left, u, ang);
+    if (rot[0] != 0.0f || rot[1] != 0.0f || rot[2] != 0.0f) {
+        for (int i = 0; i < 3; i++) ang[i] += rot[i];
+        bmvr_angle_vectors(ang, f, r, u);
+    }
+    for (int i = 0; i < 3; i++) {
+        out_ang[i] = ang[i];
+        out_pos[i] = aorg[i] - (f[i] * off[0] + r[i] * off[1] + u[i] * off[2]);
+    }
+    return 1;
+}
+
 #endif
