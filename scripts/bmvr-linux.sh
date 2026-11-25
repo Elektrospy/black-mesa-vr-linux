@@ -514,34 +514,34 @@ Run this next to them, or pass  --src /path/to/drop-into-Black-Mesa-folder"
     cp -f -- "$stock" "$backup"
     info "Backed up stock DXVK to $backup"
   fi
-  # back up the game's own openvr_api.dll once (the zip replaces it)
-  if [[ -f "$BIN_DIR/openvr_api.dll" && ! -f "$BIN_DIR/openvr_api.dll.bmvr-orig" ]] \
-     && [[ -f "$SRC_DIR/openvr_api.dll" ]] \
-     && ! cmp -s "$BIN_DIR/openvr_api.dll" "$SRC_DIR/openvr_api.dll"; then
-    cp -f -- "$BIN_DIR/openvr_api.dll" "$BIN_DIR/openvr_api.dll.bmvr-orig"
-    info "Backed up stock bin/openvr_api.dll"
+  # The OpenVR backend was removed upstream (2026-11-23): the mod no longer ships openvr_api.dll and needs neither a replaced
+  # bin/openvr_api.dll nor a disabled bin/sourcevr.dll. Undo what older installs did.
+  if [[ -f "$BIN_DIR/openvr_api.dll.bmvr-orig" ]]; then
+    mv -f -- "$BIN_DIR/openvr_api.dll.bmvr-orig" "$BIN_DIR/openvr_api.dll"
+    info "Restored stock bin/openvr_api.dll (the mod no longer replaces it)"
   fi
+  local ov
+  for ov in "$GAME_DIR/openvr_api.dll" "$DXVK_DIR/openvr_api.dll"; do
+    if [[ -f "$ov" ]]; then rm -f -- "$ov"; info "Removed leftover $ov (not used any more)"; fi
+  done
 
   # --- d3d9.dll in all three places the game can load it from
   local dest
   for dest in "$DXVK_DIR" "$BIN_DIR" "$GAME_DIR"; do
     cp -f -- "$SRC_DIR/d3d9.dll" "$dest/d3d9.dll"
     cmp -s "$SRC_DIR/d3d9.dll" "$dest/d3d9.dll" || die "Copy verification failed: $dest/d3d9.dll"
-    if [[ -f "$SRC_DIR/openvr_api.dll" ]]; then
-      cp -f -- "$SRC_DIR/openvr_api.dll" "$dest/openvr_api.dll"
-    fi
     info "Installed $dest/d3d9.dll"
   done
 
   # --- VR/ folder (keep an existing config.txt)
   local vr_src="$SRC_DIR/VR" vr_dst="$GAME_DIR/VR"
   mkdir -p "$vr_dst"
-  if [[ -d "$vr_src/SteamVRActionManifest" ]]; then
+  if [[ -d "$vr_dst/SteamVRActionManifest" ]]; then      # shipped by releases before 2026-11-23 (OpenVR backend)
     rm -rf -- "$vr_dst/SteamVRActionManifest"
-    cp -r -- "$vr_src/SteamVRActionManifest" "$vr_dst/SteamVRActionManifest"
+    info "Removed stale $vr_dst/SteamVRActionManifest"
   fi
   local sub
-  for sub in hands weapon_wheel openxr_helper64; do
+  for sub in hands weapon_wheel panel openxr_helper64; do
     if [[ -d "$vr_src/$sub" ]]; then
       mkdir -p "$vr_dst/$sub"
       cp -rf -- "$vr_src/$sub/." "$vr_dst/$sub/"
@@ -568,11 +568,11 @@ Run this next to them, or pass  --src /path/to/drop-into-Black-Mesa-folder"
   printf 'd3d9.deferSurfaceCreation = True\r\nd3d9.deviceLossOnFocusLoss = False\r\n' > "$DXVK_DIR/dxvk.conf"
   info "Set $DXVK_DIR/dxvk.conf (deviceLossOnFocusLoss = False)"
 
-  # --- sourcevr.dll pops "VR_Shutdown could not be located" with our openvr_api
+  # --- sourcevr.dll: older installs disabled it (it clashed with the mod's openvr_api.dll); that is not needed any more
   local sv="$BIN_DIR/sourcevr.dll" svd="$BIN_DIR/sourcevr.dll.disabled"
-  if [[ -f "$sv" ]]; then
-    if [[ -f "$svd" ]]; then rm -f -- "$sv"; info "Removed bin/sourcevr.dll (backup already present)"
-    else mv -- "$sv" "$svd"; info "Disabled bin/sourcevr.dll -> sourcevr.dll.disabled"; fi
+  if [[ -f "$svd" ]]; then
+    if [[ -f "$sv" ]]; then info "Kept bin/sourcevr.dll (a leftover sourcevr.dll.disabled is still there)"
+    else mv -- "$svd" "$sv"; info "Restored bin/sourcevr.dll (older installs had disabled it)"; fi
   fi
 
   info ""

@@ -16,7 +16,7 @@
  * 64-bit process works on this system: the prerequisite for the OpenXR path.
  *
  * Vulkan is loaded with dlopen (no libvulkan dev package needed); only the Vulkan HEADERS are
- * needed to build (vulkan-headers; scripts/build-linux.sh falls back to the copy in research/).
+ * needed to build (vulkan-headers; scripts/build-linux.sh falls back to the copy in third_party/l4d2vr/dxvk_new/include/vulkan/include).
  *
  * Usage:  bmvr_xfer_helper [game folder] [--size WxH] [--gpu N] [--snapshots N] [--eyes 1|2] [--no-semaphores]
  *         --eyes 2 (stage 3d) offers two shared images; the game uses the second only with target2 in bmvr_target.txt

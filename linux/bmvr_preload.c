@@ -491,6 +491,11 @@ static float g_hd_rot[3] = { 0.0f, 270.0f, 0.0f };      /* hands_rot=x,y,z in de
                                                           * sat 90 degrees about the palm normal toward the thumb, so the Linux default is 0,270,0 (rotating 90 degrees back). Live: edit the file while the game runs. */
 /* The weapon viewmodel at the weapon controller (linux/bmvr_viewmodel.h). Opt-in: viewmodel=1. */
 static int g_vm_want;                              /* viewmodel=1 */
+static int g_ar_want = 1;                          /* vm_aspect=0 turns off the GetScreenAspectRatio hook (the gun is drawn with the engine's window aspect otherwise) */
+static char g_ar_module[96] = "/engine.so";        /* aspect_module= */
+static char g_ar_class[64] = "CEngineClient";      /* aspect_class= */
+static int g_ar_slot = 96;                         /* aspect_slot=: IVEngineClient::GetScreenAspectRatio is slot 96 on the Windows build; UNVERIFIED on Linux */
+static int g_vf_slot_delta = 11;                   /* vmfov_slot_delta=: GetViewModelFOV is IClientMode slot 32, CreateMove slot 21 on the Windows build: CreateMove's slot + 11 */
 static int g_vm_direct = 1;                        /* vm_direct=0 turns off writing the viewmodel entity's origin/angles directly (used while CalcViewModelView is not hooked) */
 static char g_vm_module[96] = "/client.so";        /* vm_module= */
 static char g_vm_class[64] = "C_BlackMesaViewModel";   /* vm_class= */
@@ -671,6 +676,11 @@ static void load_cfg_once(void)
             else if (live_parse_line(line)) { }
             else if (!strncmp(line, "viewmodel=", 10)) g_vm_want = line[10] == '1';
             else if (!strncmp(line, "vm_direct=", 10)) g_vm_direct = line[10] == '1';
+            else if (!strncmp(line, "vm_aspect=", 10)) g_ar_want = line[10] == '1';
+            else if (!strncmp(line, "vmfov_slot_delta=", 17)) { const long v = strtol(line + 17, NULL, 0); if (v > 0 && v < 100) g_vf_slot_delta = (int)v; }
+            else if (!strncmp(line, "aspect_module=", 14)) snprintf(g_ar_module, sizeof g_ar_module, "%.95s", line + 14);
+            else if (!strncmp(line, "aspect_class=", 13)) snprintf(g_ar_class, sizeof g_ar_class, "%.63s", line + 13);
+            else if (!strncmp(line, "aspect_slot=", 12)) { const long v = strtol(line + 12, NULL, 0); if (v >= 0 && v < 400) g_ar_slot = (int)v; }
             else if (!strncmp(line, "vm_module=", 10)) snprintf(g_vm_module, sizeof g_vm_module, "%.95s", line + 10);
             else if (!strncmp(line, "vm_class=", 9)) snprintf(g_vm_class, sizeof g_vm_class, "%.63s", line + 9);
             else if (!strncmp(line, "vm_probe=", 9)) { long v = strtol(line + 9, NULL, 10); if (v >= 0 && v <= 100) g_vm_probe_n = (int)v; else bmvr_log("viewmodel: bad vm_probe=%s (use 0..100); keeping %d", line + 9, g_vm_probe_n); }
@@ -1679,6 +1689,11 @@ static struct bmvr_stereo_rig g_st_rig;
 static float g_st_view_org[3];
 static int g_st_view_org_valid;
 static float g_st_view_ang[3];
+/* The engine draws the viewmodel with m_flAspectRatio = engine->GetScreenAspectRatio() (the 16:9 window), not the eye's: stretched gun that shifts with
+ * where it is in the view (Windows build: dGetScreenAspectRatio returns the eye aspect during the stereo pass). Set around each eye's RenderView. */
+static int g_ar_in_eye;
+static float g_ar_eye_aspect;
+static float g_ar_eye_fov;
 static volatile int g_st_depth;         /* RenderView nesting on the thread that is inside the hook */
 static long g_st_tid;
 static int g_st_sent;                   /* this frame's pair was delivered from inside the hook */
@@ -2225,7 +2240,9 @@ static int st_try_stereo(void *self, void *view, int clear, int what)
         memcpy(buf, vv, sizeof buf);
         st_apply(buf, &ev[e]);
         g_cap[0].valid = g_cap[1].valid = 0;
+        g_ar_eye_aspect = ev[e].aspect; g_ar_eye_fov = ev[e].fov_deg; g_ar_in_eye = 1;
         g_st_orig(self, buf, clear, what & ~ST_DRAW_HUD);
+        g_ar_in_eye = 0;
         if (!st_find_target(&cap[e])) { st_fail_eye(e); ok = 0; break; }
         if (g_st_frames < 3 && cap[e].w != (unsigned)vs_i(vv, VS_W))
             bmvr_log("stereo: eye %u: the target '%s' is %ux%u but the view is %dx%d; the whole target is blitted", e, cap[e].label, cap[e].w, cap[e].h, vs_i(vv, VS_W), vs_i(vv, VS_H));
@@ -3070,6 +3087,132 @@ static void vm_direct_apply(const float go[3], float gyaw)
     }
 }
 
+/* ---- GetScreenAspectRatio. The detour forwards 4 argument words so it is indifferent to the real argument count, and it only starts to substitute
+ * after the original returned a plausible aspect (0.5..3.5) 20 times: a wrong slot returns something else, which switches the hook off again within 2 calls. */
+typedef float (*PFN_ar)(void *, uint32_t, uint32_t, uint32_t, uint32_t);
+static PFN_ar g_ar_orig;
+static uintptr_t *g_ar_vslot;
+static int g_ar_state, g_ar_verified;
+static unsigned g_ar_next_try, g_ar_calls, g_ar_good, g_ar_bad, g_ar_used;
+
+static float ar_detour(void *self, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t a4)
+{
+    const float r = g_ar_orig(self, a1, a2, a3, a4);
+    g_ar_calls++;
+    if (!g_ar_verified) {
+        if (r > 0.5f && r < 3.5f) {
+            if (++g_ar_good >= 20) { g_ar_verified = 1; bmvr_log("aspect: slot %d returns a plausible screen aspect (%.3f) 20 times in a row: it is GetScreenAspectRatio. During the eye passes it now returns the eye's aspect.", g_ar_slot, (double)r); }
+        } else {
+            g_ar_good = 0;
+            if (++g_ar_bad >= 2 && g_ar_vslot) {
+                uintptr_t old;
+                bmvr_vtable_patch(g_ar_vslot, (uintptr_t)g_ar_orig, &old);
+                g_ar_vslot = NULL;
+                g_ar_state = -1;
+                bmvr_log("aspect: slot %d does not return a screen aspect (%.3f); the hook is removed (set aspect_slot= or vm_aspect=0)", g_ar_slot, (double)r);
+            }
+        }
+        return r;
+    }
+    if (g_ar_in_eye && g_ar_eye_aspect > 0.3f && g_ar_eye_aspect < 4.0f) {
+        if (!g_ar_used++) bmvr_log("aspect: first substitution: engine %.3f -> eye %.3f", (double)r, (double)g_ar_eye_aspect);
+        return g_ar_eye_aspect;
+    }
+    return r;
+}
+
+static void ar_try_install(void)
+{
+    if (!g_vm_want || !g_ar_want || g_ar_state != 0 || g_st_state != 1 || g_x_tick < g_ar_next_try) return;
+    g_ar_state = -1;
+    char mangled[96];
+    snprintf(mangled, sizeof mangled, "%u%s", (unsigned)strlen(g_ar_class), g_ar_class);
+    struct bmvr_map mod[BMVR_RTTI_MAX_RANGES];
+    if (!bmvr_maps_module(g_ar_module, mod, BMVR_RTTI_MAX_RANGES)) {
+        static int said;
+        if (!said) { said = 1; bmvr_log("aspect: no readable mapping of a module matching '%s' yet; trying again every 120 frames", g_ar_module); }
+        g_ar_state = 0; g_ar_next_try = g_x_tick + 120;
+        return;
+    }
+    struct bmvr_vt_hit h[8];
+    const int n = bmvr_rtti_find(g_ar_module, mangled, h, 8);
+    int prim = -1, nprim = 0;
+    for (int i = 0; i < n; i++) {
+        bmvr_log("aspect: RTTI %s: vtable %#lx (module offset %#lx) %s", mangled, (unsigned long)h[i].vtable, (unsigned long)(h[i].vtable - mod[0].lo), h[i].primary ? "primary" : "secondary");
+        if (h[i].primary) { prim = i; nprim++; }
+    }
+    if (nprim != 1) {
+        struct st_list l = { 0 };
+        bmvr_log("aspect: class '%s' has %d primary vtables in '%s' (need exactly 1); the gun keeps the window aspect. Classes whose name contains EngineClient:", g_ar_class, nprim, g_ar_module);
+        bmvr_rtti_list(g_ar_module, "EngineClient", st_list_cb, &l);
+        return;
+    }
+    uintptr_t *vt = (uintptr_t *)h[prim].vtable;
+    for (int i = 0; i <= g_ar_slot; i++)
+        if (!bmvr_addr_executable(vt[i])) { bmvr_log("aspect: vtable slot %d is not executable code: the vtable is shorter than aspect_slot=%d", i, g_ar_slot); return; }
+    for (int i = g_ar_slot - 1; i <= g_ar_slot + 1; i++)
+        if (i >= 0 && bmvr_addr_executable(vt[i])) bmvr_log("aspect:   slot %3d -> %#lx (module offset %#lx)%s", i, (unsigned long)vt[i], (unsigned long)(vt[i] - mod[0].lo), i == g_ar_slot ? "   <- GetScreenAspectRatio?" : "");
+    g_ar_orig = (PFN_ar)vt[g_ar_slot];
+    uintptr_t old = 0;
+    if (!bmvr_vtable_patch(&vt[g_ar_slot], (uintptr_t)ar_detour, &old)) { bmvr_log("aspect: could not patch the vtable slot (mprotect refused)"); g_ar_orig = NULL; return; }
+    g_ar_vslot = &vt[g_ar_slot];
+    g_ar_state = 1;
+    if (g_vm_flag_path[0] && !g_vm_flag_on) { int fd = open(g_vm_flag_path, O_WRONLY | O_CREAT, 0644); if (fd >= 0) { close(fd); g_vm_flag_on = 1; } }
+    bmvr_log("aspect: hooked %s vtable slot %d (was %#lx). It only substitutes after the original has returned a plausible aspect 20 times. UNVERIFIED on this build.", mangled, g_ar_slot, (unsigned long)old);
+}
+
+/* ---- GetViewModelFOV (IClientMode). Black Mesa reads its own ~54 degrees here, whatever CViewSetup::fovViewmodel says (Windows build: dGetViewModelFOV
+ * returns the eye FOV). Same safety rules as the aspect hook: 4 forwarded words, substitution only after 20 plausible originals (20..130 degrees). */
+static PFN_ar g_vf_orig;
+static uintptr_t *g_vf_vslot;
+static int g_vf_state, g_vf_verified, g_vf_slot;
+static unsigned g_vf_next_try, g_vf_good, g_vf_bad, g_vf_used;
+
+static float vf_detour(void *self, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t a4)
+{
+    const float r = g_vf_orig(self, a1, a2, a3, a4);
+    if (!g_vf_verified) {
+        if (r > 20.0f && r < 130.0f) {
+            if (++g_vf_good >= 20) { g_vf_verified = 1; bmvr_log("viewmodel fov: slot %d returns a plausible FOV (%.1f) 20 times in a row: it is GetViewModelFOV. During the eye passes it now returns the eye's FOV.", g_vf_slot, (double)r); }
+        } else {
+            g_vf_good = 0;
+            if (++g_vf_bad >= 2 && g_vf_vslot) {
+                uintptr_t old;
+                bmvr_vtable_patch(g_vf_vslot, (uintptr_t)g_vf_orig, &old);
+                g_vf_vslot = NULL;
+                g_vf_state = -1;
+                bmvr_log("viewmodel fov: slot %d does not return a FOV (%.3f); the hook is removed (set vmfov_slot_delta= or vm_aspect=0)", g_vf_slot, (double)r);
+            }
+        }
+        return r;
+    }
+    if (g_ar_in_eye && g_ar_eye_fov > 20.0f && g_ar_eye_fov < 170.0f) {
+        if (!g_vf_used++) bmvr_log("viewmodel fov: first substitution: engine %.1f -> eye %.1f", (double)r, (double)g_ar_eye_fov);
+        return g_ar_eye_fov;
+    }
+    return r;
+}
+
+static void vf_try_install(void)
+{
+    if (!g_vm_want || !g_ar_want || g_vf_state != 0 || !g_ic_armed || g_ic_win < 0 || g_x_tick < g_vf_next_try) return;
+    g_vf_state = -1;
+    uintptr_t *cm = g_ic_h[g_ic_win].slot;                 /* &vt[CreateMove slot] of the class that proved to be CreateMove */
+    if (!cm) { g_vf_state = 0; g_vf_next_try = g_x_tick + 120; return; }
+    uintptr_t *vt = cm - g_ic_slot;
+    g_vf_slot = g_ic_slot + g_vf_slot_delta;
+    for (int i = 0; i <= g_vf_slot; i++)
+        if (i != g_ic_slot && !bmvr_addr_executable(vt[i])) { bmvr_log("viewmodel fov: vtable slot %d is not executable code; no FOV hook", i); return; }
+    g_vf_orig = (PFN_ar)vt[g_vf_slot];
+    uintptr_t old = 0;
+    if (!bmvr_vtable_patch(&vt[g_vf_slot], (uintptr_t)vf_detour, &old)) { bmvr_log("viewmodel fov: could not patch the vtable slot (mprotect refused)"); g_vf_orig = NULL; return; }
+    g_vf_vslot = &vt[g_vf_slot];
+    g_vf_state = 1;
+    if (g_vm_flag_path[0] && !g_vm_flag_on) { int fd = open(g_vm_flag_path, O_WRONLY | O_CREAT, 0644); if (fd >= 0) { close(fd); g_vm_flag_on = 1; } }
+    bmvr_log("viewmodel fov: hooked the CreateMove class's vtable slot %d (CreateMove %d + %d; was %#lx). It only substitutes after the original has returned a plausible FOV 20 times. UNVERIFIED on this build.",
+             g_vf_slot, g_ic_slot, g_vf_slot_delta, (unsigned long)old);
+}
+
 #if defined(__i386__)
 __attribute__((force_align_arg_pointer))
 #endif
@@ -3536,6 +3679,8 @@ static void xfer_tick(void)
     ic_status_tick();
     vm_try_install();
     vm_status_tick();
+    ar_try_install();
+    vf_try_install();
     cfg_live_poll();
     ic_menu_tick();
     if (g_x_tick % g_x_every == 0) {

@@ -87,8 +87,8 @@ echo "Exports OK."
 HELPER=""
 VKINC=""
 if ! echo '#include <vulkan/vulkan.h>' | cc -E -x c - >/dev/null 2>&1; then
-  for d in "$ROOT/research/dxvk-gplasync/drop-in-dxvk_new/include/vulkan/include"; do
-    [[ -f "$d/vulkan/vulkan.h" ]] && VKINC="-I$d"
+  for d in "$ROOT/third_party/l4d2vr/dxvk_new/include/vulkan/include" "$ROOT/research/dxvk-gplasync/drop-in-dxvk_new/include/vulkan/include"; do
+    if [[ -f "$d/vulkan/vulkan.h" ]]; then VKINC="-I$d"; break; fi
   done
 fi
 if echo '#include <vulkan/vulkan.h>' | cc $VKINC -E -x c - >/dev/null 2>&1; then

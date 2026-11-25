@@ -9,7 +9,7 @@ There are two separate things. Do not mix them up.
 |---|---|---|
 | What runs | the normal `d3d9.dll` + `OpenXRHelper64.exe` | the `linux/` port: a 32-bit `LD_PRELOAD` shim + a 64-bit OpenXR helper |
 | Installer | `scripts/bmvr-linux.sh` | `scripts/build-linux.sh` |
-| Status | reported working (PSVR2, SteamVR on Linux; see `docs/open-work-2026-10.md`) | stereo and head tracking verified in a headset; **gameplay not verified** (details below) |
+| Status | reported working (PSVR2, SteamVR on Linux) | stereo and head tracking verified in a headset; **gameplay not verified** (details below) |
 | Docs | [proton.md](proton.md) | everything else in this folder |
 
 ## Status of the native port (as of 2026-11-23)

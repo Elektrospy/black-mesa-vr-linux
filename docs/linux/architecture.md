@@ -60,4 +60,4 @@ long and never depends on the helper: if the helper dies the game runs on with i
 - The submitted FOV matches the rendered frustum (the off-centre setup is `VR::EyeOffCenterView` from the Windows build).
 - The game and the compositor run on separate clocks decoupled by a ring; the newest complete pair wins.
 - Every guessed hook is verified at run time before anything is written, and a crash-sticky flag (`bmvr_in_*.flag`) disables
-  only the attempt that killed the previous launch (`AGENTS.md` rule 20).
+  only the attempt that killed the previous launch (the Windows build's `src/bmvr_flags.cpp` does the same).

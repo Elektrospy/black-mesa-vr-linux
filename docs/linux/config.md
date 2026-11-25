@@ -78,6 +78,10 @@ turns the port on.
 | `vm_probe` | 24 | search slots `vm_slot-N .. vm_slot+N` with transparent probes; `0` trusts `vm_slot` only |
 | `vm_offset` | `16,3,-2` | forward,right,up in Source units: where the gun sits relative to the eye (live) |
 | `vm_rot` | `0,0,0` | pitch,yaw,roll degrees added to the aim pose (live) |
+| `vm_direct` | `1` | while `CalcViewModelView` cannot be hooked (no probed slot is it on the real build), find the viewmodel entity's origin/angles fields at run time and write the controller pose there; `0` turns it off |
+| `vm_aspect` | `1` | hook `GetScreenAspectRatio` (engine) and `GetViewModelFOV` (client mode) so the gun is drawn with the eye's aspect and FOV during the eye passes, not the window's 16:9 and ~54 degrees; `0` turns both off |
+| `aspect_module`, `aspect_class`, `aspect_slot` | `/engine.so`, `CEngineClient`, 96 | where `GetScreenAspectRatio` is looked for (Windows slot 96; unverified on Linux) |
+| `vmfov_slot_delta` | 11 | `GetViewModelFOV` is the CreateMove slot + 11 in the same vtable (Windows 32 vs 21) |
 
 Live keys (`hands_scale`, `hands_roll`, `hands_offset`, `hands_rot`, `hands_right`, `vm_offset`, `vm_rot`) are re-read when `bmvr_target.txt`
 changes while the game runs; the log prints `config: applied '...'`.

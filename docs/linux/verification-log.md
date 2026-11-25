@@ -19,6 +19,8 @@ headset via vrlink / Steam Frame.
 | 2026-11-22 12:23 | `+mat_queue_mode 0` (user report) | correct rendering and head tracking in the headset | same |
 | 2026-11-22 | input channel, run 1 and 2 | sticks arrive; Steam Frame profile bound (18 of 20 paths); face buttons, triggers unconfirmed | [input.md](input.md) |
 | after 2026-11-22 | `vm_slot=231` real log | slot never called; probe search added | [hands.md](hands.md) |
+| 2026-11-24 | viewmodel probe, real log (CachyOS, SteamVR) | probe "found" slot 244, which is a bone function `(this, ptr, bone pos, bone quaternion)`, not `CalcViewModelView`; the previous launch died with that hook live; the retry then read the probe's own `bmvr_in_viewmodel.flag` as a crash and switched the viewmodel off. Real slot still unknown (231 never called). Probe now requires the eye position to be near the game's view origin and logs which argument carries it; the flag no longer trips itself | [hands.md](hands.md) |
+| 2026-11-25 | viewmodel direct placement, real logs | no probed slot (207..255) is `CalcViewModelView`, so the entity (`this` from the transparent probes) is written directly. Fixed Windows offsets crashed the game (+0x294 held other data); the origin is at +0x284 on Linux and the entity has a second eye-like origin at +0x254, so fields are now found at run time and every origin/angles pair is written. Not yet confirmed in a headset | [hands.md](hands.md) |
 
 Not yet run in a game or headset: `CreateMove` control, aim, hands drawing, fingers, viewmodel substitution, helper auto-start, flock against
 the real helper.

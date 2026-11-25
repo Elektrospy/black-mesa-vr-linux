@@ -1,6 +1,6 @@
 # Black Mesa through Proton: `scripts/bmvr-linux.sh`
 
-Status: reported working by users (PSVR2, SteamVR on Linux, OpenXR helper; see `docs/open-work-2026-10.md`). This is the
+Status: reported working by users (PSVR2, SteamVR on Linux, OpenXR helper). This is the
 **Windows build of the mod** running under Proton. It has nothing to do with the native port described in the rest of this
 folder.
 
@@ -14,11 +14,11 @@ does:
 
 - finds the game in the Steam libraries (`libraryfolders.vdf`, Flatpak, Snap);
 - refuses to run while `bms.exe` or the helper is running;
-- installs `d3d9.dll` into all three required places (`AGENTS.md` rule 19);
-- backs up stock DXVK / `openvr_api.dll` once;
+- installs `d3d9.dll` into all three required places (`AGENTS.md` rule 1);
+- backs up stock DXVK once;
 - keeps an existing `VR/config.txt`;
 - writes the VR `dxvk.conf`;
-- disables `bin/sourcevr.dll`;
+- undoes what older installs did for the retired OpenVR backend (restores the stock `bin/openvr_api.dll` and `bin/sourcevr.dll`);
 - clears stale `bmvr_in_*.flag` files and false `bmvr_skip.txt` bans.
 
 `scripts/bmvr-linux.sh uninstall` reverses it.
