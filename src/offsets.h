@@ -227,6 +227,43 @@ public:
     // kGrenadeThrowPosition_Server (eye + an EyeAngles offset, i.e. head
     // frame), then sets velocity = normalize(target - origin) * speed.
     // Bytes: 55 8B EC 83 EC 3C 53 8B 5D 08 83 FB 15.
+    // server.dll snark throw (beta 26713286, 26234270 + 0x9D0; disassembled
+    // 2026-11-18): thiscall weapon (owner, fspeed, uspeed), called from the
+    // snark anim-event handler (throw 0xBBD / lob 0xBC5). velocity = fwd x
+    // fspeed + up x uspeed + a share of the owner's velocity, then Create
+    // ("npc_snark") -> placement cdecl (ent, pos*, ang*, owner) -> bool,
+    // then SetAbsVelocity (thiscall ent, const Vector*).
+    // Server weapon m_iClip1 (datamap FIELD_INTEGER "m_iClip1", .data
+    // 0x7B2778 in beta 26713286: type 5, offset 0x4E0). Reached through
+    // engine VEngineServer021 vtable slot 19 = PEntityOfEntIndex (index
+    // bounds check, EDICT_NUM, FL_EDICT_FREE; disassembled 2026-11-18) and
+    // edict_t +0xC (m_pUnk = the CBaseEntity).
+    static constexpr int kServerWeapon_Clip1 = 0x4E0;
+    // Server weapon datamap FIELD_TIME m_flNextPrimaryAttack / m_flNextSecondaryAttack
+    // (server.dll typedescription scan 2026-11-22: type 16, 0x49C / 0x4A0).
+    static constexpr int kServerWeapon_NextPrimaryAttack = 0x49C;
+    static constexpr int kServerWeapon_NextSecondaryAttack = 0x4A0;
+    // Server player m_flNextAttack (datamap FIELD_TIME, 0x6BC; DefaultDeploy sets it to the deploy end).
+    static constexpr int kServerPlayer_NextAttack = 0x6BC;
+    static constexpr int kEngineServer_PEntityOfEntIndexVt = 19;
+    static constexpr int kEdict_Unknown = 0xC;
+    static constexpr int kSnarkThrow_Server = 0x48D730;
+    static constexpr int kSnarkPlace_Server = 0x483BF0;
+    // server.dll CBM_SP_GameRules::FShouldSwitchWeapon (vtable slot 61, +0xF4; thiscall rules
+    // (player, weapon) -> bool; build 26768221, disassembled 2026-11-23): ammo check, no active
+    // weapon -> true, AllowsAutoSwitchTo/From, CanHolster, heavier weight. Asked by Weapon_Equip on a
+    // pickup. Single player never reads cl_weapon_autoswitch (only CMultiplayRules 0x1D4C40 does).
+    static constexpr int kSpRules_FShouldSwitchWeapon_Server = 0x280790;
+    // server.dll CBaseCombatWeapon::ReloadOrSwitchWeapons (vtable +0x444, 0x1077F0): out of ammo ->
+    // `call [eax+0x55C]` (GetWeaponFlags); `test al, 4` (ITEM_FLAG_NOAUTOSWITCHEMPTY); jne skip;
+    // SwitchToNextBestWeapon. The `test al, 4` (A8 04) here; `or al, 4` (0C 04) = flag always set.
+    static constexpr int kReloadOrSwitchNoAutoSwitchInsn_Server = 0x10788D;
+    // server.dll CBlackMesaBaseWeapon::Equip (weapon vtable slot 324, 0x490AE0; thiscall (owner)):
+    // base Equip, then `if (this->vfunc[0x558]()) owner->Weapon_Switch(this, 0)` without asking the
+    // game rules (all pickups and `give` switch through here, harness 2026-11-23). The `je` (74 0D)
+    // over that switch; `jmp` (EB) = no switch.
+    static constexpr int kBmWeaponEquipSwitchJeInsn_Server = 0x490AFE;
+    static constexpr int kSetAbsVelocity_Server = 0x11DC90;
     static constexpr int kProjectileCreate_Server = 0x37A4B0; // beta 26627981 (26234270: 0x379D20)
     static constexpr int kBlackMesaPlayer_RecoilPunchAngles_Server = 0x14BC;
 
@@ -307,6 +344,7 @@ public:
     // system pointer.
     static constexpr int kClientGpGlobalsPtr = 0x553A00; // beta 26627981 (26234270: 0x550A04)
     static constexpr int kCGlobalVars_curtime = 0xC;
+    static constexpr int kCGlobalVars_interval_per_tick = 0x1C;   // CGlobalVarsBase (SDK globalvars_base.h)
     // DT_LocalPlayerExclusive (FUN_100b7240): m_nWaterLevel +0x180 (byte),
     // m_AirFinished +0x16e4 (float). WL_Eyes == 3 is fully underwater.
     static constexpr int kCBasePlayer_nWaterLevel = 0x180;
@@ -395,10 +433,10 @@ public:
     // mat_queue_mode 2 + GetLightForPoint/studio lighting can cycle +0x1D0
     // next pointers; the engine walk never hits 0x200 and freezes the game
     // thread (verified 2026-09-08, PID 25228, 12-node cycle).
-    Offset LightcacheFindNearest{ "engine.dll", 0x1D1F60,
+    Offset LightcacheFindNearest{ "engine.dll", 0x1D20A0, // 26713286 (26672462: 0x1D1F60)
         "55 8B EC 83 EC 1C 0F B7 0D ? ? ? ? 33 D2 53 56 BB 00 02 00 00" };
 
-    Offset VGui_Paint{ "engine.dll", 0x23B140,
+    Offset VGui_Paint{ "engine.dll", 0x23B280, // 26713286 (26672462: 0x23B140)
         "55 8B EC 83 EC 18 53 8B D9 8B 0D ? ? ? ? FF 15" };
 
     // CMatRenderContext slot 7. RT-stack count moved 0x4C -> 0x58 on the beta.
@@ -464,6 +502,10 @@ public:
     // GetRenderTargetDimensions (8) and BindLightmapPage (10).
     static constexpr int kIMatRenderContext_Bind = 0x24;
     static constexpr int kIMatRenderContext_GetViewport = 0x9C;
+    // SetHeightClipMode(MaterialHeightClipMode_t) / SetHeightClipZ(float): SDK slots 39/40 + IRefCounted = 41/42.
+    // client.dll CBaseWorldView::PushView calls [ctx+0xA8](waterZ) then [ctx+0xA4](mode) (beta 26672462: 0x1FDD2F,
+    // 0x1FDDF2, 0x2033D6, 0x2034E2).
+    static constexpr int kIMatRenderContext_SetHeightClipMode = 0xA4;
     static constexpr int kIMatRenderContext_PushRT6 = 0x23C;
     static constexpr int kIMatRenderContext_PopRT = 0x24C;
     // IMatRenderContext::GetCallQueue. HL2VR/Source 2013 absolute slot 146.
@@ -599,6 +641,10 @@ public:
     // VPROF labels). Frame start (FRAME_RENDER_START work: bone cache
     // invalidation, threaded bone setup, ParticleMgr()->Simulate), cdecl, no args.
     static constexpr uint32_t kClientFrameStartRva = 0xF3530; // beta 26627981 (26234270: 0xF34C0)
+    // engine.dll CEngineClient::SetAudioState(const AudioState_t&) (IVEngineClient
+    // slot 61, thiscall, ret 4) -> Host_SetAudioState: rep movsd 7 dwords into the
+    // sound listener. The client calls it from CViewRender::SetUpView.
+    static constexpr uint32_t kEngineSetAudioStateRva = 0xA78B0; // beta 26768221
     // C_BaseAnimating::SetupBones (IClientRenderable this, 4 args, ret 0x10).
     static constexpr uint32_t kClientSetupBonesRva = 0x903C0; // beta 26627981 (26234270: 0x90350)
     // C_BaseAnimating::BuildTransformations (6 args, ret 0x18): runs only when
@@ -619,6 +665,11 @@ public:
     // DrawTranslucentRenderable: cdecl (IClientRenderable* ent, bool twoPass, bool, bool, void* viewData),
     // called per sorted translucent renderable from A, B and their helper 0x1FF510; viewData = view object + 0x988.
     static constexpr uint32_t kClientDrawTranslucentRenderableRva = 0x1FED00;
+    // Deferred lights: render one shadowed light into the shadow atlas (_rt_gbShadowMapRT /
+    // StaticRT), thiscall (lightingMgr, light*, bool static, int, bool copyStatic, bool, bool), ret 0x18.
+    // Called per queued light from "CViewRender::RenderShadows" (VPROF name; 26234270: 0x181C60),
+    // once per view = once per eye. light+4 = type, +0x48 = atlas slot (beta 26672462; 26234270: 0x181190).
+    static constexpr uint32_t kClientRenderLightShadowRva = 0x183980;
     static constexpr uint32_t kClientParticleRenderStartRva = 0x196450; // beta 26627981 (26234270: 0x193C60)
     // Black Mesa's precipitation renderer (cdecl, no args; debug string "Rain render    : %du"; called from
     // 0x20444A): per precipitation entity GetMatrix(VIEW) -> local, LoadIdentity view, clip override, quads
@@ -631,7 +682,7 @@ public:
     // view, quads built in camera space. Single caller at 0x32BDD6.
     static constexpr uint32_t kClientPcfCameraFacingRva = 0x330530; // beta 26627981 (26234270: 0x32C5E0)
     static constexpr uint32_t kClientParticleMgrSimulateRva = 0x197090; // beta 26627981 (26234270: 0x1948A0)
-    static constexpr uint32_t kEngineWorldStaticMeshesRva = 0x8E62A4; // beta 26627981 (26234270: 0x8E6224)
+    static constexpr uint32_t kEngineWorldStaticMeshesRva = 0x8E82A4; // beta 26672462 (26627981: 0x8E62A4)
     // CLensflare's world-to-pixel helper (cdecl: world, size[2], out).  Reads the
     // view and projection matrices from the render context; diagnostic hook only.
     static constexpr uint32_t kLensflareWorldToScreenRva = 0x2260C0; // beta 26627981 (26234270: 0x223960)
@@ -697,7 +748,7 @@ public:
     static constexpr int kCBasePlayer_FlashlightTurnOnVt = 0x5D8 / 4;
     static constexpr int kCBasePlayer_FlashlightTurnOffVt = 0x5DC / 4;
 
-    // client.dll CClientShadowMgr::UpdateFlashlightState (research/resolution-hud-flashlight.md).
+    // client.dll CClientShadowMgr::UpdateFlashlightState.
     // FlashlightState_t: origin float[0..2], forward float[3..5], fov float[9].
     // CClientShadowMgr::UpdateFlashlightState. public-beta +0x260.
     // Pushes the string "CClientShadowMgr::UpdateFlashlightState".

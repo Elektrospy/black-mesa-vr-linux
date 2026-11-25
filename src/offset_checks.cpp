@@ -4,6 +4,7 @@
 #include "bmvr_seh.h"
 
 #include <Windows.h>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -134,6 +135,24 @@ namespace
 
 void bmvr::VerifyGameOffsets()
 {
+    // Test only: BMVR_TEST_MISSING_HOOKS=<gameplay>,<debug> adds that many fake missing offsets, to
+    // check the out-of-date toast and the Debug tab alert headless.
+    static bool s_testInjected = false;
+    if (!s_testInjected)
+    {
+        s_testInjected = true;
+        char v[32] = {};
+        int game = 0, debug = 0;
+        if (GetEnvironmentVariableA("BMVR_TEST_MISSING_HOOKS", v, sizeof(v))
+            && sscanf_s(v, "%d,%d", &game, &debug) >= 1)
+        {
+            Game::logMsg("BMVR_TEST_MISSING_HOOKS: %d gameplay, %d debug (fake)", game, debug);
+            for (int i = 0; i < game; ++i)
+                Game::noteMissingOffset(("test gameplay " + std::to_string(i)).c_str());
+            for (int i = 0; i < debug; ++i)
+                Game::noteMissingOffset(("test debug " + std::to_string(i)).c_str(), true);
+        }
+    }
     const size_t nModules = sizeof(kOffsetFingerprints) / sizeof(kOffsetFingerprints[0]);
     for (size_t m = 0; m < nModules; ++m)
     {
@@ -155,8 +174,9 @@ void bmvr::VerifyGameOffsets()
             if (why.empty())
                 continue;
             ++failed;
-            Game::logMsg("Offset check FAILED: %s (%s+0x%X): %s", c.name, c.module, c.value, why.c_str());
-            Game::noteMissingOffset((std::string("offset ") + c.name).c_str());
+            Game::logMsg("Offset check FAILED%s: %s (%s+0x%X): %s", c.debugOnly ? " (debug only)" : "",
+                c.name, c.module, c.value, why.c_str());
+            Game::noteMissingOffset((std::string("offset ") + c.name).c_str(), c.debugOnly);
         }
         bool same = false;
         const std::string have = Fingerprint(base, fp, same);

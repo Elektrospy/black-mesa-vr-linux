@@ -255,7 +255,7 @@ namespace
         log.Print("Enabling OpenXR extension %s", name);
     }
 
-    // Quest 3 / Touch Plus, Touch Pro, Pico, Cosmos, Focus 3, and G2 profiles
+    // Quest 3 / Touch Plus, Touch Pro, Pico, Cosmos, Focus 3, G2 and Steam Frame profiles
     // are extension-gated. Suggesting them without the extension returns
     // XR_ERROR_PATH_UNSUPPORTED for the whole profile, so Pause never binds.
     void AppendInteractionProfileExtensions(
@@ -270,6 +270,8 @@ namespace
             XR_HTC_VIVE_COSMOS_CONTROLLER_INTERACTION_EXTENSION_NAME,
             XR_HTC_VIVE_FOCUS3_CONTROLLER_INTERACTION_EXTENSION_NAME,
             XR_EXT_HP_MIXED_REALITY_CONTROLLER_EXTENSION_NAME,
+            // Steam Frame controllers (SteamVR; not in the OpenXR 1.1.60 headers).
+            "XR_VALVE_frame_controller_interaction",
         };
         for (const char* name : kOptional)
             AppendOpenXrExtensionIfSupported(available, enabled, name, log);
@@ -1746,6 +1748,16 @@ namespace
             m_State->heartbeatTickMs = GetTickCount64();
         }
 
+        void PublishStagePose(const L4D2VROpenXrPoseDesc& pose)
+        {
+            if (!m_State)
+                return;
+
+            L4D2VR_SeqlockBegin(m_State->stagePoseGeneration);
+            m_State->stagePose = pose;
+            L4D2VR_SeqlockEnd(m_State->stagePoseGeneration);
+        }
+
         void PublishRuntimeViewConfig(const L4D2VROpenXrRuntimeViewConfigDesc& config)
         {
             if (!m_State || !config.valid)
@@ -2299,9 +2311,13 @@ namespace
     public:
         bool InitializeInstance(XrDispatch& xr, XrInstance instance, Logger& log);
         bool InitializeSession(XrSession session, XrSpace appSpace, bool handTrackingEnabled, Logger& log);
-        // XR_EXT_eye_gaze_interaction (PS VR2 via PSVR2Toolkit). Diagnostic
-        // only so far: logs the gaze once a second, nothing consumes it.
+        // XR_EXT_eye_gaze_interaction (PS VR2 via PSVR2Toolkit). Published in
+        // the input state (eyeGaze) for eye-tracked foveated rendering; also
+        // logged once a second.
         void SetEyeGazeEnabled(bool enabled) { m_EyeGazeEnabled = enabled; }
+        // XrSystemProperties.systemName, published with the input state so the
+        // DLL can name buttons (PS VR2 Sense reports the Touch profile).
+        void SetSystemName(const char* name) { std::snprintf(m_SystemName, sizeof(m_SystemName), "%s", name ? name : ""); }
         void Shutdown();
         void UpdateFrame(XrTime displayTime, BridgeWriter& bridge, Logger& log);
         uint32_t CurrentControllerFamily() const;
@@ -2355,6 +2371,10 @@ namespace
         bool CreateBooleanActions(Logger& log);
         bool CreateFloatDigitalActions(Logger& log);
         bool CreateAnalogActions(Logger& log);
+        bool CreateRawActions(Logger& log);
+        void AddRawBindings(std::vector<XrActionSuggestedBinding>& bindings, const char* profilePath);
+        void ReadRawHands(L4D2VROpenXrInputStateDesc& outState);
+        uint32_t RawPresentBits(uint32_t hand) const;
         void AddBinding(std::vector<XrActionSuggestedBinding>& bindings, XrAction action, const char* bindingPath);
         XrResult SuggestProfileOnce(XrPath profile, const std::vector<XrActionSuggestedBinding>& bindings);
         void SuggestProfile(Logger& log, const char* profilePath, const std::vector<XrActionSuggestedBinding>& bindings);
@@ -2363,6 +2383,7 @@ namespace
         void AddGripValueBindings(std::vector<XrActionSuggestedBinding>& bindings, const char* gripValueName);
         void AddTouchFaceButtonBindings(std::vector<XrActionSuggestedBinding>& bindings);
         void AddIndexFaceButtonBindings(std::vector<XrActionSuggestedBinding>& bindings);
+        void AddFrameFaceButtonBindings(std::vector<XrActionSuggestedBinding>& bindings);
         void AddMenuButtonBindings(std::vector<XrActionSuggestedBinding>& bindings);
         void SuggestBindings(Logger& log);
         std::string PathToString(XrPath path) const;
@@ -2400,11 +2421,26 @@ namespace
         XrAction m_HandPoseAction = XR_NULL_HANDLE;
         XrAction m_AimPoseAction = XR_NULL_HANDLE;
         XrAction m_HapticAction = XR_NULL_HANDLE;
+        // Physical inputs per hand (subaction paths left/right), read for the
+        // DLL's button mapping. Optional: a failure leaves rawHands invalid
+        // and the DLL keeps the legacy action layout.
+        XrAction m_RawTrigger = XR_NULL_HANDLE;
+        XrAction m_RawGrip = XR_NULL_HANDLE;
+        XrAction m_RawStick = XR_NULL_HANDLE;
+        XrAction m_RawFace1 = XR_NULL_HANDLE;
+        XrAction m_RawFace2 = XR_NULL_HANDLE;
+        XrAction m_RawStickClick = XR_NULL_HANDLE;
+        XrAction m_RawMenu = XR_NULL_HANDLE;
+        XrAction m_RawFace3 = XR_NULL_HANDLE;   // Steam Frame only (see L4D2VR_RAW_BUTTON_FACE3)
+        XrAction m_RawFace4 = XR_NULL_HANDLE;
+        XrAction m_RawBumper = XR_NULL_HANDLE;
+        bool m_RawReady = false;
+        char m_SystemName[64] = {};
         bool m_EyeGazeEnabled = false;
         XrAction m_EyeGazeAction = XR_NULL_HANDLE;
         XrSpace m_EyeGazeSpace = XR_NULL_HANDLE;
         XrSpace m_ViewSpace = XR_NULL_HANDLE;
-        void LogEyeGaze(XrTime displayTime, Logger& log);
+        void ReadEyeGaze(XrTime displayTime, bool focused, L4D2VROpenXrEyeGazeDesc& gaze, Logger& log);
         std::array<XrPath, L4D2VR_OPENXR_HAND_COUNT> m_HandPaths{};
         std::array<XrSpace, L4D2VR_OPENXR_HAND_COUNT> m_HandSpaces{};
         std::array<XrSpace, L4D2VR_OPENXR_HAND_COUNT> m_AimSpaces{};
@@ -4921,6 +4957,194 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
         return true;
     }
 
+    bool OpenXrInputBridge::CreateRawActions(Logger& log)
+    {
+        return
+            CreateSubactionAction(m_MainActionSet, XR_ACTION_TYPE_FLOAT_INPUT, "raw_trigger", "Raw Trigger", m_RawTrigger, log) &&
+            CreateSubactionAction(m_MainActionSet, XR_ACTION_TYPE_FLOAT_INPUT, "raw_grip", "Raw Grip", m_RawGrip, log) &&
+            CreateSubactionAction(m_MainActionSet, XR_ACTION_TYPE_VECTOR2F_INPUT, "raw_stick", "Raw Stick", m_RawStick, log) &&
+            CreateSubactionAction(m_MainActionSet, XR_ACTION_TYPE_BOOLEAN_INPUT, "raw_face1", "Raw Lower Face Button", m_RawFace1, log) &&
+            CreateSubactionAction(m_MainActionSet, XR_ACTION_TYPE_BOOLEAN_INPUT, "raw_face2", "Raw Upper Face Button", m_RawFace2, log) &&
+            CreateSubactionAction(m_MainActionSet, XR_ACTION_TYPE_BOOLEAN_INPUT, "raw_stick_click", "Raw Stick Click", m_RawStickClick, log) &&
+            CreateSubactionAction(m_MainActionSet, XR_ACTION_TYPE_BOOLEAN_INPUT, "raw_menu", "Raw Menu Button", m_RawMenu, log) &&
+            CreateSubactionAction(m_MainActionSet, XR_ACTION_TYPE_BOOLEAN_INPUT, "raw_face3", "Raw Third Face Button", m_RawFace3, log) &&
+            CreateSubactionAction(m_MainActionSet, XR_ACTION_TYPE_BOOLEAN_INPUT, "raw_face4", "Raw Fourth Face Button", m_RawFace4, log) &&
+            CreateSubactionAction(m_MainActionSet, XR_ACTION_TYPE_BOOLEAN_INPUT, "raw_bumper", "Raw Bumper", m_RawBumper, log);
+    }
+
+    namespace
+    {
+        // Physical layout per interaction profile, for the raw button actions.
+        struct RawProfileLayout
+        {
+            const char* profile;
+            const char* stick;      // component name under /input/
+            const char* grip;       // squeeze/value, squeeze/click or nullptr
+            const char* faceLeft1;  // lower face button, left hand
+            const char* faceLeft2;
+            const char* faceRight1;
+            const char* faceRight2;
+            const char* menuLeft;
+            const char* menuRight;
+            // Steam Frame only: third/fourth face button per hand, bumper.
+            const char* faceLeft3 = nullptr;
+            const char* faceLeft4 = nullptr;
+            const char* faceRight3 = nullptr;
+            const char* faceRight4 = nullptr;
+            const char* bumper = nullptr;
+            const char* gripAlt = nullptr; // second grip name tried (one of the two is dropped)
+        };
+
+        const RawProfileLayout kRawProfileLayouts[] =
+        {
+            { "/interaction_profiles/oculus/touch_controller", "thumbstick", "squeeze/value", "x", "y", "a", "b", "menu", nullptr },
+            { "/interaction_profiles/facebook/touch_controller_pro", "thumbstick", "squeeze/value", "x", "y", "a", "b", "menu", nullptr },
+            { "/interaction_profiles/meta/touch_controller_plus", "thumbstick", "squeeze/value", "x", "y", "a", "b", "menu", nullptr },
+            { "/interaction_profiles/bytedance/pico4_controller", "thumbstick", "squeeze/value", "x", "y", "a", "b", "menu", nullptr },
+            { "/interaction_profiles/hp/mixed_reality_controller", "thumbstick", "squeeze/value", "x", "y", "a", "b", "menu", "menu" },
+            { "/interaction_profiles/valve/index_controller", "thumbstick", "squeeze/value", "a", "b", "a", "b", "system", "system" },
+            { "/interaction_profiles/htc/vive_cosmos_controller", "joystick", "squeeze/click", "x", "y", "a", "b", "menu", nullptr },
+            { "/interaction_profiles/htc/vive_focus3_controller", "thumbstick", "squeeze/click", "x", "y", "a", "b", "menu", nullptr },
+            { "/interaction_profiles/microsoft/motion_controller", "thumbstick", "squeeze/click", nullptr, nullptr, nullptr, nullptr, "menu", "menu" },
+            { "/interaction_profiles/htc/vive_controller", "trackpad", "squeeze/click", nullptr, nullptr, nullptr, nullptr, "menu", "menu" },
+            // Steam Frame: left D-pad down/right/left/up mirrors right A/B/X/Y
+            // (SteamVR frame_controller_profile.json mirror_mappings); View = left menu.
+            // The extension is not in the public registry yet: component names
+            // follow SteamVR's paths, SuggestProfile drops any it rejects.
+            { "/interaction_profiles/valve/frame_controller", "thumbstick", "squeeze/value",
+              "dpad_down", "dpad_right", "a", "b", "view", "menu",
+              "dpad_left", "dpad_up", "x", "y", "bumper", "grip/value" },
+        };
+
+        const RawProfileLayout* FindRawProfileLayout(const char* profilePath)
+        {
+            if (!profilePath)
+                return nullptr;
+            for (const RawProfileLayout& l : kRawProfileLayouts)
+                if (std::strcmp(l.profile, profilePath) == 0)
+                    return &l;
+            return nullptr;
+        }
+    }
+
+    void OpenXrInputBridge::AddRawBindings(std::vector<XrActionSuggestedBinding>& b, const char* profilePath)
+    {
+        if (!m_RawReady)
+            return;
+        const RawProfileLayout* l = FindRawProfileLayout(profilePath);
+        if (!l)
+            return;
+        const char* hands[2] = { "/user/hand/left/input/", "/user/hand/right/input/" };
+        for (int h = 0; h < 2; ++h)
+        {
+            const std::string base = hands[h];
+            AddBinding(b, m_RawTrigger, (base + "trigger/value").c_str());
+            if (l->grip)
+                AddBinding(b, m_RawGrip, (base + l->grip).c_str());
+            if (l->gripAlt)
+                AddBinding(b, m_RawGrip, (base + l->gripAlt).c_str());
+            AddBinding(b, m_RawStick, (base + l->stick).c_str());
+            AddBinding(b, m_RawStickClick, (base + l->stick + "/click").c_str());
+            const char* f1 = h == 0 ? l->faceLeft1 : l->faceRight1;
+            const char* f2 = h == 0 ? l->faceLeft2 : l->faceRight2;
+            const char* menu = h == 0 ? l->menuLeft : l->menuRight;
+            if (f1)
+                AddBinding(b, m_RawFace1, (base + f1 + "/click").c_str());
+            if (f2)
+                AddBinding(b, m_RawFace2, (base + f2 + "/click").c_str());
+            if (menu)
+                AddBinding(b, m_RawMenu, (base + menu + "/click").c_str());
+            const char* f3 = h == 0 ? l->faceLeft3 : l->faceRight3;
+            const char* f4 = h == 0 ? l->faceLeft4 : l->faceRight4;
+            if (f3)
+                AddBinding(b, m_RawFace3, (base + f3 + "/click").c_str());
+            if (f4)
+                AddBinding(b, m_RawFace4, (base + f4 + "/click").c_str());
+            if (l->bumper)
+                AddBinding(b, m_RawBumper, (base + l->bumper + "/click").c_str());
+        }
+    }
+
+    uint32_t OpenXrInputBridge::RawPresentBits(uint32_t hand) const
+    {
+        const XrPath path = m_LastInteractionProfiles[hand];
+        if (path == XR_NULL_PATH || path == static_cast<XrPath>(~0ull))
+            return 0;
+        const RawProfileLayout* l = FindRawProfileLayout(PathToString(path).c_str());
+        if (!l)
+            return 0;
+        uint32_t bits = L4D2VR_RAW_BUTTON_STICK_CLICK_PRESENT;
+        if (l->grip)
+            bits |= L4D2VR_RAW_BUTTON_GRIP_PRESENT;
+        if (hand == L4D2VR_OPENXR_HAND_LEFT ? l->faceLeft1 != nullptr : l->faceRight1 != nullptr)
+            bits |= L4D2VR_RAW_BUTTON_FACE1_PRESENT;
+        if (hand == L4D2VR_OPENXR_HAND_LEFT ? l->faceLeft2 != nullptr : l->faceRight2 != nullptr)
+            bits |= L4D2VR_RAW_BUTTON_FACE2_PRESENT;
+        if (hand == L4D2VR_OPENXR_HAND_LEFT ? l->faceLeft3 != nullptr : l->faceRight3 != nullptr)
+            bits |= L4D2VR_RAW_BUTTON_FACE3_PRESENT;
+        if (hand == L4D2VR_OPENXR_HAND_LEFT ? l->faceLeft4 != nullptr : l->faceRight4 != nullptr)
+            bits |= L4D2VR_RAW_BUTTON_FACE4_PRESENT;
+        if (l->bumper)
+            bits |= L4D2VR_RAW_BUTTON_BUMPER_PRESENT;
+        return bits;
+    }
+
+    void OpenXrInputBridge::ReadRawHands(L4D2VROpenXrInputStateDesc& outState)
+    {
+        std::snprintf(outState.systemName, sizeof(outState.systemName), "%s", m_SystemName);
+        if (!m_RawReady)
+            return;
+        for (uint32_t hand = 0; hand < L4D2VR_OPENXR_HAND_COUNT; ++hand)
+        {
+            L4D2VROpenXrRawHandDesc& raw = outState.rawHands[hand];
+            XrActionStateGetInfo getInfo{ XR_TYPE_ACTION_STATE_GET_INFO };
+            getInfo.subactionPath = m_HandPaths[hand];
+            bool any = false;
+            auto readFloat = [&](XrAction a, float& out)
+            {
+                getInfo.action = a;
+                XrActionStateFloat st{ XR_TYPE_ACTION_STATE_FLOAT };
+                if (XR_SUCCEEDED(m_Xr->xrGetActionStateFloat(m_Session, &getInfo, &st)) && st.isActive)
+                {
+                    out = std::clamp(st.currentState, 0.0f, 1.0f);
+                    any = true;
+                }
+            };
+            auto readBool = [&](XrAction a, uint32_t bit)
+            {
+                getInfo.action = a;
+                XrActionStateBoolean st{ XR_TYPE_ACTION_STATE_BOOLEAN };
+                if (XR_SUCCEEDED(m_Xr->xrGetActionStateBoolean(m_Session, &getInfo, &st)) && st.isActive)
+                {
+                    any = true;
+                    if (st.currentState)
+                        raw.buttons |= bit;
+                }
+            };
+            readFloat(m_RawTrigger, raw.trigger);
+            readFloat(m_RawGrip, raw.grip);
+            {
+                getInfo.action = m_RawStick;
+                XrActionStateVector2f st{ XR_TYPE_ACTION_STATE_VECTOR2F };
+                if (XR_SUCCEEDED(m_Xr->xrGetActionStateVector2f(m_Session, &getInfo, &st)) && st.isActive)
+                {
+                    raw.stick[0] = st.currentState.x;
+                    raw.stick[1] = st.currentState.y;
+                    any = true;
+                }
+            }
+            readBool(m_RawFace1, L4D2VR_RAW_BUTTON_FACE1);
+            readBool(m_RawFace2, L4D2VR_RAW_BUTTON_FACE2);
+            readBool(m_RawStickClick, L4D2VR_RAW_BUTTON_STICK_CLICK);
+            readBool(m_RawMenu, L4D2VR_RAW_BUTTON_MENU);
+            readBool(m_RawFace3, L4D2VR_RAW_BUTTON_FACE3);
+            readBool(m_RawFace4, L4D2VR_RAW_BUTTON_FACE4);
+            readBool(m_RawBumper, L4D2VR_RAW_BUTTON_BUMPER);
+            raw.buttons |= RawPresentBits(hand);
+            raw.valid = any ? 1u : 0u;
+        }
+    }
+
     bool OpenXrInputBridge::InitializeInstance(XrDispatch& xr, XrInstance instance, Logger& log)
     {
         m_Xr = &xr;
@@ -4954,6 +5178,8 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
         {
             return false;
         }
+        m_RawReady = CreateRawActions(log);
+        log.Print("Raw button actions %s", m_RawReady ? "ready" : "unavailable (legacy layout only)");
 
         SuggestBindings(log);
         if (m_EyeGazeEnabled)
@@ -5001,10 +5227,14 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
         return m_Xr->xrSuggestInteractionProfileBindings(m_Instance, &suggested);
     }
 
-    void OpenXrInputBridge::SuggestProfile(Logger& log, const char* profilePath, const std::vector<XrActionSuggestedBinding>& bindings)
+    void OpenXrInputBridge::SuggestProfile(Logger& log, const char* profilePath, const std::vector<XrActionSuggestedBinding>& legacyBindings)
     {
-        if (bindings.empty())
+        if (legacyBindings.empty())
             return;
+        // Every suggest for a profile replaces the previous one, so the raw
+        // button bindings go into each call.
+        std::vector<XrActionSuggestedBinding> bindings = legacyBindings;
+        AddRawBindings(bindings, profilePath);
 
         XrPath profile = XR_NULL_PATH;
         if (!TryPath(profilePath, profile))
@@ -5128,6 +5358,20 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
         AddBinding(b, m_BooleanActions[Index(L4D2VROpenXrActionId::Pause)], "/user/hand/left/input/system/click");
     }
 
+    void OpenXrInputBridge::AddFrameFaceButtonBindings(std::vector<XrActionSuggestedBinding>& b)
+    {
+        // Touch layout on the Frame's diamonds: right A/B as on Touch, left
+        // D-pad down / up where Touch has X / Y, View = Pause. Bumpers, right
+        // X/Y and D-pad left/right stay free for the CONTROLS tab (raw inputs).
+        AddBinding(b, m_BooleanActions[Index(L4D2VROpenXrActionId::SecondaryAttack)], "/user/hand/right/input/b/click");
+        AddBinding(b, m_BooleanActions[Index(L4D2VROpenXrActionId::Reload)], "/user/hand/right/input/a/click");
+        AddBinding(b, m_BooleanActions[Index(L4D2VROpenXrActionId::MenuSelect)], "/user/hand/right/input/a/click");
+        AddBinding(b, m_BooleanActions[Index(L4D2VROpenXrActionId::MenuBack)], "/user/hand/right/input/b/click");
+        AddBinding(b, m_BooleanActions[Index(L4D2VROpenXrActionId::PrevItem)], "/user/hand/left/input/dpad_down/click");
+        AddBinding(b, m_BooleanActions[Index(L4D2VROpenXrActionId::Pause)], "/user/hand/left/input/dpad_up/click");
+        AddBinding(b, m_BooleanActions[Index(L4D2VROpenXrActionId::Pause)], "/user/hand/left/input/view/click");
+    }
+
     void OpenXrInputBridge::AddMenuButtonBindings(std::vector<XrActionSuggestedBinding>& b)
     {
         AddBinding(b, m_BooleanActions[Index(L4D2VROpenXrActionId::ActivateVR)], "/user/hand/right/input/menu/click");
@@ -5152,6 +5396,7 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
             "/interaction_profiles/htc/vive_focus3_controller",
             "/interaction_profiles/htc/vive_controller",
             "/interaction_profiles/bytedance/pico4_controller",
+            "/interaction_profiles/valve/frame_controller",
             "/interaction_profiles/khr/simple_controller",
         };
 
@@ -5187,6 +5432,18 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
             AddGripValueBindings(b, "squeeze/value");
             AddIndexFaceButtonBindings(b);
             SuggestProfile(log, "/interaction_profiles/valve/index_controller", b);
+        }
+        {
+            // Native Steam Frame profile: without it SteamVR falls back to its
+            // Touch emulation, which folds bumper into trigger, right X/Y into B
+            // and the whole D-pad into X/Y (upstream issue #20).
+            std::vector<XrActionSuggestedBinding> b;
+            AddPoseAndHapticBindings(b);
+            AddStickAndTriggerBindings(b, "thumbstick");
+            AddGripValueBindings(b, "squeeze/value");
+            AddGripValueBindings(b, "grip/value");
+            AddFrameFaceButtonBindings(b);
+            SuggestProfile(log, "/interaction_profiles/valve/frame_controller", b);
         }
         {
             std::vector<XrActionSuggestedBinding> b;
@@ -5351,6 +5608,17 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
             DestroyAction(m_HandPoseAction);
             DestroyAction(m_AimPoseAction);
             DestroyAction(m_HapticAction);
+            DestroyAction(m_RawTrigger);
+            DestroyAction(m_RawGrip);
+            DestroyAction(m_RawStick);
+            DestroyAction(m_RawFace1);
+            DestroyAction(m_RawFace2);
+            DestroyAction(m_RawStickClick);
+            DestroyAction(m_RawMenu);
+            DestroyAction(m_RawFace3);
+            DestroyAction(m_RawFace4);
+            DestroyAction(m_RawBumper);
+            m_RawReady = false;
             for (XrAction& action : m_BooleanActions)
                 DestroyAction(action);
             for (XrAction& action : m_FloatDigitalActions)
@@ -5387,8 +5655,11 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
         }
     }
 
-    void OpenXrInputBridge::LogEyeGaze(XrTime displayTime, Logger& log)
+    void OpenXrInputBridge::ReadEyeGaze(XrTime displayTime, bool focused, L4D2VROpenXrEyeGazeDesc& gaze, Logger& log)
     {
+        gaze = {};
+        gaze.publishTickMs = GetTickCount64();
+        gaze.focused = focused ? 1u : 0u;
         if (m_EyeGazeSpace == XR_NULL_HANDLE || m_ViewSpace == XR_NULL_HANDLE)
             return;
         static ULONGLONG s_lastMs;
@@ -5407,16 +5678,22 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
             && (location.locationFlags & XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT) != 0;
         if (tracked)
             ++s_tracked;
-        const ULONGLONG now = GetTickCount64();
-        if (now - s_lastMs < 1000)
-            return;
-        s_lastMs = now;
-        // Gaze forward is -Z of the gaze pose; as yaw/pitch relative to the
-        // head view (right/up positive).
+        // Gaze forward is -Z of the gaze pose (view space: x right, y up).
         const XrQuaternionf& q = location.pose.orientation;
         const float fx = -(2.f * (q.x * q.z + q.w * q.y));
         const float fy = -(2.f * (q.y * q.z - q.w * q.x));
         const float fz = -(1.f - 2.f * (q.x * q.x + q.y * q.y));
+        gaze.valid = (XR_SUCCEEDED(stateResult) && poseState.isActive) ? 1u : 0u;
+        gaze.tracked = tracked ? 1u : 0u;
+        gaze.sampleTime = static_cast<int64_t>(sampleTime.time);
+        gaze.dir[0] = fx;
+        gaze.dir[1] = fy;
+        gaze.dir[2] = fz;
+        const ULONGLONG now = GetTickCount64();
+        if (now - s_lastMs < 1000)
+            return;
+        s_lastMs = now;
+        // Log as yaw/pitch relative to the head view (right/up positive).
         const float yaw = std::atan2(fx, -fz) * 57.29578f;
         const float pitch = std::atan2(fy, std::sqrt(fx * fx + fz * fz)) * 57.29578f;
         log.Print("gaze: active=%u tracked=%u/%u frames flags=0x%llx yaw=%+.1f pitch=%+.1f sampleTime=%lld state=%s loc=%s",
@@ -5464,7 +5741,8 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
         SynthesizeControllerFingerCurls(state);
         LocateControllerPoses(displayTime, state, log);
         LocateHandTracking(displayTime, state);
-        LogEyeGaze(displayTime, log);
+        ReadEyeGaze(displayTime, syncResult == XR_SUCCESS, state.eyeGaze, log);
+        ReadRawHands(state);
         state.reserved0 = CurrentControllerFamily();
         static uint32_t s_loggedFamily = ~0u;
         if (state.reserved0 != s_loggedFamily)
@@ -5585,13 +5863,9 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
     void OpenXrInputBridge::PublishDerivedDpadActions(L4D2VROpenXrInputStateDesc& outState)
     {
         constexpr float kPress = 0.70f;
-        const L4D2VROpenXrAnalogActionDesc& turn = outState.analogActions[Index(L4D2VROpenXrActionId::Turn)];
-        if (turn.active)
-        {
-            // G2 SteamVR dpad: north=Jump, south=CrouchToggle. Do not steal
-            // this axis for weapon cycle (X/Y do that on Touch).
-            SetDerivedDigital(outState, L4D2VROpenXrActionId::Jump, turn.y > kPress);
-        }
+        // Turn stick up = jump is decided in the DLL (distance + angle cone +
+        // turn block). A derived Jump here (turn.y > 0.7) fired on diagonal
+        // turns up to ~45 deg off vertical, so none is published.
 
         const L4D2VROpenXrAnalogActionDesc& walk = outState.analogActions[Index(L4D2VROpenXrActionId::Walk)];
         if (walk.active)
@@ -6273,6 +6547,20 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
             result = m_Xr.xrGetSystem(m_Instance, &systemInfo, &m_SystemId);
             if (!Succeeded(m_Log, "xrGetSystem(HMD)", result) || m_SystemId == XR_NULL_SYSTEM_ID)
                 return false;
+            {
+                // System name for the DLL's button labels (optional).
+                PFN_xrGetSystemProperties getProps = nullptr;
+                if (XR_SUCCEEDED(m_Xr.xrGetInstanceProcAddr(m_Instance, "xrGetSystemProperties",
+                        reinterpret_cast<PFN_xrVoidFunction*>(&getProps))) && getProps)
+                {
+                    XrSystemProperties props{ XR_TYPE_SYSTEM_PROPERTIES };
+                    if (XR_SUCCEEDED(getProps(m_Instance, m_SystemId, &props)))
+                    {
+                        m_Log.Print("System: %s (vendor 0x%X)", props.systemName, props.vendorId);
+                        m_InputBridge.SetSystemName(props.systemName);
+                    }
+                }
+            }
 
             uint32_t viewCount = 0;
             result = m_Xr.xrEnumerateViewConfigurationViews(
@@ -6822,6 +7110,15 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
             if (!Succeeded(m_Log, "xrCreateReferenceSpace(VIEW, head-locked overlays)",
                     m_Xr.xrCreateReferenceSpace(m_Session, &viewInfo, &m_OverlayViewSpace)))
                 m_OverlayViewSpace = XR_NULL_HANDLE;
+
+            // Room front for menus: the STAGE origin located in LOCAL gives the
+            // play area's forward. Optional; without it menus face the head.
+            XrReferenceSpaceCreateInfo stageInfo{ XR_TYPE_REFERENCE_SPACE_CREATE_INFO };
+            stageInfo.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_STAGE;
+            stageInfo.poseInReferenceSpace.orientation.w = 1.0f;
+            if (!Succeeded(m_Log, "xrCreateReferenceSpace(STAGE, room front for menus)",
+                    m_Xr.xrCreateReferenceSpace(m_Session, &stageInfo, &m_StageSpace)))
+                m_StageSpace = XR_NULL_HANDLE;
 
             m_Log.Print("Created OpenXR Vulkan session and LOCAL reference space");
             m_Bridge.Update(L4D2VROpenXrBridgeStatus::SessionCreated, 0, 0, "OpenXR Vulkan session created");
@@ -8638,12 +8935,19 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
             const XrPosef* gameRenderCenterPose = nullptr)
         {
             OverlayAnchor anchor{};
-            if (!gameRenderCenterPose && locatedViews.empty())
+            const bool givenAnchor = (overlay.reserved1 & L4D2VR_OPENXR_OVERLAY_FLAG_ANCHOR_POSE) != 0;
+            if (!givenAnchor && !gameRenderCenterPose && locatedViews.empty())
                 return anchor;
 
             XrVector3f hmdPosition{};
             XrQuaternionf hmdOrientation{};
-            if (gameRenderCenterPose)
+            if (givenAnchor)
+            {
+                // The game's latched menu panel pose (room front, eye height).
+                hmdPosition = XrVector3f{ overlay.anchorPosition[0], overlay.anchorPosition[1], overlay.anchorPosition[2] };
+                hmdOrientation = NormalizeOpenXrQuaternion(overlay.orientation);
+            }
+            else if (gameRenderCenterPose)
             {
                 hmdPosition = gameRenderCenterPose->position;
                 hmdOrientation = gameRenderCenterPose->orientation;
@@ -9717,6 +10021,37 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
                         locatedCount,
                         viewState.viewStateFlags,
                         frameState.predictedDisplayTime));
+                    // Room front: the STAGE origin moves only on a room
+                    // re-setup / recenter, so ~4 Hz is plenty.
+                    if (m_StageSpace != XR_NULL_HANDLE && (m_StageLocateFrame++ % 30u) == 0u)
+                    {
+                        XrSpaceLocation stageLoc{ XR_TYPE_SPACE_LOCATION };
+                        L4D2VROpenXrPoseDesc stage{};
+                        if (XR_SUCCEEDED(m_Xr.xrLocateSpace(m_StageSpace, m_AppSpace,
+                                frameState.predictedDisplayTime, &stageLoc))
+                            && (stageLoc.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT))
+                        {
+                            stage.valid = 1;
+                            stage.viewStateFlags = static_cast<uint32_t>(stageLoc.locationFlags);
+                            stage.displayTime = frameState.predictedDisplayTime;
+                            stage.position[0] = stageLoc.pose.position.x;
+                            stage.position[1] = stageLoc.pose.position.y;
+                            stage.position[2] = stageLoc.pose.position.z;
+                            stage.orientation[0] = stageLoc.pose.orientation.x;
+                            stage.orientation[1] = stageLoc.pose.orientation.y;
+                            stage.orientation[2] = stageLoc.pose.orientation.z;
+                            stage.orientation[3] = stageLoc.pose.orientation.w;
+                        }
+                        m_Bridge.PublishStagePose(stage);
+                        if (static_cast<int>(stage.valid) != m_StageLoggedValid)
+                        {
+                            m_StageLoggedValid = static_cast<int>(stage.valid);
+                            m_Log.Print("STAGE space in LOCAL: %s pos=(%.2f, %.2f, %.2f) rot=(%.3f, %.3f, %.3f, %.3f)",
+                                stage.valid ? "valid" : "not located",
+                                stage.position[0], stage.position[1], stage.position[2],
+                                stage.orientation[0], stage.orientation[1], stage.orientation[2], stage.orientation[3]);
+                        }
+                    }
                     // HMD 2026-09-20: polling here for a pair tagged with
                     // this predictedDisplayTime timed out almost every
                     // frame (matchHit=2/N, matchWaitAvg=9.01ms) and made
@@ -10168,7 +10503,8 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
                                         overlayLayer.layerFlags =
                                             (overlayIndex == L4D2VR_OPENXR_OVERLAY_HUD)
                                                 ? (XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT
-                                                    | XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT)
+                                                    | ((overlay.reserved1 & L4D2VR_OPENXR_OVERLAY_FLAG_PREMULTIPLIED) != 0
+                                                        ? 0 : XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT))
                                                 : 0;
                                         overlayLayer.space = m_AppSpace;
                                         overlayLayer.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
@@ -10580,6 +10916,8 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
             }
             if (m_CommandPool != VK_NULL_HANDLE && m_Vk.vkDestroyCommandPool)
                 m_Vk.vkDestroyCommandPool(m_VkDevice, m_CommandPool, nullptr);
+            if (m_StageSpace != XR_NULL_HANDLE && m_Xr.xrDestroySpace)
+                m_Xr.xrDestroySpace(m_StageSpace);
             if (m_OverlayViewSpace != XR_NULL_HANDLE && m_Xr.xrDestroySpace)
                 m_Xr.xrDestroySpace(m_OverlayViewSpace);
             if (m_AppSpace != XR_NULL_HANDLE && m_Xr.xrDestroySpace)
@@ -10611,6 +10949,9 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
         XrSession m_Session = XR_NULL_HANDLE;
         XrSpace m_AppSpace = XR_NULL_HANDLE;
         XrSpace m_OverlayViewSpace = XR_NULL_HANDLE;
+        XrSpace m_StageSpace = XR_NULL_HANDLE;
+        uint32_t m_StageLocateFrame = 0;
+        int m_StageLoggedValid = -1;
         XrSessionState m_SessionState = XR_SESSION_STATE_UNKNOWN;
         XrEnvironmentBlendMode m_BlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
         OpenXrInputBridge m_InputBridge;

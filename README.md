@@ -1,113 +1,214 @@
 # Black Mesa VR
 
-> [!IMPORTANT]
-> **New here? Start with the newest experimental release.** Most of the current development happens on the
-> `experimental-beta` branch, for the **Black Mesa public beta** (Steam → Black Mesa → Properties → Betas →
-> `public-beta`). Those releases are marked *Pre-release* on GitHub, but they get the current fixes and
-> features first, and they are what we test against.
-> Switch Black Mesa to the public beta, then get the top *Experimental* entry on the
-> **[Releases page](https://github.com/Hochgeschwindigkeitsrennfahrer/black-mesa-vr/releases)**. If you're on Linux, make sure to use the Proton version of the game.
-
 <a href="https://www.youtube.com/watch?v=S9kmK95yqgM">
-  <img src="assets/release-2026-09-06.jpg" alt="Black Mesa VR — Weapon Menu" width="90%">
+  <img src="docs/images/weapon-menu.jpg" alt="Black Mesa VR — Weapon Menu" width="90%">
 </a>
 
 [![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/P5P56X4HH)
 
-A VR mod for the Steam version of **Black Mesa**, bringing 6DOF motion controls, true stereo rendering, OpenXR, and VR-first weapon interaction to the game.
+A VR mod for the Steam version of **Black Mesa**: true stereo rendering, 6DOF motion controls, OpenXR, and
+weapon handling built for VR. The whole campaign is playable from start to finish, and **Black Mesa: Blue Shift**
+works too.
 
-The foundation of the VR implementation is based heavily on the approach pioneered by **L4D2VR**, adapted and extended for Black Mesa.
+The VR foundation is based on the approach pioneered by **[L4D2VR](https://github.com/keyou91/l4d2vr)**, adapted and
+extended for Black Mesa, with weapon selection, crowbar swinging and more adapted from **HL2VR**.
 
-L4D2VR source:
-https://github.com/keyou91/l4d2vr
+A macOS version lives here: https://github.com/armax9/black-mesa-vr-macos
 
-MacOS version here:
-https://github.com/armax9/black-mesa-vr-macos
+**Download:** [Releases page](https://github.com/Hochgeschwindigkeitsrennfahrer/black-mesa-vr/releases): get the latest release.
 
-## Current Status
+## Features
 
-**The project is working start-to-finish and is playable as a full VR mod.**
+### Playing
+- **6DOF motion controls**, the gun follows your hand, and you aim with the controller while you walk where you look.
+- **Two-handed weapons:** put your off-hand on the forend of a rifle, shotgun, MP5, crossbow and so on and hold grip;
+  the glove sits on the gun and steadies it.
+- **Manual weapon reloads:** reload weapons manually in VR. Optional.
+- **Grab gestures:** a hand behind a shoulder, at a hip or (left hand) at the forehead + grip. Each zone has a setting
+  per hand: the right hand draws a weapon (default: right shoulder crowbar, right hip pistol, above the left hip MP5;
+  "Dynamic" zones keep what you put away there), the left hand does an action (quick save, flashlight, ammo, quick
+  load, screenshot into the Steam library, recenter; default: left shoulder quick save, left hip ammo, forehead flashlight).
+- **Crowbar swinging** that hits where you swing (HL2VR style).
+- **HL2VR-style weapon wheel**, with the VR settings gear below the crowbar.
+- **Grenades thrown at the speed of your hand.**
+- **Crossbow scope built for VR:** bring the crossbow to your face with both hands to zoom; the zoomed view follows the
+  crossbow, with smoothing for hand tremor.
+- **Mounted guns** (50 cal, TOW) you steer with your hands.
+- **Ladders that work in VR:** push the stick roughly towards a ladder to get on, also while swimming; no need to face it exactly as the game normally wants. Optionally enable Physical Climbing in the VR menu to pull yourself up by the rungs instead.
+- **Per-hand item holding and use.**
+- **Health, suit and ammo on your hands**, an ammo counter on the weapon, and a **short red flash over the view when
+  you get hit**.
+- **Aim marker and laser:** red laser dot, laser beam with adjustable width, or the classic amber ticks; all optional.
+- **Flashlight** on the right grip, optionally in the left hand or on the left Square/X button.
+- Snap or smooth turning, crouch while held or toggle, sprint toggle, recenter. Cutscene cameras can take your view
+  with them as the scene was made; turn that off if it is too much for your VR legs.
+- **Bare hands until you get the HEV suit** (and throughout Blue Shift), HEV gloves after that.
+- **VR main menu and pause menu** in the world, with a motion-controller pointer, and Black Mesa's loading screens
+  as a flat panel.
 
-* True stereo rendering
-* 6DOF motion controls
-* HL2VR-style weapon selection
-* Accurate crowbar swinging (HL2VR)
-* OpenXR implementation
-* Health and armor on the hand 
-* Weapon-mounted ammo counter
-* Per-hand item holding and use
-* In-world transparent pause menu
-* Bare hands until HEV (and throughout Blue Shift)
-* Crossbow zoom (headset aim while scoped)
-* VR main menu with a motion-controller cursor
-* Blue Shift HUD theme (weapon wheel and wrist HUD)
-* Multicore rendering
+### Image quality and performance
+- **True stereo rendering** with each eye's own field of view, so no pixels are wasted outside the lenses, at the
+  headset's full resolution or above it.
+- **Foveated rendering:** the edges of each eye are shaded at a lower rate, which you hardly notice in the headset
+  but gives a large speed-up in heavy scenes. **Eye-tracked** on headsets with eye tracking (the sharp area follows
+  where you look), fixed at the lens centre on headsets without it. On by default.
+- **MSAA on the eyes** (2x / 4x): much smoother edges on walls, pipes, cables, models and the gun, optionally also on
+  leaves and fences.
+- **FXAA tuned for VR**, with Sharp / Balanced / Smooth presets.
+- **Less shimmer:** calmer cubemap reflections on shiny walls and floors (Full / Balanced / Subtle), lens flares,
+  light glows and smoke that stay level and agree between the eyes.
+- **MulticoreMode:** the game's render thread runs next to the game, and heavy outdoor areas keep a much higher
+  frame rate than before.
+- Many fixes for things that only break in VR: water and mirror reflections per eye, objects popping in one eye,
+  glows shining through walls, Xen fog, and more.
 
-## Known Issues
+### The VR settings panel
+**Hold Triangle/Y** (about half a second) or pick the gear in the weapon wheel. Six tabs:
+- **General:** turning, ladders, view, menus.
 
-The VR experience is fully playable, but several features are still a work in progress:
+  <img src="docs/images/panel-general.jpg" alt="VR settings: General tab" width="90%">
 
-* **Quest 3:** Meta Link uses the Link / Oculus OpenXR runtime. Virtual Desktop must use Streamer Options → **OpenXR Runtime = VDXR**. SteamVR in that dropdown inverts the world
-* If shots misalign with the weapon, press the right thumbstick once to recenter. Roomscale support is coming.
-* Two-handed weapons are planned for a later update.
-* Manual reloading is not currently implemented and is planned for a future update.
+- **Hands & Weapons:** hand HUD and its position, flashlight, aim marker and laser,
+  ammo feedback, weapon auto-switch, pistols, physical weapons.
 
-## Linux quick start: OpenXR runtime
+  <img src="docs/images/panel-hands.jpg" alt="VR settings: Hands & Weapons tab" width="90%">
 
-On Linux the OpenXR loader needs an *active runtime*, and running SteamVR is not enough: SteamVR also has to be
-registered as the system's OpenXR runtime. If it is not, `bmvr_xfer_helper --xr-probe` fails with
-`failed to determine active runtime file path` / `no OpenXR runtime installed or active?` (`-51`, `UNAVAILABLE`).
+- **Gestures:** what each hand does in each grab zone, on a picture of the HEV suit. A zone lights up while your hand
+  is in it.
 
-SteamVR's *Set SteamVR as OpenXR runtime* button (Settings → Developer, advanced settings) is missing on some Linux
-installs. The manual way works regardless:
+  <img src="docs/images/panel-gestures.jpg" alt="VR settings: Gestures tab" width="90%">
 
-```bash
-mkdir -p ~/.config/openxr/1
-ln -sf ~/.local/share/Steam/steamapps/common/SteamVR/steamxr_linux64.json \
-       ~/.config/openxr/1/active_runtime.json
-```
+- **Controls:** every button of both controllers, shown on pictures of your own controllers (PS VR2 Sense, Quest
+  Touch, Index, WMR / Reverb G2, Steam Frame). Pick a preset or set each press and hold yourself.
 
-Adjust the path if SteamVR lives in another Steam library (Flatpak Steam: under `~/.var/app/com.valvesoftware.Steam/`).
-Or override per launch, without touching the system setting:
+  <img src="docs/images/panel-controls.png" alt="VR settings: Controls tab with PS VR2 Sense controller pictures" width="90%">
 
-```bash
-XR_RUNTIME_JSON=$HOME/.local/share/Steam/steamapps/common/SteamVR/steamxr_linux64.json %command%
-```
+- **Graphics:** foveated rendering, frame cap, MSAA, FXAA, reflections, bloom.
 
-Then, with SteamVR running and a headset connected, check it:
+  <img src="docs/images/panel-graphics.jpg" alt="VR settings: Graphics tab" width="90%">
 
-```bash
-"$HOME/.local/share/Steam/steamapps/common/Black Mesa/bmvr_xfer_helper" --xr-probe
-```
+- **Debug:** diagnostics, logs and debug captures for bug reports.
 
-It should end with `xr-probe: PASS`. With the headset on you can then run the frame-loop self-test, which needs no game:
-`"$HOME/.local/share/Steam/steamapps/common/Black Mesa/bmvr_xfer_helper" --selftest-xr` (left eye should be BLUE with an "L", right eye RED
-with an "R"; Ctrl-C ends it). Experimental: it passed on SteamVR with an RTX 3080 (one run). With the native Linux build, `scripts/build-linux.sh` installs a launcher that starts the helper for you; stereo and head tracking were confirmed in a headset on SteamVR 2.19.4 + RTX 3080 (controller gameplay is not verified yet). Overview and status: `docs/linux/README.md`. (Observed: SteamVR/OpenXR 2.19.4, NVIDIA RTX 3080, session reaches READY. The probe
-submits no frames.) If it still says `UNAVAILABLE`, see `docs/linux/openxr-results.md`.
+Most changes apply right away. Settings you changed show in amber (the screenshots show a player's own setup). The panel only saves those into `VR\config.txt`, so improved
+defaults reach you with each update.
 
-## Black Mesa: Blue Shift
+## Install
 
-Black Mesa VR also supports **Black Mesa: Blue Shift**.
+### What you need
+- **Black Mesa on Steam**, up to date on the default branch (no beta). On **Linux** use the **Proton** version
+  of the game (Properties → Compatibility), not a native build.
+- A PC VR headset with an **OpenXR runtime**: SteamVR, Meta Link, Virtual Desktop (VDXR), WMR and others.
 
-After installing Blue Shift, launch the game with:
+### Steps
+1. **Quit Black Mesa.** A running game does not pick up the new files.
+2. Download the zip from the [Releases page](https://github.com/Hochgeschwindigkeitsrennfahrer/black-mesa-vr/releases)
+   and extract it.
+3. Copy **everything inside** `drop-into-Black-Mesa-folder` into your Black Mesa folder, the one that contains
+   `bms.exe` (Steam → Black Mesa → Manage → Browse local files). Replace files when asked.
+   This puts `d3d9.dll` in all three places it has to be: the game folder, `bin\` and `bin\thirdparty\dxvk-windows-x86\`.
+4. **Steam → Black Mesa → Properties → Launch Options:**
+   ```text
+   -heapsize 524288 -processheap -high -novid -windowed -oldgameui
+   ```
+   `-oldgameui` is required (the new game UI is upside-down in the headset). If the game's video menu shows
+   **Direct3D 9** as the renderer, also add `-enabledxvk`.
+5. **Turn off Steam Input for Black Mesa** (Properties → Controller → Disable Steam Input).
+6. Pick **one OpenXR runtime** and start it before the game:
+   - **SteamVR:** SteamVR → Settings → OpenXR → Set SteamVR as OpenXR runtime.
+   - **Meta Link (Quest):** uses the Link / Oculus OpenXR runtime.
+   - **Virtual Desktop:** Streamer → Options → **OpenXR Runtime = VDXR**. "SteamVR" in that dropdown shows the
+     world upside-down.
+7. Launch Black Mesa from Steam. `bmvr_log.txt` next to `bms.exe` should appear and start with `BMVR d3d9.dll loaded`.
 
-```text
--game bshift
-```
+**Updating:** copy the new zip over the old install the same way. Keep your `VR\config.txt` unless the release notes
+say otherwise; it only holds what you changed.
 
-The same VR setup can then be used with the Blue Shift campaign. Calhoun never
-wears the HEV suit, so this build keeps the bare-hand models for the whole
-Blue Shift session. The weapon wheel and wrist HUD use Calhoun blue instead of
-HEV amber.
+**Uninstall:** quit the game, then in the Black Mesa folder delete `d3d9.dll`, `BMVR_README.txt`, `bmvr_*` files,
+the `VR\` folder, `bin\d3d9.dll`, `bms\cfg\bmvr.cfg` and `bms\sound\bmvr\` (same under `bshift\` if you played Blue
+Shift). Installs from before 2026-11 may also have `openvr_api.dll` next to `bms.exe`,
+`bin\thirdparty\dxvk-windows-x86\openvr_api.dll` and `bin\sourcevr.dll.disabled`: delete those too. Then run Steam → Black Mesa → Properties → Installed Files → **Verify integrity of game files**:
+it restores the game's own `d3d9.dll` in the DXVK folder, `bin\openvr_api.dll` and `bin\sourcevr.dll`. Verify alone
+is not enough: it does not delete the mod's extra files. Remove the launch options too.
 
+**Blue Shift:** same install, plus `-game bshift` in the launch options. Calhoun
+keeps bare hands for the whole campaign, and the weapon wheel and wrist HUD turn security-guard blue.
 
-## Huge thanks wormslayer for HL2VR & to my testers and contributors for their patience and help:
+## Recommended setup
 
-marnovdm for quality of life features and polish + beta support (https://github.com/marnovdm)
-TheRealBubble
-SilentVortiguant - [Check out his youtube](https://www.youtube.com/@SilentVortigauntVR).
+### In the VR settings panel (Graphics tab)
+- **Foveated rendering: Eye-tracked** (default). The "Foveation now" row shows what it is actually doing: eye-tracked,
+  fixed, or off because your GPU has no variable-rate shading. Without eye tracking it falls back to the lens centre
+  by itself. Turning it on from off needs a game restart; the row tells you.
+- **MSAA: 2x** if your GPU has room. It costs about 2 ms per frame in a heavy room on an RX 9070; 4x roughly
+  doubles that. Keep **"MSAA on leaves + fences"** and **"MSAA skips particles"** on.
+- **Keep FXAA on next to MSAA.** MSAA smooths geometry edges; it cannot reach Black Mesa's lighting, so thin lit
+  objects (railings) and specular sparkle need FXAA. Start with the **Sharp** preset.
+- **Reflections (shimmer): Balanced** (default). **Subtle** if shiny floors still shimmer, **Full** for the game's
+  original look.
 
-yakupagagaming
+### In Black Mesa's video options
+- **Anti-aliasing: FXAA** (the mod tunes it for the headset).
+- Lower shadow and light quality first if you run short on frame rate; those cost more in VR than in flat play.
 
-Credits for the custom models:
-https://steamcommunity.com/sharedfiles/filedetails/?id=2969302231 (HEV Gloves)
+### In `VR\config.txt` (not in the panel)
+A few settings can only be changed in this file, because they set up the eye images when the game starts.
+**Quit the game fully before you edit it**; it is read once at launch.
+
+| Setting | Default | What it does |
+|---|---|---|
+| `RenderScale` | `1.0` | Multiplier on the headset's recommended eye size. **Above 1.0 = supersampling: sharper and much less shimmer**, at a GPU cost (1.2 renders about 44 % more pixels). If your PC can handle it, **1.2–1.4 is the biggest single image upgrade**; foveated rendering makes this a lot more affordable. Below 1.0 (0.8–0.9) if you are GPU-bound. |
+| `OpenXRHelperDownsample` | empty | `box`: with RenderScale above 1.0, the mod scales the big eye image down to the headset size itself, for cleaner edges. Try it together with a higher RenderScale. |
+| `MaxEyeSize` | `4096` | Largest eye side in pixels. Raise it (up to 5456 with MulticoreMode) only if a high RenderScale hits the cap; `bmvr_log.txt` shows the eye size that was used. Far above 4096 can run the 32-bit game out of memory. |
+| `ReflectionRtScale` | `0.5` | Resolution of **water and mirror-floor reflections**, as a fraction of the eye size. Higher = sharper reflections and less shimmer at floor and wall edges, but costs GPU in rooms with big reflective floors. `0` = the game's fixed 1024×1024, which shimmers badly at headset resolution. |
+| `RefractCopyRtScale` | `0.5` | Resolution of the screen copy that **shiny floors and wired glass** sample. At the game's 1024×1024 the edges where floors meet walls look jagged. It is only a copy, so it is cheap: leave it at 0.5. |
+| `OffCenterEyes` | `true` | Renders each eye's own field of view instead of one wide view for both eyes. Most headsets see further outward than inward, so this is sharper at the same cost. Set to `false` only if the view looks wrong on your headset. |
+| `IPDScale`, `HeightOffset` | `1.0`, `0.0` | World scale and player height tweaks. |
+
+The file explains every setting in comments.
+
+## Known issues
+- **Thin lit objects stay jagged even with MSAA 4x** (railings, thin bars). Black Mesa lights the scene in a separate
+  pass at 1x that MSAA cannot reach. FXAA softens it.
+- **Odd reflections in door glass and windows** look like Black Mesa's own bugs, not the mod's.
+- **Very heavy outdoor views can still drop below the headset's refresh rate:** the game draws every eye separately,
+  and its render thread is the limit there.
+- **Your hands disappear below the water surface** when you reach into water.
+- **Some monitors in the world pulse** (their brightness goes subtly up and down).
+- **Switching to an addon from the game's new menu (Blue Shift, Military, ...) does not work in VR:** the game
+  restarts its engine in place, the menu then runs at a few fps and starting a game crashes. Start the addon directly
+  instead, e.g. with the Steam launch option `-game bshift`.
+- The first launch after an update recompiles shaders: expect some hitches in the first minutes.
+
+**Reporting a bug:** attach `bmvr_log.txt` (next to `bms.exe`). For visual problems, **Debug → Capture debug frame**
+while the problem is visible helps a lot.
+
+## Credits
+
+**Developers:** [Hochgeschwindigkeitsrennfahrer](https://github.com/Hochgeschwindigkeitsrennfahrer) (original author)
+and [marnovdm](https://github.com/marnovdm).
+
+Huge thanks to:
+- **wormslayer** for HL2VR.
+- **keyou91** for [L4D2VR](https://github.com/keyou91/l4d2vr), the foundation of the VR implementation.
+- **martysl1** (Discord), whose AA4 experiment showed that multisampling only the eye images works with Black Mesa's
+  deferred renderer; that idea is the basis of the MSAA feature.
+- Our testers and contributors, for their patience and help:
+  - TheRealBubble
+  - SilentVortiguant ([check out his YouTube](https://www.youtube.com/@SilentVortigauntVR))
+  - yakupagagaming
+
+Custom models:
+- [HEV gloves](https://steamcommunity.com/sharedfiles/filedetails/?id=2969302231)
+
+## Disclaimer
+
+This is an **unofficial, free fan project** and is not affiliated with, endorsed by,
+or supported by Crowbar Collective or Valve Corporation.
+
+- **You need a legitimate copy of Black Mesa** (e.g. on Steam) to use this mod.
+- This mod does **not** include or distribute any Black Mesa or Valve game files, code, or assets.
+- This mod is **not sold** and never will be. It's made purely for the love of the game.
+- Please don't report problems with this mod to Crowbar Collective or Valve.
+  Use our [issue tracker](https://github.com/Hochgeschwindigkeitsrennfahrer/black-mesa-vr/issues) instead.
+
+Black Mesa is a trademark of Crowbar Collective. Half-Life is a trademark of Valve Corporation.

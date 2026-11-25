@@ -4,6 +4,7 @@
 #include <string>
 
 struct IDirect3DDevice9;
+struct IDirect3DTexture9;
 struct IDirect3DSurface9;
 class Game;
 
@@ -21,6 +22,17 @@ namespace bmvr
 
     void Log(const char* fmt, ...);
     void SetStage(const char* stage);
+    // New game UI study (2026-11-23): DXVK reports every shared texture or
+    // surface (created or opened from a handle). Logged; the ones on the VR
+    // (game) device are kept so `dump` can write them to VR/.
+    void NoteSharedResource(void* device, IDirect3DTexture9* texture, IDirect3DSurface9* surface, const char* kind,
+        bool opened, void* handle);
+    // A shared texture was bound for drawing (SetTexture). On the game device
+    // the last one bound in a frame is the top UI layer the game composites.
+    void NoteSharedTextureBound(void* device, void* texture);
+    // UI device window (second device, 1x1 back buffer), or nullptr.
+    void SetNewUiWindow(void* hwnd);
+    void* NewUiWindow();
 
     bool TryHmdFramebuffer();
     bool TryHmdNative();
@@ -149,6 +161,9 @@ namespace bmvr
     HWND GameWindow();
     // Client size of GameWindow(), cached for a few ms. Thread-safe.
     bool QueryWindowClientSize(uint32_t& width, uint32_t& height);
+    // The thread that refreshes that cache (main/RenderView thread, every frame); others only read it.
+    void NoteClientSizeRefreshThread();
+    void InvalidateClientSizeCache();  // device Reset: the window size may have changed
     void InstallEarlyFramebufferHook();
     void SetGameplayWorldRts(bool gameplayMap);
 
@@ -156,7 +171,6 @@ namespace bmvr
     extern uint32_t g_RecommendedEyeHeight;
     extern uint32_t g_FramebufferWidth;
     extern uint32_t g_FramebufferHeight;
-    extern bool g_OpenVRInitedFromCreateDevice;
     extern float g_RenderScale;
     extern float g_TurnSpeed;
     extern bool g_SnapTurning;
@@ -202,14 +216,46 @@ namespace bmvr
     // A crash during the scoped create persist-skips it (g_MsaaAllowed = false).
     extern uint32_t g_Msaa;
     extern bool g_AlphaToCoverage;   // AlphaToCoverage (default true, needs Msaa): alpha-tested draws use the eye MSAA samples (foliage, fences)
-    extern float g_LodBias;          // LodBias (default 0): extra mip LOD bias in the 3D views (texture shimmer)
+    extern float g_LodBias;          // LodBias (default 0): extra mip LOD bias in the 3D views (softer textures; foliage/fences more solid)
     extern bool g_RefractOncePerEye; // RefractOncePerEye (default true): glass refraction copied once per eye
+    extern float g_RefractCopiesPerEye; // RefractCopiesPerEye (1..20, default 6): copies per eye RefractOncePerEye lets through
     extern float g_MsaaF;           // VR panel copy of g_Msaa (0/2/4); applied live by recreating the eyes
     extern bool g_MsaaParticles1x; // MsaaParticles1x (default true, needs Msaa): particles drawn last, on the 1x resolve (the gun too in frames with particles)
     extern bool g_MsaaPostSwitch;   // MsaaPostSwitch (default true): post chain on the 1x resolve
+    // PostCopySwap (default true, panel DEBUG > GPU SAVINGS): the post chain's
+    // eye -> _rt_FullFrameFB copies swap image storage in DXVK instead of copying
+    // (same image; the copy still runs if anything reads the eye before the
+    // next full-screen pass). The arm values are the thread id of the hook
+    // that may swap / overwrite, 0 = not armed.
+    extern bool g_PostCopySwap;
+    // ShadowsOncePerFrame (default true, panel DEBUG > SAVINGS): the deferred lights' shadow
+    // atlas tiles are rendered by the first eye only; the second eye skips a light whose
+    // render call (light, atlas slot, flags) matches one the first eye made in this stereo
+    // pair (same frame, same content). Saves engine CPU (shadow views) and GPU.
+    extern bool g_ShadowsOncePerFrame;
+    // Bumped once per stereo pair on the main thread (dRenderView), before the first eye.
+    extern int g_StereoPairSeq;
+    // bmvr_shadows_once_test (test, not saved): the second eye skips every light shadow, matched or not.
+    extern bool g_ShadowsOnceTestSkipAll;
+    // bmvr_cpu_sample <s> (test, not saved): sample main + render thread CPU for s seconds, log the result.
+    extern float g_CpuSampleSeconds;
+    // PostCopySwapAlpha (cvar bmvr_post_copy_swap_alpha, default 1): 0 = an RGBA write is
+    // needed to drop the debt, 1 = RGB-only writes count (eye alpha mid-post is
+    // not needed), 2/3 = as 1 and the owed eye is cleared to alpha 0/1 (test).
+    extern float g_PostCopySwapAlpha;
+    extern volatile unsigned long g_PostSwapArmThread;
+    extern volatile unsigned long g_FullOverwriteArmThread;
     extern bool g_MsaaAllowed;
     uint32_t NormalizeMsaa(int samples);
     extern bool g_Haptics;
+    // Last round out of the gun (LastShotHaptic): 0 = the normal shot buzz, 1 = a double
+    // buzz (default), 2 = one longer buzz. Amplitude = LastShotHapticStrength (0.05-1).
+    extern float g_LastShotHaptic;
+    extern float g_LastShotHapticStrength;
+    // Trigger pulled on an empty gun (DryFireHaptic): 0 = no buzz, 1 = one tick,
+    // 2 = a quick "nope" double tick (default). Amplitude = DryFireHapticStrength (0.05-1).
+    extern float g_DryFireHaptic;
+    extern float g_DryFireHapticStrength;
     extern bool g_HideCrosshair;
     extern bool g_MatchHmdHz;
     extern bool g_DisableViewBob;
@@ -235,6 +281,9 @@ namespace bmvr
     extern bool g_VrHandsDebugBoxes;
     // Wrist HUD: health+suit flat on the off-hand, ammo sideways beside the gun hand.
     extern bool g_HandHud;
+    // Red flash on the eye edges when health or armor drops; strength = peak alpha.
+    extern bool g_DamageFlash;
+    extern float g_DamageFlashStrength;
     // Off-hand (health/suit) panel placement, relative to the controller after
     // the tilt/roll: size and offsets in game units, angles in degrees. Roll is
     // mirrored for a right-hand panel (left-handed play).
@@ -295,16 +344,28 @@ namespace bmvr
     // Fixes, default on (a config key can turn each off):
     extern bool g_TwoHandHoldWhileGrip;  // long guns stay two-handed while the grip is held
     extern bool g_TwoHandGripToggle;     // support grip latches: squeeze on the gun = on, squeeze again = off
+    // Pistols (glock, .357): one shot per trigger pull; holding fires no more (off = hold repeats, game default).
+    extern bool g_VrPistolSemiAuto;
+    // Glock: a pull within VrGlockRapidWindow s of the last one fires Black Mesa's alt-fire (fast, wide spread).
+    extern bool g_VrGlockRapidAlt;
+    extern unsigned long g_ScreenshotAt;     // VR panel "Screenshot": GetTickCount when to dump the eyes (0 = none)
+    extern unsigned long g_SteamScreenshotAt; // gesture screenshot: GetTickCount when to send the right eye to Steam (0 = none)
     extern unsigned long g_DebugCaptureAt;   // VR panel "Capture debug frame": GetTickCount when to capture (0 = none)
+    extern bool g_FlareLog;              // VR panel DEBUG "Flare position log" / bmvr_flare_log / env BMVR_FLARE_LOG=1: log lens flare positions + visibility; each switch-on starts fresh line caps (not saved)
     extern bool g_FreezeHead;            // VR panel debug row / bmvr_freeze_head: game view keeps the head pose of the moment it was switched on (not saved)
+    extern float g_DebugHideXog;         // VR panel debug row: skip Xen fog draws, 1 = global (__gbxog0), 2 = volumes, 3 = both (not saved)
     extern float g_DebugBlankEye;        // VR panel debug row: 1 = blank the left eye, 2 = the right (not saved)
     extern bool g_PauseMenuColourFromFrame; // pause-menu layer colour from the presented desktop frame (VR repaint stacks windows wrongly)
     extern float g_PauseMenuAlphaPasses; // pause-menu layer: N passes of a -> a + a(1-a), i.e. 1-(1-a)^(2^N); 0 = off
-    extern bool g_FlashlightLeftHand;    // flashlight from the left hand (along the gun while two-handed)
+    // Flashlight from (FlashlightFrom): 0 = right (gun) hand (default), 1 = left hand (along the
+    // gun while two-handed), 2 = head (the light follows the view, as in the flat game).
+    // The old FlashlightLeftHand=true maps to 1.
+    extern float g_FlashlightFrom;
     extern bool g_FlashlightOnSquare;    // left Square toggles the flashlight (replaces previous weapon)
     extern float g_FrameCapMode;         // fps_max: 0 = game's own, 1 = headset rate + 10, 2 = 2x headset rate
     extern bool g_VrHandThrow;           // frag leaves the hand at the hand's speed (Lambda1VR-style throw)
     extern float g_MountedGunGain;       // mounted gun: barrel turn per degree of hand swing around the mount (1 = handle stays in the hand)
+    extern float g_SnarkThrowScale;      // snark hand throw: x this on top of the frag throw speed
     extern float g_ThrowScale;           // hand speed x 2/3 x this, capped at 1500 u/s (Lambda1VR vr_throw_scale)
     extern bool g_VrSkipMotionBlur;      // skip the engine motion blur pass in VR
     extern bool g_VrSkipScreenEffects;   // skip env_screeneffect overlays (stun / intro blur) in VR
@@ -341,6 +402,35 @@ namespace bmvr
     // GPU ms per frame for eye-sized RTs, the reflection set and refract
     // copies, per eye, every ~5 s (D3D timestamp queries, no stalls).
     extern bool g_GpuPassTiming;
+    // GpuPassDetail (default false, test aid): GpuPassTiming split by every
+    // RT0 and material group (Bind hook on) plus copies and eye MSAA
+    // switches, per eye, logged every ~10 s as "GPU pass" lines.
+    extern bool g_GpuPassDetail;
+    // Foveated rendering (VK_KHR_fragment_shading_rate rate image per eye,
+    // DXVK d3d9_device.cpp BmvrFoveationSelect). Foveated: 0 off, 1 fixed
+    // rings around each eye's lens centre, 2 eye-tracked (centre follows the
+    // OpenXR eye gaze; lens centre while there is none). FoveatedGazeStep:
+    // gaze change (tangent units) before the centre moves. The GPU feature is only enabled
+    // when Foveated > 0 at game start (g_FoveatedAtStart); later the panel
+    // switches it live. Rings in units of half the eye height on the PS VR2:
+    // inside Inner full rate, to Mid 2x1/1x2, to Outer 2x2, beyond 4x4 (driver
+    // clamps to its largest rate, 2x2 on RDNA4). g_FoveatedRingScale (set per
+    // eye pass) keeps them the same angle on other headsets: PS VR2 vertical
+    // eye span (tangent) / this headset's.
+    extern float g_Foveated;
+    extern bool g_FoveatedAtStart;
+    extern float g_FoveatedInner;
+    extern float g_FoveatedMid;
+    extern float g_FoveatedOuter;
+    extern float g_FoveatedRingScale;
+    // Panel/log status: "off", "eye-tracked", "fixed (no eye tracking)", ...
+    std::string FoveationStatusText();
+    extern float g_FoveatedGazeStep;
+    // Called on the D3D thread after RT0 changes: stereoEye 1/2 = this eye's
+    // world pass (rate image on eye-sized targets), 0 = none. centreU/V =
+    // lens centre in the eye texture (0..1, v down).
+    void FoveationSelect(IDirect3DDevice9* device, int stereoEye, uint32_t eyeW, uint32_t eyeH, float centreU, float centreV);
+    bool FoveationAvailable(IDirect3DDevice9* device);
     // PerfLog (default false): playtest performance log. Turns on GpuPassTiming
     // and the engine world batch counters (per eye/view: surface groups, mesh
     // changes vs the engine's 127 limit, player position) and the glow
@@ -350,13 +440,82 @@ namespace bmvr
     // Test aid: frames left to log every render pass (VR/trace.txt, headless runs only).
     extern int g_PassTraceFrames;
     extern bool g_SprintAimedPose;       // sprint animations show the aimed idle pose
+    extern float g_QuickDrawSec;         // after a weapon switch the draw wait is cut to this many seconds (< 0 = off)
     extern bool g_SkipDrawAnim;          // draw/holster/pickup animations show the idle pose
+    // Game auto-switches (user 2026-11-23: both off). Off = a picked-up weapon goes to the
+    // inventory only (CBM_SP_GameRules::FShouldSwitchWeapon -> false), and an emptied weapon stays in
+    // the hand (ReloadOrSwitchWeapons sees ITEM_FLAG_NOAUTOSWITCHEMPTY on every weapon).
+    extern bool g_AutoSwitchPickup;
+    extern bool g_AutoSwitchEmpty;
     extern bool g_ThrowStroke;           // frag throw velocity from the throwing stroke (far point of the hold -> release)
     extern bool g_DeltaSeqIdle;          // a delta layer as the main viewmodel sequence shows idle (tau/crossbow)
+    extern bool g_CrowbarHitDrawnBar;    // crowbar hit sweep along the drawn v_crowbar bar (not the old HL2VR grip frame)
+    extern bool g_TwoHandNoLower;        // both hands on the gun: no lowered clip at friendlies, laser stays on
+    extern bool g_TwoHandLoweredFollow;  // two-hand support glove follows the gun's lowered clip (aimed at a friendly)
     extern bool g_ScopeClipIdle;         // crossbow to/from-scope clips show idle (the clip moves the gun to the eye)
     extern bool g_MuteFidgetSounds;      // weapon fidget clips play no sound (the pose is frozen in VR)
     // Optional features, default off:
-    extern bool g_ShoulderGestures;      // hand behind shoulder + grip: left quick save, right crowbar
+    // Grab zones (grip with the hand there). Every zone has a slot per hand
+    // (user 2026-11-23): the left hand does an action, the right hand takes a
+    // weapon. The forehead (head frame) has a left-hand slot only: the gun
+    // hand aims and scopes there.
+    enum GestureZoneId
+    {
+        kGestureShoulderLeft = 0,
+        kGestureShoulderRight,
+        kGestureHipLeft,        // right hand: just above it (cross draw)
+        kGestureHipRight,       // left hand: just above it (cross draw)
+        kGestureHead,
+        kGestureZoneCount
+    };
+    constexpr int kGestureWeaponZoneCount = 4;   // all but the forehead
+    // Left-hand actions. Ammo = the manual-reload ammo pouch (live only while
+    // manual reload is on). Quick load needs a ~1 s grip hold.
+    enum GestureAction
+    {
+        kGestureOff = -1,
+        kGestureQuickSave = 0,
+        kGestureFlashlight,
+        kGestureAmmo,
+        kGestureQuickLoad,
+        kGestureScreenshot,
+        kGestureRecenter,
+        kGestureActionMax = kGestureRecenter
+    };
+    extern float g_GestureLeft[kGestureZoneCount];
+    // Right-hand slots: -1 off, a weapon (index into GestureWeaponName / parts:
+    // 0 crowbar, 1 pistol, 2 .357, 3 MP5, 4 shotgun, 5 crossbow, 6 RPG, 7 tau,
+    // 8 gluon, 9 hivehand, 10 grenade), or kGestureDynamic: the zone holds the
+    // weapon last put away there (g_GestureDyn, -1 = none yet; written by the
+    // game). Floats for the panel's Choice rows. The old ShoulderGestures /
+    // HipGestures switches and VrHolsterDynamic migrate once and are dropped.
+    constexpr int kGestureWeaponCount = 11;
+    constexpr int kGestureDynamic = kGestureWeaponCount;
+    extern float g_GestureRight[kGestureWeaponZoneCount];
+    extern float g_GestureDyn[kGestureWeaponZoneCount];
+    const char* GestureLeftKey(int zone);    // config.txt keys
+    const char* GestureRightKey(int zone);
+    const char* GestureDynKey(int zone);
+    const char* GestureZoneName(int zone);   // "left shoulder", ...
+    const char* GestureActionName(int action);
+    // The right-hand slot's weapon now (a Dynamic zone's stored one), -1 = none.
+    int GestureWeaponAt(int zone);
+    // Grab zones follow an estimated body yaw + neck point, not the headset
+    // (debug A/B, not saved; on by default). Tunables in VR/config.txt and the
+    // Debug tab TESTS rows.
+    extern bool g_GestureBodyFrame;
+    // MenuRoomFront (panel GENERAL > MENUS, saved; default off): main menu +
+    // pause overlay face the room's front (STAGE forward) at eye height unless
+    // the head is > 90 deg off it, and an open menu re-anchors when the head
+    // moved/turned away. Off = the menu opens straight ahead of the head.
+    extern bool g_MenuRoomFront;
+    extern float g_BodyYawDeadzoneDeg;    // head turns this far without moving the body (35)
+    extern float g_BodyYawHardLimitDeg;   // body dragged along past this (80)
+    extern float g_BodyYawCatchUpSec;     // head held past the dead zone this long -> body turns (0.8)
+    extern float g_BodyYawCatchUpDegPerSec; // turn speed while catching up (120)
+    const char* GestureWeaponName(int index);
+    // Name parts matched against the inventory's network / model names (nullptr-terminated).
+    const char* const* GestureWeaponParts(int index);
     extern bool g_SettingsTriangleHold;  // Triangle/Y hold opens the VR settings panel, tap pauses on release
     extern bool g_WeaponMenuSettingsGear; // VR gear slot in the weapon menu (always shown without SettingsTriangleHold)
     extern bool g_WeaponMenuTilt;        // weapon menu opened low tilts back to face the eye
@@ -364,18 +523,35 @@ namespace bmvr
     // (default false = each push toggles crouch).
     extern bool g_CrouchStickHold;
     // StickJumpCrouchThreshold: how far (0..1) the right stick must go up/down
-    // for jump/crouch (default 0.8); it also has to point within 30 degrees
-    // of straight up/down.
+    // for jump/crouch (default 0.8); it also has to point within
+    // StickJumpCrouchAngle degrees of straight up/down (default 30).
     extern float g_StickJumpCrouchThreshold;
+    extern float g_StickJumpCrouchAngle;
     // TurnBlocksJumpCrouch=true: after the right stick went sideways (turn),
     // no stick jump/crouch until it returns near the centre.
     extern bool g_TurnBlocksJumpCrouch;
-    // SprintToggle=true: one sprint click (left stick click) keeps sprinting
-    // until the left stick returns to centre or sprint is clicked again
-    // (default false = hold the click).
+    // Button mapping: a button with a hold action mapped fires it after this
+    // long (ms); released earlier = its press action. One global value.
+    extern float g_ButtonHoldMs;
+    // Button mapping on (OpenXR helper with raw inputs). false = the helper's
+    // fixed bindings, as before mapping existed (fallback if a mapping bug
+    // blocks a button).
+    extern bool g_ButtonMapping;
+    // VR panel CONTROLS tab: show each controller as a picture (SteamVR render
+    // model) with a label per button, and label the controllers in your hands.
+    // false (or no model found) = the plain list.
+    extern bool g_ControlsPicture;
+    // SprintToggle=true (default): one sprint click (left stick click) keeps
+    // sprinting until the left stick returns to centre or sprint is clicked
+    // again; false = hold the click. Fixed button layout only (ButtonMapping
+    // off): with mapping, the "Sprint toggle" / "Sprint (hold)" actions pick
+    // it, and an old SprintToggle=false becomes a Sprint (hold) mapping.
     extern bool g_SprintToggle;
     // VR settings panel pauses the game while open (setpause / unpause).
     extern bool g_VrSettingsPause;
+    // First-run welcome ("hold <button> to open the VR menu") done; written by
+    // the mod once the player opened the panel from it (VrWelcomeSeen=true).
+    extern bool g_VrWelcomeSeen;
     // Logs (and resets) the access-violation count since the last call.
     void LogFaultStats();
     // Hide HEV gloves and wrist HUD until the HEV suit is picked up. Bare-hand
@@ -407,6 +583,13 @@ namespace bmvr
     // 0 = between the eyes). A scope is one-eyed: from the head centre the
     // bolt hit half an IPD beside the reticle in both eyes (2026-11-03).
     extern int g_ScopeEye;
+    // ScopeMonoZoom (default on, user 2026-11-18): while the crossbow is
+    // zoomed both eyes render from the head centre (zero IPD) and the bolt
+    // starts there, so both eyes see the same picture and reticle. Stereo
+    // zoomed 3.5x magnified the eyes' disparity: the target showed doubled
+    // and only ScopeEye's copy matched the bolt (users closed the left eye).
+    // ScopeEye then does nothing. Debug-tab A/B row, off = the old stereo zoom.
+    extern bool g_ScopeMonoZoom;
     // LeftEyeCullPad (default 0 = off since 2026-10-30, max 0.25): the left eye's right
     // edge is pushed out by this fraction of the half-FOV tangent (off-centre
     // CViewSetup) and submitted at that FOV (OpenXR explicit tangents, OpenVR
@@ -462,6 +645,17 @@ namespace bmvr
     extern bool g_McHandSnapshot;
     extern bool g_SkyWaterPerEye;
     extern bool g_EyeUnderwaterWorld;
+    // Eye at the water line (near plane crosses the surface): the eye view drops the engine's
+    // "keep above the water" clip, so the G-buffer has the world under the surface for the
+    // engine's water intersection view (false = stock: black/fog-green lower part of the view).
+    extern bool g_WaterLineClipFix;
+    // Screen-space quads (DrawScreenSpaceRectangle: underwater warp, post chain; lens flare layers) get an
+    // identity model matrix around the draw. Both set identity view + projection but inherit the model
+    // matrix; a leftover translation drew the warp / flares shifted for a whole launch (2026-11-17).
+    extern bool g_ScreenSpaceModelFix;
+    // Black Mesa's global Xen fog pass (__gbxog0) is not drawn in VR: view-direction noise at infinite stereo
+    // depth, also inside rooms where flat shows none. Local fog volumes stay.
+    extern bool g_XenGlobalFogOff;
     extern bool g_FlareEyeAxis;
     // Lens flare layers are turned so their streaks stay level with the world
     // horizon at the light, not with the eye's image (which rolls with the head).
@@ -525,8 +719,8 @@ namespace bmvr
     // 0 this long shows the glow at 0 at once (no glow through walls).
     extern float g_GlowSmooth;
     extern float g_GlowHideMs;
-    // Tests (VR panel Debug -> TESTS), default off:
-    // GlowProxyScale (bmvr_glow_proxy_scale, default 1.5 since 2026-11-11,
+    // Tests (VR panel Debug -> TESTS, developer rows), default off:
+    // GlowProxyScale (bmvr_glow_proxy_scale, default 1 since 2026-11-22 (was 1.5),
     // 1 = stock): the glow occlusion test area is this many times wider, so a query counts more pixels and
     // its visible fraction moves in finer steps.
     // PoseHoldDeg / PoseHoldMm (bmvr_pose_hold_deg / _mm, 0 = off): the game
@@ -534,11 +728,31 @@ namespace bmvr
     // this; the frame goes out with that pose, SteamVR reprojects the rest.
     // A still head then renders identical frames (no glow / shimmer crawl).
     extern float g_GlowProxyScale;
+    // VrRpgRingScale (bmvr_rpg_ring_scale): size of the spinning red lines
+    // around the RPG laser point. 1 = the flat HUD's size (10-18 px per 1440 px
+    // of eye height); default 0.25. Own setting, not the aim marker size.
+    extern float g_VrRpgRingScale;
     extern float g_PoseHoldDeg;
     extern float g_PoseHoldMm;
     // LOADING card on in-game loads (bmvr_loading_card, default on). Test switch
     // for the 2026-11-11 stuck-head-pose-after-load report.
     extern bool g_LoadingCard;
+    // TitleLevel (default true since 2026-11-17, panel DEBUG > FIXES: RENDERING): intro logo / chapter
+    // titles placed level with the room at the head's yaw when they appear and
+    // left there (like the pause menu) instead of head-locked (turning,
+    // pitching and rolling with the headset).
+    extern bool g_TitleLevel;
+    // TitleGlow (default on, panel DEBUG > FIXES: RENDERING, not saved): the
+    // title layer gets flat Black Mesa's hud_post look (bloom + scanlines,
+    // client 0x267c40).
+    extern bool g_TitleGlow;
+    // ParticlesLast (default true since 2026-11-17, panel DEBUG > FIXES: RENDERING): hold the main view's
+    // particles to the end of the translucent pass also when "MSAA skips
+    // particles" does not (MSAA 0 or that row off), as a pure draw-order change
+    // without the 1x switch. The engine's distance sort can put a big water
+    // model after a waterfall splash; the water then paints its refraction
+    // texture (no particles in it) over the splash (capture 213054 vs 213110).
+    extern bool g_ParticlesLast;
     // bmvr_glow_trace <seconds> / panel DEBUG "Record glow trace": start a glow
     // trace of that length (bmvr_glowtrace.h); reset to 0 once it starts.
     extern float g_GlowTraceSeconds;
@@ -571,9 +785,12 @@ namespace bmvr
     // Left = -deg, right = +deg, same convention as the Index roll. One value
     // for every controller: on Index the pose already carries
     // g_VrHandsIndexRollDeg, so the glove adds only the difference (90 = as
-    // before). Not applied to a hand posed on a weapon; never touches the
-    // tracked pose, so guns and aim are unaffected.
+    // before). Also on a hand posed on a weapon (it then sits under the gun);
+    // never touches the tracked pose, so guns and aim are unaffected.
     extern float g_VrHandsRollDeg;
+    // VR panel DEBUG "Show developer rows" (VrPanelDevRows, default off): shows the
+    // developer groups (A/B switches, tests, engine cvars) on the DEBUG tab.
+    extern bool g_PanelDevRows;
     extern float g_VrHandsGunGripRight;
     extern float g_VrHandsGunGripUp;
     extern float g_VrHandsGunGripForward;
@@ -614,6 +831,148 @@ namespace bmvr
     extern float g_VrHandsRightGripRotZ;
     // Prefer ripped HEV GLBs in VR/hands when present.
     extern bool g_VrHandsUseHevGloves;
+    // Gloves built from Black Mesa's own viewmodel arms (installed VPKs). Always on
+    // (no config key since 2026-11-18); the glove files are only the fallback
+    // when building them fails. Cvar bmvr_hands_blackmesa stays for A/B tests.
+    extern bool g_VrHandsBlackMesa;
+    extern float g_VrHandsBlackMesaScale;
+    // The weapon's own right hand (viewmodel arms, left arm + forearms collapsed) on the gun.
+    extern bool g_VrGunRightHand;
+    // Black Mesa hands: the support glove on the gun takes the stock left
+    // hand's finger pose (idle), and pinches the MP5 bolt / grenade pin.
+    extern bool g_VrStockHandPose;
+    // Support hand locks to the gun (user, 2026-11-18): while the left hand
+    // holds the gun (two-hand latch) the gun's own stock left hand is drawn
+    // in its grip pose (follows the shotgun pump) and the left glove is
+    // hidden. Needs VrGunRightHand (the viewmodel's arms drawn).
+    extern bool g_VrSupportHandLock;
+    // A/B (user, 2026-11-18): VR hands lit with the raw light at the palm
+    // (GetLightForPoint + flashlight) instead of the lifted/tinted value with
+    // a floor ("indoor gloves stay readable", Aug 2026). Off = the old look.
+    extern bool g_VrHandLightRaw;
+    // Satchel (user, 2026-11-18): bag in the left hand (v_satchel's own left
+    // hand), detonator in the right (v_satchel_radio's own right hand), both
+    // pinned to the controllers by SatchelPinHand; left trigger throws from
+    // the left hand on the release, right trigger detonates, left grip = Use.
+    // Fist centre target in the controller frame (cm: forward, right, up;
+    // right is mirrored for the left hand).
+    extern bool g_VrSatchelHands;
+    extern bool g_VrGrenadeWristAlign; // grenade own hand turned to the gun hands' wrist pose
+    extern float g_VrSatchelFist[3];
+    // Two-handed: health panel above the ammo panel on the gun (not on the support wrist).
+    extern bool g_HudHealthOnGun;
+    extern bool g_VrSupportHandForce; // test: lock as if the left hand held the gun
+    // Pinch curls (thumb, index; 0-1) and a test switch that pinches the left
+    // glove everywhere. Cvars only (bmvr_pinch_*), for tuning.
+    extern float g_VrPinchThumb;
+    extern float g_VrPinchIndex;
+    extern bool g_VrPinchForce;
+    // "Physical weapons (beta)" master switch (VR panel HANDS & WEAPONS, off by
+    // default = the stable release's gun handling). The rows under it
+    // (manual reloads, grenade pin, support hand pose and
+    // lock, satchel detonator in the hand, snark hand throw, recoil) only act
+    // while it is on; read them through PhysicalWeapon().
+    extern bool g_PhysicalWeapons;
+    inline bool PhysicalWeapon(bool sub) { return g_PhysicalWeapons && sub; }
+    // Manual MP5 magazine (prototype): reload ejects, left grip at the left hip takes a magazine, seat it in the well.
+    extern bool g_VrMagReload;
+    // Frag grenade: pull the pin with the left hand before it can be thrown
+    // (only with VrMagReload on). On by default.
+    extern bool g_VrGrenadePin;
+    // Small "PUMP IT" / "PULL THE CHARGING HANDLE" toasts on a dead trigger
+    // (twice each per game start). On by default.
+    extern bool g_VrReloadHints;
+    // Left glove takes Black Mesa's own reload-clip hand pose on a held magazine, the MP5 bolt
+    // and the glock slide (vr_clip_hand_poses.h); the magazine sits where that hand holds it.
+    extern bool g_VrClipHandPose;
+    // While the MP5 bolt / glock slide is held: the gun's own left hand in that clip pose sits on
+    // it (like the support-hand lock), the glove hides.
+    extern bool g_VrClipHandSnap;
+    // RPG rocket held through a closed left fist (along the knuckle line).
+    extern bool g_VrClipHandRpg;
+    // That rocket's tail out of the pinky side (default, user 2026-11-19); off = thumb side.
+    extern bool g_VrClipHandRpgFlip;
+    // Manual reloads: rounds left in an ejected magazine / an opened .357
+    // cylinder are lost (not topped up again); a chambered MP5/glock round
+    // stays. Only while there is reserve ammo (user, 2026-11-18).
+    extern bool g_VrMagDiscard;
+    // Eye near clip plane, game units (BM's own is 7, ~18 cm at the VR
+    // scale). Lower = guns/hands held at the face clip later (sights), at
+    // some depth precision far away. Only ever lowers the game's value.
+    extern float g_VrNearZ;
+    // VR recoil: each shot kicks the gun + aim up (per-weapon amount, back in
+    // ~0.15 s); both hands on the gun cut it to 30 % (pistol grip 50 %).
+    // Off by default (user A/B). Strength scales every weapon's kick.
+    extern bool g_VrRecoil;
+    // Physical ladders: grip a ladder with either hand and pull/push to
+    // climb (the stick still climbs too). On by default.
+    extern bool g_PhysicalLadders;
+    // VR panel DEBUG "HELD WEAPON ANGLE": pitch/yaw/roll (degrees) of the held
+    // weapon, on top of the built-in table; live, saved per weapon in
+    // VR/viewmodel_offsets.txt (ax ay az), not in config.txt.
+    extern float g_VmTunePitch, g_VmTuneYaw, g_VmTuneRoll;
+    // Same rows: support (left) hand point along the held gun, cm (+ = forward).
+    extern float g_VmTuneSupportCm;
+    // Same rows: how close (cm, magazine centre to the well) and how
+    // straight (deg between the magazine in the hand and its seated pose,
+    // 180 = any angle) a magazine/shell/loader must be to seat. Per weapon,
+    // built-in defaults until changed (vm_numpad seat columns).
+    extern float g_VmTuneSeatCm, g_VmTuneSeatDeg;
+    // Built-in seat values for the weapon in the hand (vr.cpp): what
+    // "Reset tab" puts back on those two rows.
+    void HeldWeaponSeatDefaults(float& cm, float& deg);
+    // Physical ladders: the view follows the climb hand every frame instead
+    // of LadderMove's per-tick bursts (render offset only). On by default.
+    extern bool g_PhysicalLadderSmooth;
+    extern bool g_LadderBodyFollowsArms; // hand climbing: view closer/further from the ladder with the arms
+    // Physical ladders, the gun hand: 0 = grabbing holsters the weapon (back
+    // when off the ladder), 1 = only an empty hand grabs a ladder (default),
+    // 2 = grabbing holsters it and it stays holstered.
+    extern float g_LadderGunHand;
+    // Physical ladders: the stick also mounts (walk-on, mount assist) and
+    // climbs, as before hand climbing. Off = hands only (sv_ladder_useonly).
+    extern bool g_LadderStickClimb;
+    // Physical ladders: glove this far (units) in front of the rung it holds.
+    extern float g_LadderHandBack;
+    // Physical ladders: the glove on a rung is turned so its fist closes round
+    // the rung (knuckle line along the rung, overhand), fingers at
+    // g_LadderGripCurl; off = the controller's angle and curls.
+    extern bool g_LadderHandWrap;
+    extern float g_LadderGripCurl;
+    // VR panel DEBUG "LADDER GRIP TUNING": the last held ladder model's grip
+    // (out toward the player / up, cm; curl), saved in VR/ladder_grip.txt.
+    extern float g_LadderTuneOutCm, g_LadderTuneUpCm, g_LadderTuneCurl;
+    extern float g_SatchelBagDepth;
+    extern float g_RpgFistCurl, g_RpgFistOutCm;
+    extern float g_RpgHandTurn, g_RpgHandRoll, g_RpgHandSpin, g_RpgHandFwdCm, g_RpgHandUpCm, g_RpgHandSideCm; // RPG rocket in the left hand: finger curl, rocket out of the palm (cm)
+    extern float g_GlockMagTurn, g_GlockMagRoll, g_GlockMagSpin, g_GlockMagFwdCm, g_GlockMagUpCm, g_GlockMagSideCm, g_GlockThumbCurl, g_GlockThumbBase; // glock magazine in the left hand: tuning on top of the reload-clip pose
+    extern float g_SatchelBagTurn, g_SatchelBagInCm, g_SatchelBagUpCm; // satchel bag hand tuning
+    extern float g_SatchelBagRoll, g_SatchelBagSpin, g_SatchelBagSideCm; // satchel bag top this far into the fist (units at scale 1)
+    extern float g_SatchelGripCurl; // left glove fist round the satchel bag top
+    extern float g_PauseSkipPaints; // pause-menu paints dropped at the start of each pause
+    extern bool g_TripmineFaceAim;
+    extern bool g_PauseCaptureArm; // DEBUG: capture the next pause (not saved)
+    extern bool g_DesktopMouseGuard; // VR: no desktop mouse fire, stuck desktop buttons released
+    extern bool g_PumpStrokeAtController; // bolt/pump stroke measured at the controller, back stroke at 0.75 (99c2b29); off = grab anchor, 0.85
+    extern bool g_GunHandCuffCap; // cap the open HEV cuff of the gun's own hands // tripmine placed along the mine face (controller up)
+    extern float g_GunHandCuff; // gun's own right hand: forearm folds this far behind the wrist (units at scale 1)
+    extern float g_VrRecoilScale;
+    // Kick with the second hand on the gun, as a share of the one-handed kick (default 0.3;
+    // pistols use x5/3 of it, capped at 1).
+    extern float g_VrRecoilTwoHand;
+    // Show the RPG rocket whenever the RPG is loaded (stock loses it on a save load / a cut-off clip).
+    extern bool g_RpgRocketShown;
+    extern float g_DebugVmSeq, g_DebugVmCycle; // debug: hold the viewmodel on a sequence/cycle (-1 = off)
+    extern bool g_DebugDumpHandPose; // debug hold: keep the stock left hand + log its pose around the object
+    extern float g_VrMagHandForward, g_VrMagHandUp; // game units
+    extern float g_VrShellOut; // shotgun shell centre beyond the pinch, fraction of its length
+    extern bool g_VrShellFlip; // test: the other shell end in the fingers
+    extern bool g_Vr357Flick;     // .357 cylinder closes on a wrist flick (or the reload button)
+    extern float g_Vr357FlickSpeed; // deg/s
+    extern bool g_Vr357Tilt;        // .357 empties stay in the open cylinder until the muzzle is tilted up
+    extern float g_Vr357TiltPitch;  // muzzle-up degrees that dump them
+    extern bool g_Vr357FireBeamHide; // laser beam off during the .357 fire clip (big kick)
+    extern float g_VrBoltGrabRadius; // game units (before the viewmodel scale)
     // True for this process when launched with -game bshift (or a bs_* map).
     // Calhoun never wears the HEV suit — use bare-hand GLBs the whole session.
     extern bool g_IsBlueShift;
@@ -622,11 +981,11 @@ namespace bmvr
     // HUD and bare hands as Blue Shift.
     extern bool g_IsAzureSheep;
     bool IsAzureSheep();
+    bool IsAzureSheepReborn();   // -game asheep_reborn (own guard arms in v_glock)
+    bool IsBmMilitary();         // -game bmmilitary (marine arms: v_glock HEV rig with marine_d)
     // Wrist HUD, weapon-wheel chrome, HUD icons, and the pause cursor use
     // Calhoun blue (64,168,255) instead of HEV orange.
     bool UseBlueHud();
-    // false = runtime PostPresentHandoff. true = L4D2VR app handoff (default).
-    extern bool g_CompositorPostPresentHandoff;
     // Old stereo vis workaround: r_portalsopenall + r_occlusion 0. Default
     // off — that pair draws the whole map and tanks open/complex areas.
     extern bool g_ForceOpenVis;
@@ -691,9 +1050,6 @@ namespace bmvr
     bool TryGbLeftSkip();
     bool TryDrawHud();
     bool TryDrawModelExecute();
-    // HL2VR: QueueCall WaitGetPoses onto ICallQueue. Sticky disables queued
-    // WGP only — sync WaitGetPoses on the calling thread stays on.
-    bool TryHl2vrQueuedWgp();
     // Apply OpenXR/OpenVR controller poses into tracking (viewmodel + gloves).
     bool TryCtrlPose();
     // CalcViewModelView hard-lock to the aim controller.

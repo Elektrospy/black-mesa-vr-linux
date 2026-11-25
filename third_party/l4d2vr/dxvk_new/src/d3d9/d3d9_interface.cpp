@@ -1,3 +1,4 @@
+#include "../dxvk/dxvk_bmvr_vrs.h"
 #include "d3d9_interface.h"
 
 #include "d3d9_monitor.h"
@@ -9,6 +10,8 @@
 
 #include <openvr.h>
 #include "bmvr_flags.h"
+#include <intrin.h>
+#include <cstring>
 #include "openxr_helper_bridge.h"
 #include "vr_runtime_backend.h"
 
@@ -390,6 +393,10 @@ namespace dxvk {
     const bool noHmd = IsNoHmdLaunchArgPresent();
     bmvr::InitFromDisk();
     bmvr::SetStage("create_device");
+    // Foveated rendering: the device needs the shading rate features
+    dxvk::bmvrFoveationRequestedRef() = bmvr::g_FoveatedAtStart;
+    if (bmvr::g_FoveatedAtStart)
+      bmvr::Log("Foveation requested at start (Foveated=%.0f)", bmvr::g_Foveated);
     if (pPresentationParameters && !pPresentationParameters->Windowed)
     {
       Logger::info("BMVR CreateDevice: keeping Windowed=TRUE (refusing exclusive fullscreen)");
@@ -397,63 +404,13 @@ namespace dxvk {
     }
     if (!noHmd)
     {
-      bool skipOpenVrInit = false;
-      const VrRuntimeBackendConfig runtimeConfig = L4D2VR_ReadRuntimeBackendConfig();
-      const VrRuntimeBackendSelection runtimeSelection =
-        L4D2VR_SelectRuntimeBackend(runtimeConfig.requestedBackend, true);
-      if (runtimeSelection.active == VrRuntimeBackend::OpenXR)
+      const OpenXrHelperLaunchConfig helperConfig = L4D2VR_ReadOpenXrHelperLaunchConfig();
+      if (helperConfig.enabled)
       {
-        const OpenXrHelperLaunchConfig helperConfig = L4D2VR_ReadOpenXrHelperLaunchConfig();
-        if (helperConfig.enabled)
-        {
-          BootstrapOpenXrRecommendedSize(helperConfig);
-          // FullFrame is created during SetMode after this returns. Hook
-          // CreateNamedRT now so WorldRenderAtEyeSize can LITERAL-grow it.
-          // OpenVR already called InstallEarlyFramebufferHook below; OpenXR
-          // skipped that and left G2 world RTs at the HWND (worldMatch=0).
-          bmvr::InstallEarlyFramebufferHook();
-          // OpenXR owns the SteamVR/OpenXR scene app. VR_Init(Scene) here after
-          // a helper timeout started a second scene app, delayed load ~45s, and
-          // the game closed at the main menu.
-          skipOpenVrInit = true;
-        }
-      }
-
-      if (!skipOpenVrInit)
-      {
-      vr::EVRInitError vrErr = vr::VRInitError_None;
-      vr::IVRSystem* vrSys = vr::VR_Init(&vrErr, vr::VRApplication_Scene);
-      if (vrErr == vr::VRInitError_None && vrSys)
-      {
-        uint32_t recW = 0, recH = 0;
-        vrSys->GetRecommendedRenderTargetSize(&recW, &recH);
-        if (recW >= 640 && recH >= 360)
-        {
-          bmvr::g_RecommendedEyeWidth = recW;
-          bmvr::g_RecommendedEyeHeight = recH;
-          bmvr::g_OpenVRInitedFromCreateDevice = true;
-
-          float lLeft = 0.f, lRight = 0.f, lTop = 0.f, lBottom = 0.f;
-          vrSys->GetProjectionRaw(vr::Eye_Left, &lLeft, &lRight, &lTop, &lBottom);
-          const float tanHalfFovX = (-lLeft > lRight) ? -lLeft : lRight;
-          const float tanHalfFovY = (-lTop > lBottom) ? -lTop : lBottom;
-          const float projAspect = (tanHalfFovY > 0.01f) ? (tanHalfFovX / tanHalfFovY) : 0.f;
-          const uint32_t winW = pPresentationParameters->BackBufferWidth;
-          const uint32_t winH = pPresentationParameters->BackBufferHeight;
-          bmvr::ComputeHmdFramebufferSize(recW, recH, winW, winH, projAspect);
-          bmvr::InstallEarlyFramebufferHook();
-          Logger::info(str::format(
-            "BMVR CreateDevice: OpenVR ready recommended ", recW, "x", recH,
-            " window ", winW, "x", winH,
-            " G-buffer ", bmvr::g_FramebufferWidth, "x", bmvr::g_FramebufferHeight));
-        }
-      }
-      else
-      {
-        Logger::warn(str::format(
-          "BMVR CreateDevice: VR_Init failed (",
-          static_cast<int>(vrErr), ") — keeping desktop swapchain size"));
-      }
+        BootstrapOpenXrRecommendedSize(helperConfig);
+        // FullFrame is created during SetMode after this returns. Hook
+        // CreateNamedRT now so WorldRenderAtEyeSize can LITERAL-grow it.
+        bmvr::InstallEarlyFramebufferHook();
       }
     }
     (void)noHmd;
@@ -470,8 +427,20 @@ namespace dxvk {
 
     if (SUCCEEDED(result)
      && ppReturnedDeviceInterface != nullptr
-     && *ppReturnedDeviceInterface != nullptr)
-      Direct3DCreateVRImpl(*ppReturnedDeviceInterface, &g_D3DVR9);
+     && *ppReturnedDeviceInterface != nullptr) {
+      // New game UI (Qt Quick on ANGLE) creates a second device with a 1x1
+      // back buffer after the game's. VR must stay on the game's device:
+      // eye RTs made on the UI device cannot be bound by the game's
+      // (D3DERR_INVALIDCALL, black eyes; 2026-11-23).
+      const bool uiDevice = g_D3DVR9 != nullptr && pPresentationParameters
+        && pPresentationParameters->BackBufferWidth <= 1 && pPresentationParameters->BackBufferHeight <= 1;
+      if (uiDevice)
+        bmvr::SetNewUiWindow(pPresentationParameters->hDeviceWindow ? pPresentationParameters->hDeviceWindow : hFocusWindow);
+      if (uiDevice)
+        bmvr::Log("D3D9 device %p (1x1 back buffer) kept out of VR: new game UI device", static_cast<void*>(*ppReturnedDeviceInterface));
+      else
+        Direct3DCreateVRImpl(*ppReturnedDeviceInterface, &g_D3DVR9);
+    }
 
     return result;
   }
@@ -609,6 +578,27 @@ namespace dxvk {
         return hr;
 
       *ppReturnedDeviceInterface = ref(device);
+      // BMVR: the new game UI (Qt Quick on ANGLE) makes its own D3D9Ex
+      // device next to the game's; log each one so the log says which is
+      // which (2026-11-23 new UI study).
+      {
+        static LONG s_deviceCount = 0;
+        const LONG n = InterlockedIncrement(&s_deviceCount);
+        void* ret = _ReturnAddress();
+        HMODULE mod = nullptr;
+        char path[MAX_PATH] = "?";
+        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                static_cast<LPCSTR>(ret), &mod) && mod)
+          GetModuleFileNameA(mod, path, MAX_PATH);
+        const char* base = std::strrchr(path, '\\');
+        bmvr::Log("D3D9 device #%ld created: %p bb=%ux%u fmt=%u count=%u windowed=%d hwnd=%p focus=%p flags=0x%X tid=%lu caller=%s+0x%X",
+          n, static_cast<void*>(device), pPresentationParameters->BackBufferWidth, pPresentationParameters->BackBufferHeight,
+          static_cast<unsigned>(pPresentationParameters->BackBufferFormat), pPresentationParameters->BackBufferCount,
+          pPresentationParameters->Windowed ? 1 : 0, static_cast<void*>(pPresentationParameters->hDeviceWindow),
+          static_cast<void*>(hFocusWindow), static_cast<unsigned>(BehaviorFlags), GetCurrentThreadId(),
+          base ? base + 1 : path,
+          mod ? static_cast<unsigned>(reinterpret_cast<uintptr_t>(ret) - reinterpret_cast<uintptr_t>(mod)) : 0u);
+      }
     }
     catch (const DxvkError& e) {
       Logger::err(e.message());

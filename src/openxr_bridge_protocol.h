@@ -26,11 +26,18 @@ inline void L4D2VR_SeqlockAcquire()
 }
 
 constexpr uint32_t L4D2VR_OPENXR_BRIDGE_MAGIC = 0x5258344Cu; // L4XR
-constexpr uint32_t L4D2VR_OPENXR_BRIDGE_VERSION = 16;
+constexpr uint32_t L4D2VR_OPENXR_BRIDGE_VERSION = 19;
 // 13: XR_KHR_visibility_mask hidden triangle list (NDC xy per eye).
 // 14: helperConsumingFrameId / helperConsumedFrameId (helper -> game blit
 //     progress; the game reuses a publish slot only once the helper's blit
 //     out of it has finished on the GPU).
+// 17: L4D2VROpenXrInputStateDesc.eyeGaze (XR_EXT_eye_gaze_interaction ray in
+//     head view space, for eye-tracked foveated rendering).
+// 18: L4D2VROpenXrInputStateDesc.rawHands + systemName (physical buttons per
+//     hand for the DLL's button mapping; legacy actions stay as they were).
+// 19: stagePose (STAGE space origin located in the LOCAL app space; the
+//     room's floor + forward, for menus anchored to the room front) and
+//     L4D2VROpenXrOverlayDesc.anchorPosition (OVERLAY_FLAG_ANCHOR_POSE).
 // L4D2VROpenXrRuntimeViewConfigDesc.reserved0: 0 = recommended size only
 // (CreateDevice), 1 = xrLocateViews FOV (InitOpenXR stereo fusion).
 constexpr uint32_t L4D2VR_OPENXR_RUNTIME_VIEW_SIZE_ONLY = 0;
@@ -92,7 +99,11 @@ enum : uint32_t
     L4D2VR_OPENXR_CONTROLLER_FAMILY_TOUCH = 1, // Quest / Rift / Pico Touch-like
     L4D2VR_OPENXR_CONTROLLER_FAMILY_HP_G2 = 2,
     L4D2VR_OPENXR_CONTROLLER_FAMILY_KNUCKLES = 3,
-    L4D2VR_OPENXR_CONTROLLER_FAMILY_VIVE = 4
+    L4D2VR_OPENXR_CONTROLLER_FAMILY_VIVE = 4,
+    // Steam Frame controllers (XR_VALVE_frame_controller_interaction). Without
+    // that profile SteamVR emulates Touch and folds bumper / right X+Y / D-pad
+    // onto trigger / B / X+Y (frame_controller_remapping.json, upstream #20).
+    L4D2VR_OPENXR_CONTROLLER_FAMILY_FRAME = 5
 };
 
 inline bool L4D2VR_TextContainsI(const char* haystack, const char* needle)
@@ -136,6 +147,8 @@ inline uint32_t L4D2VR_ClassifyOpenXrInteractionProfile(const char* path)
         L4D2VR_TextContainsI(path, "vive_cosmos") ||
         L4D2VR_TextContainsI(path, "vive_focus"))
         return L4D2VR_OPENXR_CONTROLLER_FAMILY_VIVE;
+    if (L4D2VR_TextContainsI(path, "frame_controller"))
+        return L4D2VR_OPENXR_CONTROLLER_FAMILY_FRAME;
     return L4D2VR_OPENXR_CONTROLLER_FAMILY_UNKNOWN;
 }
 
@@ -157,6 +170,8 @@ inline uint32_t L4D2VR_ClassifyOpenVrControllerType(const char* type)
         return L4D2VR_OPENXR_CONTROLLER_FAMILY_HP_G2;
     if (L4D2VR_TextContainsI(type, "vive"))
         return L4D2VR_OPENXR_CONTROLLER_FAMILY_VIVE;
+    if (L4D2VR_TextContainsI(type, "frame_controller"))
+        return L4D2VR_OPENXR_CONTROLLER_FAMILY_FRAME;
     return L4D2VR_OPENXR_CONTROLLER_FAMILY_UNKNOWN;
 }
 
@@ -167,7 +182,16 @@ inline bool L4D2VR_ControllerFamilyPrefersAimPose(uint32_t family)
     // pose -45°. Index hands still need a 90° inward roll around that aim
     // (thumbstick face vs palm); weapons keep the unrolled aim pose.
     return family == L4D2VR_OPENXR_CONTROLLER_FAMILY_TOUCH
-        || family == L4D2VR_OPENXR_CONTROLLER_FAMILY_KNUCKLES;
+        || family == L4D2VR_OPENXR_CONTROLLER_FAMILY_KNUCKLES
+        || family == L4D2VR_OPENXR_CONTROLLER_FAMILY_FRAME;
+}
+
+// Pose tuning (hand offsets, gun tilt, viewmodel ox) per family. The Frame
+// used to arrive as SteamVR's Touch emulation, so it keeps the Touch tuning
+// until a Frame owner reports otherwise.
+inline uint32_t L4D2VR_ControllerFamilyPoseTuning(uint32_t family)
+{
+    return family == L4D2VR_OPENXR_CONTROLLER_FAMILY_FRAME ? L4D2VR_OPENXR_CONTROLLER_FAMILY_TOUCH : family;
 }
 
 inline const char* L4D2VR_ControllerFamilyName(uint32_t family)
@@ -178,6 +202,7 @@ inline const char* L4D2VR_ControllerFamilyName(uint32_t family)
     case L4D2VR_OPENXR_CONTROLLER_FAMILY_HP_G2: return "g2";
     case L4D2VR_OPENXR_CONTROLLER_FAMILY_KNUCKLES: return "knuckles";
     case L4D2VR_OPENXR_CONTROLLER_FAMILY_VIVE: return "vive";
+    case L4D2VR_OPENXR_CONTROLLER_FAMILY_FRAME: return "frame";
     default: return "unknown";
     }
 }
@@ -277,6 +302,9 @@ struct L4D2VROpenXrOverlayDesc
     float curvature = 0.0f;
     float offsetMeters[3] = { 0.0f, -0.25f, 0.0f };
     float orientation[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+    // v19, with L4D2VR_OPENXR_OVERLAY_FLAG_ANCHOR_POSE: the head position the
+    // overlay is placed from (LOCAL space); orientation gives its yaw.
+    float anchorPosition[3] = { 0.0f, 0.0f, 0.0f };
 };
 
 // reserved1 bits on L4D2VROpenXrPoseDesc. reserved0 is still the packed IPD
@@ -288,6 +316,14 @@ constexpr uint32_t L4D2VR_OPENXR_OVERLAY_FLAG_BLEND_ALPHA = 1u << 0;
 // Placed in front of the head every frame (full head pose) instead of the
 // pose captured when the epoch started: chapter titles, intro logo, "Saved...".
 constexpr uint32_t L4D2VR_OPENXR_OVERLAY_FLAG_HEAD_LOCKED = 1u << 1;
+// Colour is premultiplied by alpha (title texts: Black Mesa's additive fonts
+// paint colour*a). Without it the HUD quad is submitted UNPREMULTIPLIED.
+// Older helpers ignore the bit (text then composites a little darker).
+constexpr uint32_t L4D2VR_OPENXR_OVERLAY_FLAG_PREMULTIPLIED = 1u << 2;
+// Placed from anchorPosition + orientation (yaw) instead of the head pose when
+// the epoch starts: the pause menu uses the game's latched menu panel pose
+// (room front at eye height), the same pose its pointer ray hits.
+constexpr uint32_t L4D2VR_OPENXR_OVERLAY_FLAG_ANCHOR_POSE = 1u << 3;
 // L4D2VROpenXrSharedTextureDesc.reserved0. UVs are a subrect of a shared
 // ring (or similar); do not treat 0..1 as one eye.
 constexpr uint32_t L4D2VR_OPENXR_SHARED_UV_EXPLICIT = 1u << 0;
@@ -364,6 +400,54 @@ struct L4D2VROpenXrHandTrackingDesc
     L4D2VROpenXrHandJointDesc joints[L4D2VR_OPENXR_HAND_JOINT_COUNT] = {};
 };
 
+// Combined eye gaze (XR_EXT_eye_gaze_interaction), located in the VIEW
+// space at the frame's predicted display time. dir = gaze forward, unit
+// vector, x right, y up, -z forward (OpenXR view axes).
+struct L4D2VROpenXrEyeGazeDesc
+{
+    uint32_t valid = 0;          // extension active, action bound
+    uint32_t tracked = 0;        // this sample's orientation is tracked
+    uint32_t focused = 0;        // xrSyncActions returned XR_SUCCESS
+    uint32_t reserved0 = 0;
+    uint64_t publishTickMs = 0;  // GetTickCount64() when the helper wrote it
+    int64_t sampleTime = 0;      // XrEyeGazeSampleTimeEXT (0 = unknown)
+    float dir[3] = { 0.0f, 0.0f, -1.0f };
+    float reserved1 = 0.0f;
+};
+
+// Physical inputs per hand (protocol 18). face1 = A/X/Cross (lower face
+// button), face2 = B/Y/Circle (upper). Index: A/B on both hands. Controllers
+// without face buttons (WMR, Vive wand) report none of those bits.
+// Steam Frame (Xbox-style diamond): face1..4 = A/B/X/Y on the right hand and
+// D-pad down/right/left/up on the left (SteamVR's own mirror pairs), plus a
+// bumper on each hand. Only the Frame sets FACE3/FACE4/BUMPER.
+enum : uint32_t
+{
+    L4D2VR_RAW_BUTTON_FACE1 = 1u << 0,
+    L4D2VR_RAW_BUTTON_FACE2 = 1u << 1,
+    L4D2VR_RAW_BUTTON_STICK_CLICK = 1u << 2,
+    L4D2VR_RAW_BUTTON_MENU = 1u << 3,
+    L4D2VR_RAW_BUTTON_FACE3 = 1u << 4,
+    L4D2VR_RAW_BUTTON_FACE4 = 1u << 5,
+    L4D2VR_RAW_BUTTON_BUMPER = 1u << 6,
+    L4D2VR_RAW_BUTTON_FACE1_PRESENT = 1u << 16, // bound on the active profile
+    L4D2VR_RAW_BUTTON_FACE2_PRESENT = 1u << 17,
+    L4D2VR_RAW_BUTTON_STICK_CLICK_PRESENT = 1u << 18,
+    L4D2VR_RAW_BUTTON_GRIP_PRESENT = 1u << 19,
+    L4D2VR_RAW_BUTTON_FACE3_PRESENT = 1u << 20,
+    L4D2VR_RAW_BUTTON_FACE4_PRESENT = 1u << 21,
+    L4D2VR_RAW_BUTTON_BUMPER_PRESENT = 1u << 22,
+};
+
+struct L4D2VROpenXrRawHandDesc
+{
+    uint32_t valid = 0;   // raw actions created and the hand is active
+    uint32_t buttons = 0; // L4D2VR_RAW_BUTTON_*
+    float trigger = 0.0f; // 0..1
+    float grip = 0.0f;    // 0..1 (squeeze/click profiles: 0 or 1)
+    float stick[2] = {};  // thumbstick / joystick / trackpad
+};
+
 struct L4D2VROpenXrInputStateDesc
 {
     uint32_t valid = 0;
@@ -375,6 +459,9 @@ struct L4D2VROpenXrInputStateDesc
     L4D2VROpenXrDigitalActionDesc digitalActions[L4D2VR_OPENXR_ACTION_COUNT] = {};
     L4D2VROpenXrAnalogActionDesc analogActions[L4D2VR_OPENXR_ACTION_COUNT] = {};
     L4D2VROpenXrHandTrackingDesc handTracking[L4D2VR_OPENXR_HAND_COUNT] = {};
+    L4D2VROpenXrEyeGazeDesc eyeGaze = {};
+    L4D2VROpenXrRawHandDesc rawHands[L4D2VR_OPENXR_HAND_COUNT] = {};
+    char systemName[64] = {}; // XrSystemProperties.systemName (PS VR2 vs Quest labels)
 };
 
 struct L4D2VROpenXrHapticRequestDesc
@@ -474,4 +561,8 @@ struct L4D2VROpenXrBridgeState
     uint32_t reservedTail0 = 0;
     uint32_t menuQuadGeneration = 0;
     L4D2VROpenXrMenuQuadDesc menuQuad = {};
+    // Helper -> game (v19). valid = 0 when the runtime has no STAGE space
+    // or cannot locate it (orientation not tracked).
+    uint32_t stagePoseGeneration = 0;
+    L4D2VROpenXrPoseDesc stagePose = {};
 };

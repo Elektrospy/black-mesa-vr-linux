@@ -5,29 +5,42 @@
 #include <cstdint>
 #include <cstring>
 #include "bmvr_seh.h"
+#include "bmvr_crashinfo.h"
 
 static LONG CALLBACK FaultVeh(PEXCEPTION_POINTERS info)
 {
     if (!info || !info->ExceptionRecord || !info->ContextRecord)
         return EXCEPTION_CONTINUE_SEARCH;
     const DWORD code = info->ExceptionRecord->ExceptionCode;
-    if (code != 0xC0000005 && code != 0xC000001D && code != 0xC0000094)
+    // Fatal codes too (heap corruption, fail fast, stack overflow): those
+    // end the process and were never written (user 2026-11-20: a crash on a
+    // save load left no fault line). They also get a minidump.
+    const bool fatal = bmvr::crashinfo::IsFatalCode(code);
+    if (code != 0xC0000005 && code != 0xC000001D && code != 0xC0000094 && !fatal)
         return EXCEPTION_CONTINUE_SEARCH;
-    static DWORD seen[8];
+    if (fatal)
+        bmvr::crashinfo::DumpNow(info, "fatal exception code");
+    // 32 distinct addresses per process (was 8: a run's real crash could be
+    // past the cap behind caught faults).
+    static DWORD seen[32];
     static volatile LONG count = 0;
     const DWORD eip = info->ContextRecord->Eip;
     const LONG n = InterlockedIncrement(&count);
-    if (n > 8)
+    if (n > 32 && !fatal)
         return EXCEPTION_CONTINUE_SEARCH;
-    seen[n - 1] = eip;
-    for (LONG i = 0; i < n - 1; ++i)
+    if (n > 32)
+        InterlockedExchange(&count, 32);
+    const LONG slot = n > 32 ? 31 : n - 1;
+    seen[slot] = eip;
+    for (LONG i = 0; i < slot; ++i)
     {
         if (seen[i] == eip)
             return EXCEPTION_CONTINUE_SEARCH;
     }
 
     char body[1600];
-    int used = snprintf(body, sizeof(body), "fault eip=%08X code=%08X\n", eip, code);
+    int used = snprintf(body, sizeof(body), "fault eip=%08X code=%08X tid=%lu tick=%lu\n", eip, code,
+        GetCurrentThreadId(), GetTickCount());
     HMODULE mod = nullptr;
     if (GetModuleHandleExA(
             GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
@@ -109,6 +122,16 @@ static void RestoreDesktopDisplayModes()
 namespace
 {
     volatile LONG g_FaultCount = 0;
+    constexpr int kFaultStacks = 6;
+    constexpr int kFaultStackDepth = 8;
+    struct FaultStack
+    {
+        uint32_t addr, target, tid, espTop;
+        uint32_t ret[kFaultStackDepth];
+        volatile LONG ready, logged;
+    };
+    FaultStack g_FaultStacks[kFaultStacks]{};
+    volatile LONG g_FaultStackNext = 0;
     struct FaultSlot { volatile LONG addr; volatile LONG hits; };
     FaultSlot g_FaultSlots[8]{};
 
@@ -128,8 +151,55 @@ namespace
                     break;
                 }
             }
+            // First few faults: keep the EBP chain (return addresses) so the
+            // report names the caller, not only the faulting instruction.
+            // ReadProcessMemory: no SEH inside the handler.
+            const LONG slot = InterlockedIncrement(&g_FaultStackNext) - 1;
+            if (slot < kFaultStacks && info->ContextRecord)
+            {
+                FaultStack& fs = g_FaultStacks[slot];
+                fs.addr = static_cast<uint32_t>(addr);
+                fs.target = static_cast<uint32_t>(info->ExceptionRecord->ExceptionInformation[1]);
+                fs.tid = GetCurrentThreadId();
+                uint32_t ebp = static_cast<uint32_t>(info->ContextRecord->Ebp);
+                // Leaf frame: the faulting function may not have pushed EBP
+                // yet; [esp] is its return address in that case.
+                SIZE_T got = 0;
+                uint32_t top = 0;
+                if (ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(static_cast<uintptr_t>(info->ContextRecord->Esp)),
+                        &top, sizeof(top), &got) && got == sizeof(top))
+                    fs.espTop = top;
+                for (int i = 0; i < kFaultStackDepth && ebp; ++i)
+                {
+                    uint32_t frame[2] = {};
+                    if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(static_cast<uintptr_t>(ebp)),
+                            frame, sizeof(frame), &got) || got != sizeof(frame))
+                        break;
+                    fs.ret[i] = frame[1];
+                    if (frame[0] <= ebp)
+                        break;
+                    ebp = frame[0];
+                }
+                fs.ready = 1;
+            }
         }
         return EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    void DescribeAddr(uint32_t a, char* out, size_t n)
+    {
+        HMODULE mod = nullptr;
+        char name[MAX_PATH] = "?";
+        if (a && GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                reinterpret_cast<LPCSTR>(static_cast<uintptr_t>(a)), &mod) && mod)
+        {
+            GetModuleFileNameA(mod, name, MAX_PATH);
+            const char* base = std::strrchr(name, '\\');
+            sprintf_s(out, n, "%s+0x%X", base ? base + 1 : name,
+                static_cast<unsigned>(a - static_cast<uint32_t>(reinterpret_cast<uintptr_t>(mod))));
+        }
+        else
+            sprintf_s(out, n, "0x%08X", static_cast<unsigned>(a));
     }
 }
 
@@ -163,6 +233,23 @@ namespace bmvr
         const char* base = std::strrchr(name, '\\');
         Log("Access violations since last report: %ld, top %ld at %s+0x%X",
             n, topHits, base ? base + 1 : name, static_cast<unsigned>(rva));
+        for (FaultStack& fs : g_FaultStacks)
+        {
+            if (!fs.ready || InterlockedExchange(&fs.logged, 1))
+                continue;
+            char where[160], top[160], line[1400];
+            DescribeAddr(fs.addr, where, sizeof(where));
+            DescribeAddr(fs.espTop, top, sizeof(top));
+            int len = sprintf_s(line, "Fault stack: %s reading 0x%08X tid=%u [esp]=%s ebp-chain:",
+                where, static_cast<unsigned>(fs.target), static_cast<unsigned>(fs.tid), top);
+            for (int i = 0; i < kFaultStackDepth && fs.ret[i] && len > 0 && len < static_cast<int>(sizeof(line)) - 170; ++i)
+            {
+                char r[160];
+                DescribeAddr(fs.ret[i], r, sizeof(r));
+                len += sprintf_s(line + len, sizeof(line) - len, " %s", r);
+            }
+            Log("%s", line);
+        }
     }
 }
 
@@ -215,7 +302,7 @@ static DWORD WINAPI InitBMVR(LPVOID param)
     return 0;
 }
 
-BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
+BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved)
 {
     switch (reason)
     {
@@ -228,11 +315,13 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
         bmvr::SetDllModule(hModule);
         AddVectoredExceptionHandler(1, FaultVeh);
         AddVectoredExceptionHandler(1, CountFaults);
+        bmvr::crashinfo::Install();
         bmvr::StartWatchdog();
         bmvr::SetStage("dll_attach");
         CreateThread(nullptr, 0, InitBMVR, hModule, 0, nullptr);
         break;
     case DLL_PROCESS_DETACH:
+        bmvr::crashinfo::NoteDetach(reserved != nullptr);
         RestoreDesktopDisplayModes();
         L4D2VR_ShutdownReShadeVRBridge();
         L4D2VR_ShutdownSystemMouseInputSuppression();

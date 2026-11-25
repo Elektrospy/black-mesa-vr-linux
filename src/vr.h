@@ -7,6 +7,7 @@
 #include "vector.h"
 #include "openxr_bridge_protocol.h"
 #include "vr_runtime_backend.h"
+#include "vr_button_map.h"
 #include <cstdint>
 #include <array>
 #include <atomic>
@@ -63,14 +64,16 @@ struct D3DAimLineOverlayEyeState
     uint32_t outlineColor = 0;
 };
 
+// Title HUD panels: HudCredits, HudMessage, CHudIntroCredits.
+constexpr int kTitleHudCount = 3;
+
 class VR
 {
 public:
     Game* m_Game = nullptr;
 
-    VrRuntimeBackend m_RuntimeBackend = VrRuntimeBackend::OpenVR;
-    VrRuntimeBackend m_RequestedRuntimeBackend = VrRuntimeBackend::OpenVR;
-    bool m_RuntimeBackendFallbackToOpenVR = true;
+    VrRuntimeBackend m_RuntimeBackend = VrRuntimeBackend::OpenXR;
+    VrRuntimeBackend m_RequestedRuntimeBackend = VrRuntimeBackend::OpenXR;
     bool m_OpenXrLoaderAvailable = false;
     bool m_OpenXrHelperBridgeActive = false;
     DWORD m_OpenXrHelperRestartMs = 0;
@@ -202,6 +205,8 @@ public:
     // published and the HUD/menu overlay surface to <VR dir>\<name>-*.bmp
     // (name = first word of dump.txt) and deletes dump.txt.
     void MaybeDebugDumpPublished(uint32_t slot, const L4D2VROpenXrPoseDesc* pose);
+    // Gesture screenshot: the right eye (16:9 crop) into Steam's library.
+    void TakeSteamScreenshot(IDirect3DDevice9* dev, uint32_t slot);
     // Debug capture restore (VR/<capture>-state.txt etc., tools/headless/bm-restore):
     // render-thread part (raw OpenXR poses, view state), game-thread part
     // (engine view, settings, the capture save), and the headless restore
@@ -223,11 +228,6 @@ public:
     int m_RestoreSteps = 0;
     DWORD m_RestoreNextMs = 0;
 
-    vr::IVRSystem* m_System = nullptr;
-    vr::IVRInput* m_Input = nullptr;
-    vr::IVROverlay* m_Overlay = nullptr;
-    vr::VROverlayHandle_t m_HUDTopHandle = vr::k_ulOverlayHandleInvalid;
-    vr::IVRCompositor* m_Compositor = nullptr;
 
     // Eye / G-buffer size. L4D2VR uses OpenVR recommended size. Named RTs at
     // that size died on BM, so the blit path matches G-buffer to recommended
@@ -339,6 +339,9 @@ public:
         bool rpg = false;
         bool gluon = false;
         bool mp5 = false;
+        bool glock = false;
+        bool crossbow = false;
+        bool revolver = false;
         // Long guns / pistols: off-hand can wrap the model. Table is meters
         // from the rear grip along F/R/U. L_Wrist is used only when
         // offhandUseBone is set (MP5 magwell / pistol monitor pose are wrong).
@@ -367,13 +370,50 @@ public:
         kVmFlagRpg = 1u << 3,
         kVmFlagGluon = 1u << 4,
         kVmFlagMp5 = 1u << 5,
+        kVmFlagGlock = 1u << 6,
+        kVmFlagCrossbow = 1u << 7,
+        kVmFlag357 = 1u << 8,
+        kVmFlagSnark = 1u << 9,
+        kVmFlagSatchel = 1u << 10,
     };
+    // Manual MP5 magazine (VrMagReload): eject / hip grab / seat, game thread.
+    void UpdateMagReload(uint32_t& buttons);
+    void UpdateGrenadePin(uint32_t& buttons);
+    // Snark hand throw (VrHandThrow): trigger held = nothing, let go = the
+    // game's throw (pulsed), from the hand at the hand's speed (server hooks).
+    void UpdateSnarkThrow(uint32_t& buttons);
+    // GetTickCount until which a snark throw of the local player is a hand
+    // throw (set at the trigger release).
+    std::atomic<unsigned> m_SnarkHandThrowUntil{ 0 };
+    std::atomic<bool> m_ThrowFromLeft{ false }; // satchel: throw samples from the left hand
+    int MagReloadWeaponNow() const;
+    // Left controller world pose for the viewmodel draw (render thread).
+    bool OffhandWorldPoseForDraw(Vector& pos, QAngle& ang) const;
+    bool ViewmodelIsShotgun() const { return (m_VmClassFlags.load(std::memory_order_relaxed) & kVmFlagShotgun) != 0; }
+    bool ViewmodelIsCrossbow() const { return (m_VmClassFlags.load(std::memory_order_relaxed) & kVmFlagCrossbow) != 0; }
+    bool ViewmodelIs357() const { return (m_VmClassFlags.load(std::memory_order_relaxed) & kVmFlag357) != 0; }
+    bool ViewmodelIsSnark() const { return (m_VmClassFlags.load(std::memory_order_relaxed) & kVmFlagSnark) != 0; }
+    bool ViewmodelIsSatchel() const { return (m_VmClassFlags.load(std::memory_order_relaxed) & kVmFlagSatchel) != 0; }
+    // Satchel drawn with VrSatchelHands: bag in the left hand, detonator in the right.
+    bool SatchelHandsActive() const;
+    bool ViewmodelIsGlock() const { return (m_VmClassFlags.load(std::memory_order_relaxed) & kVmFlagGlock) != 0; }
     bool ViewmodelIsMp5() const { return (m_VmClassFlags.load(std::memory_order_relaxed) & kVmFlagMp5) != 0; }
     // Viewmodel sequence is a reload/draw/holster/pump-style action: the
     // gun moves away from the aim, so the laser beam is hidden.
     void NoteViewmodelBeamHidden(bool hide) { m_ViewmodelBeamHidden.store(hide, std::memory_order_relaxed); }
     // Muzzle in the gun frame, from the bones as drawn (viewmodel DME).
     void NoteDrawnMuzzleLocal(const Vector& local);
+    // Lowered set (idletolow / lowidle / lowtoidle, gun held down while aimed
+    // at a friendly): the clip moves the gun's bones, while the two-hand
+    // support glove sits on the controller-derived grip point. The glove
+    // follows the drawn weapon root bone's move away from its idle pose
+    // (the gun body; the arms are separate bones and on the pistols the left
+    // wrist barely moves). State from CalcViewModelView (game thread) for the
+    // weapon's own viewmodel header; bone samples from the draw (render thread).
+    enum : int { kVmLowerIdle = 0, kVmLowerLowered = 1, kVmLowerOther = 2 };
+    void NoteViewmodelLowerState(int state, const void* studioHdr);
+    // Weapon root bone origin and unit axes in the gun frame of that draw.
+    void NoteDrawnWeaponRootLocal(const void* studioHdr, const Vector& pos, const Vector axes[3]);
     bool ViewmodelIsRpg() const { return (m_VmClassFlags.load(std::memory_order_relaxed) & kVmFlagRpg) != 0; }
     bool ViewmodelIsGluon() const { return (m_VmClassFlags.load(std::memory_order_relaxed) & kVmFlagGluon) != 0; }
     bool ViewmodelIsScoped() const { return (m_VmClassFlags.load(std::memory_order_relaxed) & kVmFlagScoped) != 0; }
@@ -387,17 +427,10 @@ public:
     int m_FirstAttackSpikeLogs = 0;
     std::mutex m_PoseMutex;
     vr::TrackedDevicePose_t m_WaitedPoses[vr::k_unMaxTrackedDeviceCount]{};
-    vr::TrackedDevicePose_t m_RenderPoses[vr::k_unMaxTrackedDeviceCount]{};
-    vr::TrackedDevicePose_t m_PredictedPoses[vr::k_unMaxTrackedDeviceCount]{};
     vr::HmdMatrix34_t m_HmdTrackingPose{};
     vr::HmdMatrix34_t m_StereoFrameTrackingPose{};
     bool m_StereoFrameTrackingPoseValid = false;
     std::atomic<DWORD> m_WaitedPoseTick{ 0 };
-    std::mutex m_Hl2vrFrameMutex;
-    std::condition_variable m_Hl2vrFrameCv;
-    uint64_t m_Hl2vrFrameCounter = 0;
-    std::atomic<uint64_t> m_Hl2vrAwaitedId{ 0 };
-    std::atomic<uint64_t> m_Hl2vrHandoffId{ 0 };
     int m_Hl2vrCallQueueSlot = -1;
     bool m_Hl2vrCallQueueProbed = false;
     // Source slot 146 can return a non-null non-queue on BM. Remember it so
@@ -405,7 +438,6 @@ public:
     int m_McCallQueueFailedSlot = -1;
     bool m_McEyeCopyQueued = false;
     bool m_McEyeCopyDone = false;
-    uint32_t m_Hl2vrQueuedWgpFrames = 0;
     Vector m_SetupOrigin{};
     Vector m_SetupOriginToHMD{};
     float m_StereoZNear = 7.f;
@@ -468,6 +500,12 @@ public:
     IDirect3DDevice9* m_D9NekoPostOutputTransferShaderDevice = nullptr;
     IDirect3DTexture9* m_D9HUDTexture = nullptr;
     IDirect3DSurface9* m_D9HUDSurface = nullptr;
+    // What the helper reads (m_VKHUD): a copy of m_D9HUDSurface made when a
+    // paint is complete. The helper copies the shared image at its own time;
+    // reading the RT VGUI clears and repaints every frame showed half-painted
+    // or empty layers (title text / pause menu flicker, 2026-11-17).
+    IDirect3DTexture9* m_D9HUDPublishTexture = nullptr;
+    IDirect3DSurface9* m_D9HUDPublishSurface = nullptr;
     IDirect3DSurface9* m_D9ScopeSurface = nullptr;
     IDirect3DTexture9* m_D9ScopeLensScratchTexture = nullptr;
     IDirect3DSurface9* m_D9ScopeLensScratchSurface = nullptr;
@@ -521,7 +559,7 @@ public:
     std::atomic<uint32_t> m_SubmitVRTexturesEntryCount{ 0 };
     std::atomic<uint32_t> m_SubmitInFlightSkipCount{ 0 };
     std::atomic<uint32_t> m_CompositorFrameIndexDedupSkipCount{ 0 };
-    std::atomic<uint32_t> m_ActualCompositorSubmitCount{ 0 };
+    std::atomic<uint32_t> m_ActualCompositorSubmitCount{ 0 };  // stats line in d3d9_device.cpp; 0 since OpenVR left
     std::atomic<uint32_t> m_SubmitEyeNoneCount{ 0 };
     std::atomic<uint32_t> m_SubmitEyeAlreadySubmittedCount{ 0 };
     std::atomic<uint32_t> m_SubmitEyeOtherErrorCount{ 0 };
@@ -616,9 +654,6 @@ public:
     bool m_SoftPitchLook = false;
     bool m_ProcessInputEnabled = false;
     std::atomic<bool> m_ActionsReady{ false };
-    vr::VRActionSetHandle_t m_ActionSet = vr::k_ulInvalidActionSetHandle;
-    vr::VRActionSetHandle_t m_BaseActionSet = vr::k_ulInvalidActionSetHandle;
-    vr::VRActiveActionSet_t m_ActiveActionSets[2]{};
     vr::VRActionHandle_t m_ActionJump = vr::k_ulInvalidActionHandle;
     vr::VRActionHandle_t m_ActionPrimaryAttack = vr::k_ulInvalidActionHandle;
     vr::VRActionHandle_t m_ActionSecondaryAttack = vr::k_ulInvalidActionHandle;
@@ -648,7 +683,6 @@ public:
     vr::VRActionHandle_t m_ActionInventoryQuickSwitch = vr::k_ulInvalidActionHandle;
     vr::VRActionHandle_t m_ActionSkeletonLeft = vr::k_ulInvalidActionHandle;
     vr::VRActionHandle_t m_ActionSkeletonRight = vr::k_ulInvalidActionHandle;
-    bool m_CompositorAppHandoff = false;
     uint32_t m_CompositorHandoffSlowCount = 0;
     std::atomic<float> m_WalkForward{ 0.f };
     std::atomic<float> m_WalkSide{ 0.f };
@@ -658,6 +692,28 @@ public:
     std::atomic<int> m_PendingInvDelta{ 0 };
     std::atomic<int> m_PendingWeaponSelect{ 0 };
     std::atomic<bool> m_PendingQuickSave{ false };
+    std::atomic<bool> m_PendingQuickLoad{ false };
+    // Button mapping (OpenXR helper, protocol 18): while active, the mappable
+    // OpenXR action slots come from m_MappedDigital instead of the helper's
+    // fixed bindings (GetDigitalActionData). Menus / the VR panel use the
+    // fixed layout; a legacy slot still held at that switch reads released
+    // until it is let go (m_LegacyMask).
+    bmvr::ButtonMapper m_ButtonMapper;
+    bool m_ButtonMapActive = false;
+    bool m_MappedOverride[L4D2VR_OPENXR_ACTION_COUNT] = {};
+    L4D2VROpenXrDigitalActionDesc m_MappedDigital[L4D2VR_OPENXR_ACTION_COUNT] = {};
+    mutable bool m_LegacyMask[L4D2VR_OPENXR_ACTION_COUNT] = {};
+    // VR recoil (g_VrRecoil): current upward kick in degrees, decays; added
+    // to the aim and the viewmodel basis.
+    std::atomic<float> m_RecoilKickDeg{ 0.f };
+    void* m_RecoilWeapon = nullptr;
+    int m_RecoilClip = -1;
+    DWORD m_RecoilLastMs = 0;
+    DWORD m_RecoilAttackMs = 0;
+    void UpdateVrRecoil();
+    bool m_AmmoGrabReady = false;     // UpdateMagReload: a grip at the ammo zone would take ammo now
+    bool m_GestureZoneLeft = false;   // last frame: left hand in one of its gesture zones
+    bool m_GestureZoneRight = false;  // last frame: right hand in a shoulder/hip zone (or just left one)
     // Saves keep the player's view angles, and gameplay usercmds carry the
     // controller aim, so a load faced where the gun pointed. Before a quick
     // save or a pause (saves from the pause menu) a few usercmds send the head's
@@ -684,9 +740,12 @@ public:
     DWORD m_GameUiActivateMs = 0;
     DWORD m_MenuLastVisibleMs = 0;
     int m_MenuPointerHand = 1;
+    // Last time the right hand's ray hit the menu panel (right has priority).
+    DWORD m_MenuRightHitMs = 0;
     void* m_EngineVGuiFromPaint = nullptr;
     void* m_VguiPanel = nullptr; // vgui2.dll VGUI_Panel009
-    unsigned int m_TitleHudPanels[2] = {};
+    unsigned int m_TitleHudPanels[kTitleHudCount] = {};
+    int m_TitleHudSearches = 0;
     // Panels resized to the HUD RT for the title paint, with their own sizes.
     unsigned int m_TitleFitPanels[16] = {};
     int m_TitleFitSizes[16][2] = {};
@@ -713,6 +772,11 @@ public:
     // turn offset once. A load is a gap in usercmds (the LevelInit hook is not
     // installed on BM, and reloading the same map does not change its name).
     int m_YawSyncTicks = 0;
+    // Yaw of the last usercmd sent in gameplay: the turn sync's reference.
+    // Commands outside gameplay (the new game UI's loading/menu phase, menu
+    // background maps) pass the engine's angles through and must not move it.
+    float m_LastGameplayCmdYaw = 0.f;
+    bool m_LastGameplayCmdYawValid = false;
     ULONGLONG m_LastCmdMs = 0;
     bool m_LastCmdYawValid = false;
     // Headless harness only (fake VR runtime): it starts straight into a save
@@ -724,7 +788,17 @@ public:
     float m_LastCmdYaw = 0.f;
     void SyncTurnToRestoredYaw(float engineYaw);
     float m_LastCmdPitch = 0.f;
-    void NoteCmdAngles(float pitch, float yaw) { m_LastCmdPitch = pitch; m_LastCmdYaw = yaw; m_LastCmdYawValid = true; }
+    void NoteCmdAngles(float pitch, float yaw)
+    {
+        m_LastCmdPitch = pitch;
+        m_LastCmdYaw = yaw;
+        m_LastCmdYawValid = true;
+        if (m_GameplayEligible)
+        {
+            m_LastGameplayCmdYaw = yaw;
+            m_LastGameplayCmdYawValid = true;
+        }
+    }
     // Scripted camera (FollowScriptedCamera / bmvr_follow_scripted_camera):
     // in normal play the engine's view angles are the ones the mod sent with
     // the last usercmd; a cutscene camera (point_viewcontrol, the drag scene,
@@ -775,8 +849,8 @@ public:
     bool m_AppliedVrPerfCvars = false;
     std::string m_CurrentMapName;
     std::string m_ScreenFxMap;
-    IMaterial* m_ScreenFxMaterials[3] = {};
-    bool m_ScreenFxNoDraw = false;
+    IMaterial* m_ScreenFxMaterials[4] = {};   // [3] = Xen global fog __gbxog0 (XenGlobalFogOff)
+    bool m_ScreenFxNoDraw[4] = {};
     int m_ScreenFxMaterialCount = -1;
     struct EnvmapTintEntry
     {
@@ -803,7 +877,6 @@ public:
     bool m_CaptureReentry = false;
     bool m_LoggedFirstSubmit = false;
     bool m_LookApplyWanted = true;
-    int m_OpenVRInitAttempts = 0;
     bool m_DirectEyeSubmit = false;
     bool m_UsedNamedRenderTargets = false;
     bool m_StereoRenderViewActive = false;
@@ -848,7 +921,6 @@ public:
     void EndStereoFramePose();
     void LogOpenXrPublishRate();
     void ApplyFrameCap(int nominalHz, float sourceHz, const char* source);
-    void TickOpenVrFrameCap();
     int m_FrameCapApplied = 0;
     void TickOpenXrHelperWatchdog();
     void LogOpenXrPublishSetupFailure(const char* stage, uint32_t eye, uint32_t slot, unsigned hr);
@@ -884,6 +956,79 @@ public:
     // stick points roughly at the ladder (mount assist, see vr.cpp); NaN
     // otherwise.
     bool LadderMode(int& moveBits, bool& onLadder, float* mountYaw = nullptr) const;
+    // Physical ladders (PhysicalLadders): a grip squeezed with the hand on a
+    // ladder mounts it (one IN_USE with the view at the ladder) and then the
+    // player moves opposite to that hand's height change, so the hand stays
+    // on the rung. Called once per CreateMove; false = not involved (stick
+    // ladder mode as before). dir: +1 climb up this tick, -1 down, 0 hold.
+    struct PhysicalLadderCmd
+    {
+        bool onLadder = false;
+        bool useEdge = false;   // send IN_USE this tick (mount)
+        bool mountPush = false; // mounting: walk toward the ladder (yaw) this tick
+        bool mountRise = false; // mounting below the ladder's bottom end: swim up
+        bool drop = false;      // let go of the ladder (IN_USE on it, view straight down)
+        bool topExit = false;   // step off at the top end (IN_USE on it, level head view)
+        bool stickTop = false;  // near the top with the stick moved: stick ladder mode this tick
+        float yaw = 0.f;        // view yaw towards the ladder while mounting
+        int dir = 0;
+    };
+    bool PhysicalLadderStep(PhysicalLadderCmd& out);
+    // RenderView: height to add to the main view while climbing by hand
+    // (PhysicalLadderSmooth). LadderMove moves 0 or 200 u/s per tick, so
+    // the body moves in bursts; the view instead follows the climb hand
+    // every frame, at most a few units ahead of / behind the body.
+    float PhysicalLadderViewOffset(float renderZ);
+    // RenderView: horizontal view shift towards / away from the ladder so the
+    // real hands reach the rungs they hold (arms pulled in = closer to the
+    // ladder, stretched = further). LadderBodyFollowsArms; +-8 units (more
+    // where the rungs stand further out than 24 units, up to 24).
+    Vector PhysicalLadderViewShift(const Vector& body);
+    struct LadderViewState
+    {
+        bool active = false;     // climbing by hand (set by PhysicalLadderStep)
+        bool rebase = false;     // new anchor: keep the view continuous
+        int hand = -1;
+        float anchorHandZ = 0.f; // tracking z of the climb hand at its grab
+        float visAnchorZ = 0.f;  // view z belonging to anchorHandZ
+        float offset = 0.f;      // last offset sent
+        Vector shift{};          // last horizontal shift sent (PhysicalLadderViewShift)
+        float limit = 8.f;
+        ULONGLONG lastMs = 0;
+    } m_LadderView;
+    // ProcessInput: grip state per hand (0 left, 1 right) for PhysicalLadderStep.
+    void UpdateLadderGrips();
+    std::atomic<bool> m_LadderGrip[2]{};
+    // Last CreateMove: hand within reach of a ladder. Its grip is a grab
+    // there, not the mapped action (flashlight on the right grip).
+    std::atomic<bool> m_LadderTouch[2]{};
+    // Last CreateMove: on a ladder, climbing by hand or mounting one.
+    std::atomic<bool> m_LadderActive{ false };
+    // Player within reach of a ladder (PhysicalLadderStep, every tick it
+    // runs; ms of the last time): a right-grip flashlight press waits a
+    // moment there in case it is a ladder grab.
+    std::atomic<unsigned long long> m_LadderNearMs{ 0 };
+    // Hand climbing: the rung each hand took hold of (world), from the
+    // map's ladder props (vr_ladder_rungs). The glove is drawn there.
+    struct LadderPin
+    {
+        bool valid = false;
+        Vector world{};   // where the controller is drawn (rung + LadderHandBack toward the player)
+        Vector rung{};    // the point on the rung itself
+        Vector axis{};    // along the rung, toward the thumb of an overhand grip (inward)
+        bool hasAxis = false;
+        int model = -1;   // ladder model of the rung (per-model grip tuning)
+        Vector face{};    // player -> rung, flat, unit (grip tuning "out" = against it)
+    };
+    LadderPin m_LadderPin[2];
+    bool TryGetLadderPinDrawPos(bool physicalLeft, const Vector& body, Vector& trackingPos) const;
+    // LadderHandWrap: the glove holding a rung is turned so its fist closes
+    // round the rung (vr_hands.cpp). Point on the rung + axis (thumb side).
+    // curl: the finger curl for that ladder model (DEBUG ladder grip tuning).
+    bool LadderRungGrip(bool physicalLeft, Vector& point, Vector& axis, float* curl = nullptr) const;
+    // DEBUG "LADDER GRIP TUNING" rows <-> VR/ladder_grip.txt for the ladder
+    // model last held (game thread).
+    void SyncLadderGripRows();
     bool UseFollowsLeftHand() const { return m_GrabLatched && m_GrabHandLeft; }
     bool UseGrabActive() const { return m_GrabLatched; }
     // Weapon fire, shoot origin, and flashlight must not follow a leftover
@@ -973,10 +1118,13 @@ public:
     // follow (game thread); the eye being drawn switches to its 1x resolve at that point of the draw stream.
     void NoteTranslucentPassStart();
     void RetireMsaaEyeIfBound();
+    // RefractOncePerEye: main view translucents done (game thread); later refract copies run again.
+    void NoteWorldTranslucentsDone();
     void MsaaEyesTo1x(IDirect3DDevice9* device);
     // Eye surface the calling thread is drawing (multicore TLS or the stereo blit).
     IDirect3DSurface9* ThreadEyeSurface() const;
     IDirect3DSurface9* m_RefractEyeDone = nullptr;   // RefractOncePerEye: eye already copied
+    int m_RefractEyeCopies = 0;                      // copies run for m_RefractEyeDone (reset with it)
     uint32_t m_RefractCopiesSkipped = 0;
     void BeginStereoEyeBlit(IDirect3DSurface9* dst);
     void ClearStereoEyeSurfaces();
@@ -1067,8 +1215,31 @@ public:
         bool aimBeamValid = false, aimBeamHit = false, aimCrosshairValid = false;
         int aimStage = 0;
         Vector aimCrosshairWorld{};
+        // Gun's own right wrist as drawn in this frame (cuff cap), from
+        // MagReload::g_GunWrist when the snapshot was taken.
+        bool gunWristOk = false;
+        float gunWrist[12]{};
+        // Turn offset of this frame: world-latched menus (weapon menu, VR
+        // panel) rebuild their pose from body + turn at draw time.
+        float rotationOffsetY = 0.f;
+        // HUD numbers (health, armor, clip, reserve, secondary, air) read on
+        // the game thread with the frame: the render thread reading them live
+        // caught the next frame's network update before prediction re-applied
+        // a reload, so the reserve flicked back to its old value.
+        bool hudOk = false;
+        int hud[6] = { -1, -1, -1, -1, -1, -1 };
     };
     void CaptureHandDrawSnap(HandDrawSnap& s);
+    // HUD values for drawing: the drawing frame's snapshot while one is drawn
+    // (MC), else read live.
+    bool HudValuesForDraw(int& health, int& armor, int& clip, int& reserve, int& secondary, int& air) const;
+    // Body origin + turn offset for drawing world-latched menus: the drawing
+    // frame's snapshot while one is drawn (MC), else the live values.
+    void MenuDrawBody(Vector& body, float& rotationOffsetY) const;
+    // Right wrist of the gun's own hands for the cuff cap: the drawing
+    // frame's snapshot while one is drawn (MC), else the latest published
+    // (within 100 ms). False = no cap.
+    bool GunCapWristForDraw(float out[12]) const;
     void McCompositeEyesToRing(uint32_t band, const L4D2VROpenXrPoseDesc* pose, const HandDrawSnap* hands = nullptr);
     bool CopyEyesToOpenXrPublishSlot(IDirect3DSurface9* left, IDirect3DSurface9* right,
         const OpenXrPendingPublish& pend);
@@ -1119,6 +1290,7 @@ public:
     bool StereoEyesReady() const;
     void ClearUnusedDesktopBackbuffer();
     void ProcessInput();
+    void UpdateButtonMap();
     void ApplyMenuCursor();
     // Game thread only. World vgui_screen (bm_c2a5i mortar, etc.): hover is
     // C_VGuiScreen::ClientThink from EyeAngles, but clicks need VGUI
@@ -1141,9 +1313,9 @@ public:
     void QueueVirtualKey(int vk);
     void QueueGameUiToggle(bool currentlyPaused);
     void FlushPendingGameUi();
+    void SyncLadderUseOnly();
     void FlushPanelEngineCommands();
     void FlushPendingQuit();
-    void PollVrMenuEvents();
     void NoteEngineVGui(void* engineVgui);
     // Intro logo (env_credits -> HudCredits) and env_message / game_text
     // (HudMessage): client HUD panels the eyes never get (DRAWHUD is stripped
@@ -1154,6 +1326,7 @@ public:
     bool WantHudLayer() const { return WantPauseWorldOverlay() || WantTitleHudOverlay(); }
     // Hide every visible panel that is not a visible title panel or one of its
     // ancestors; returns how many were hidden into `hidden`.
+    bool TitleHudPanelShowing(int i) const;
     int IsolateTitleHudPanels(unsigned int* hidden, int cap);
     void RestoreTitleHudPanels(const unsigned int* hidden, int count);
     void UpdateScreenEffectNoDraw();
@@ -1163,6 +1336,11 @@ public:
     // WM_ACTIVATEAPP. Default true so the first frames publish before any
     // activate message. Alt-tab sets false.
     void NoteAppActivated(bool activated);
+    // Game thread, once per RenderView. Logs foreground changes of the game
+    // window and releases +attack/+attack2 after it comes back: the click
+    // that refocuses the window could latch the engine's mouse1 bind
+    // (fire held until restart, 2026-11-17).
+    void TickWindowFocus();
     bool AppActivated() const { return m_AppActivated.load(std::memory_order_relaxed); }
     // Called from the window proc before the engine's own handler, and once
     // per RenderView. No-op unless a focus transition left sound stuck.
@@ -1199,8 +1377,25 @@ public:
     // HL2VR restores OverrideAlphaWriteEnable(false, true) after RenderHUD.
     void FinishPauseHudExtraPaint(IMatRenderContext* ctx);
     void StampPauseOverlayCursor();
+    // Laser-style click at window coordinates (new UI Back, test clicks).
+    void StartSyntheticMenuClick(int x, int y);
+    void TickSyntheticMenuClick();
+    int m_SynthClickX = -1;
+    int m_SynthClickY = -1;
+    DWORD m_SynthClickAtMs = 0;
+    // New game UI pause: no VGUI extra paint (the QML layer is the menu).
+    void SetPauseHudSkipVgui(bool skip) { m_PauseHudSkipVgui.store(skip, std::memory_order_release); }
+    std::atomic<bool> m_PauseHudSkipVgui{ false };
+    IDirect3DTexture9* NewUiLayerTexture();
+    bool DrawNewUiLayerTo(IDirect3DDevice9* device, IDirect3DSurface9* dst);
     bool IntersectMenuPanelUv(float& u, float& v);
-    void NoteHudPainted() { m_HudPaintedThisFrame.store(true, std::memory_order_release); }
+    // Paint complete: copy the HUD RT to the publish surface, then flag it.
+    void NoteHudPainted();
+    // Pending painted HUD frame for the layer about to publish (kind 0 = pause
+    // menu, 1 = title texts). A paint of the other kind is dropped, and a
+    // switch of kind drops the last image (2026-11-17: the map-start pause
+    // screen's paint was published as the first frame of the credits layer).
+    bool TakeHudPaintFor(int kind);
     bool HudPaintedThisFrame() const { return m_HudPaintedThisFrame.load(std::memory_order_acquire); }
     void UpdateCrowbarMelee();
     // Hand throw: sampled every input frame; read by the server grenade hooks.
@@ -1248,6 +1443,9 @@ public:
     // True only while a scoped weapon is actually zoomed. Aim then comes from
     // the headset, because the scope picture is centred on the view.
     bool ScopeZoomActive() const { return m_ScopeZoomActive; }
+    // Half the render IPD in world units (eye = head centre +- this along
+    // right); 0 while ScopeMonoZoom holds both eyes at the head centre.
+    float RenderHalfIpd() const;
     static bool IsScopedWeaponModel(const char* model);
     static bool IsRpgWeaponModel(const char* model);
     static bool IsGluonWeaponModel(const char* model);
@@ -1271,6 +1469,10 @@ public:
     void CloseSettingsPanel(const char* why);
     // Short head-locked message (quick save); detail = optional smaller second line.
     void ShowToast(const char* text, DWORD ms = kToastMs, const char* detail = nullptr);
+    // Manual-reload hint (small toast), each id at most twice per game start;
+    // VrReloadHints off = never.
+    void ShowReloadHint(int id, const char* text);
+    bool m_ToastSmall = false;
     bool ToastVisible() const;
     void DrawToast(IDirect3DDevice9* device, int stereoEye, UINT w, UINT h,
         const Vector& eyeOrig, const Vector& fwd, const Vector& right, const Vector& up);
@@ -1279,7 +1481,7 @@ public:
     void DrawToastOnEyeSurface(IDirect3DSurface9* eyeSurf, int stereoEye);
     static constexpr DWORD kToastMs = 2500;
     char m_ToastText[32]{};
-    char m_ToastDetail[64]{};
+    char m_ToastDetail[128]{};
     DWORD m_ToastUntilMs = 0;
     int m_MissingOffsetsWarned = 0;   // Game::missingOffsetCount() at the last "out of date" toast
     bool m_VrConfigsExecuted = false; // bmvr.cfg / bmvr_local.cfg run once per game start
@@ -1290,6 +1492,21 @@ public:
     void SettingsPanelFrame(Vector& origin, Vector& fwd, Vector& right, Vector& up) const;
     static IDirect3DTexture9* SettingsGearTexture(IDirect3DDevice9* device);
     bool m_SettingsOpen = false;
+    // First-run welcome: once per map until the player opened the VR panel
+    // from it, pause the game and show "hold <button> to open the VR menu"
+    // until they do (WelcomeStep, vr_settings_panel.cpp).
+    void WelcomeStep(bool paused);
+    bool m_WelcomeActive = false;
+    bool m_WelcomePaused = false;      // our setpause is on
+    bool m_WelcomeTriedThisMap = false;
+    DWORD m_WelcomeGameplaySinceMs = 0;
+    char m_WelcomeText[128]{};
+    // Welcome toast latched in the room like the VR panel (DrawToast).
+    bool m_WelcomeLatched = false;
+    float m_WelcomeLatchYaw = 0.f;
+    Vector m_WelcomeLatchDelta{};
+    Vector m_WelcomeLatchFwd{};
+    Vector m_WelcomeLatchRight{};
     // Set by the game thread, cleared by the render thread before it paints:
     // a change during a paint stays set and is painted next frame.
     std::atomic<bool> m_SettingsDirty{ false };
@@ -1331,6 +1548,9 @@ public:
     bool IsPerformingMelee() const { return m_PerformingMelee; }
     bool TryGetMeleeBladeViewAngles(QAngle& out) const;
     bool TryGetMeleeTraceOrigin(Vector& origin) const;
+    // Drawn v_crowbar bar (hand end projected on the bar, far end), in the
+    // right controller's forward/right/up, noted by the viewmodel draw.
+    void NoteDrawnCrowbarBar(const Vector& startLocal, const Vector& tipLocal);
     // Visible crowbar strike point and blade axis while a VR swing is live, so
     // the engine's melee trace runs along the bar the player can see.
     bool TryGetMeleeAim(Vector& origin, QAngle& angles) const;
@@ -1346,20 +1566,36 @@ public:
     // Written on the game thread, read by the glove draw.
     bool GmanGestureActive() const { return m_GmanGestureActive.load(std::memory_order_relaxed); }
     bool TwoHandGripActive() const { return m_TwoHandActive; }
+    // VrStockHandPose: the drawn gun's stock left-hand finger joints in idle,
+    // relative to L_Wrist (thumb..pinky x 3 segments, 3x4 rows, game units).
+    // Viewmodel draw -> glove draw. Get is false for another gun's pose.
+    void NoteStockOffhandFingers(const void* studioHdr, const float rel[15][12]);
+    bool GetStockOffhandFingers(float rel[15][12]) const;
+    bool StockOffhandFingersIdleSettled() const;
     // Live L_Wrist (or L_Hand) world origin from DrawModelExecute bone matrices.
-    void NoteViewmodelOffhandWorld(const Vector& worldOrigin);
+    void NoteViewmodelOffhandWorld(const Vector& worldOrigin, bool sideHandle = false);
     bool TryGetTwoHandOffhandDrawPose(bool physicalLeft, Vector& trackingPos, QAngle& trackingAng) const;
     bool HudOverlayReady() const { return m_HudOverlayReady; }
     void EnsureHudOverlay();
-    void SubmitHudOverlay();
-    // Bind HUD overlay texture. Caller must already hold LockSubmissionQueue.
-    void BindHudOverlayWhileQueueLocked();
     void ClearHudSurface(bool opaque);
     void TickMatQueueFromRenderView();
     // HL2VR hlvr_msaa from VR/config.txt. Scene targets pick it up on the
     // next map load. Advanced Video is not hooked.
     void UpdateHl2vrMsaa();
-    uint32_t HeldButtons() const { return m_HeldButtons.load(std::memory_order_acquire); }
+    // IN_JUMP is masked while m_LadderJumpLatch is set: a hand mount that
+    // caught with jump (stick up = swim up) held does not jump straight off
+    // the ladder; cleared once jump is let go (hooks.cpp CreateMove).
+    uint32_t HeldButtons() const
+    {
+        const uint32_t b = m_HeldButtons.load(std::memory_order_acquire);
+        constexpr uint32_t kInJump = 1u << 1;   // IN_JUMP (in_buttons.h)
+        return m_LadderJumpLatch.load(std::memory_order_relaxed) ? (b & ~kInJump) : b;
+    }
+    uint32_t RawHeldButtons() const { return m_HeldButtons.load(std::memory_order_acquire); }
+    std::atomic<bool> m_LadderJumpLatch{ false };
+    // A hand mount is running: HL2's walk-on auto-mount is allowed meanwhile
+    // (SyncLadderUseOnly), so the mount needs only one use press.
+    std::atomic<bool> m_LadderMountActive{ false };
     static constexpr uint32_t kWeaponSoundHover = 1u;
     static constexpr uint32_t kWeaponSoundSelect = 2u;
     void NoteViewmodelModel(const char* modelName);
@@ -1375,18 +1611,11 @@ public:
     IDirect3DBaseTexture9* EyeRtSubstitute(IDirect3DBaseTexture9* texture);
     IDirect3DBaseTexture9* SceneCubemap() const { return m_SceneCubemap; }
     bool GetFingerCurls(vr::VRActionHandle_t skeletonAction, float outCurls[5]) const;
-    void TryCompositorPostPresentHandoff(DWORD nowMs, DWORD poseAgeMs);
 
 private:
-    friend class Hl2vrAwaitFrameFunctor;
     friend class McPauseHudFunctor;
-    void MatAwaitFrame(uint64_t frameId);
-    void SyncFrameGetPoses(uint64_t frameId);
-    bool QueueMatAwaitFrame(uint64_t frameId);
     ICallQueue* ProbeCallQueue();
-    void ApplyHl2vrWaitedPoses(bool usePredicted);
     Vector GetViewOriginUnshifted(const Vector& setupOrigin) const;
-    void SetActionManifest();
     bool GetDigitalActionData(vr::VRActionHandle_t handle, vr::InputDigitalActionData_t& out) const;
     bool GetAnalogActionData(vr::VRActionHandle_t handle, vr::InputAnalogActionData_t& out) const;
     bool PressedDigitalAction(vr::VRActionHandle_t handle, bool onChanged = false) const;
@@ -1400,7 +1629,9 @@ private:
     bool EngineDrawingLoadingImage();
     void UpdateVrPhase(bool inGame);
     VrPhase m_VrPhase = VrPhase::Unknown;
+    unsigned m_LoadEpoch = 0;   // +1 each time the Loading phase starts (map change, save load, death reload)
     DWORD m_VrPhaseSinceMs = 0;
+    bool m_PauseFromLoading = false;   // this pause phase came straight from loading (load end)
     // In-game load without the game's loading dialog (trigger changelevel,
     // reload after death): a LOADING card painted onto the held eye pair,
     // as flat Black Mesa shows its small LOADING box. Painted on the eyes
@@ -1417,7 +1648,6 @@ private:
     void TickPhaseDump();
     DWORD m_PoseDiagUntilMs = 0;
     void TickPoseDiag();
-    bool InitOpenVR();
     bool InitOpenXR();
     bool ConsumeOpenXrTracking();
     // Copies the eyes into a free publish slot and either queues the slot
@@ -1438,27 +1668,52 @@ private:
     bool EnsurePrivateEyeSurfaces(IDirect3DDevice9* device);
     bool EnsureFrameCopySurface(IDirect3DDevice9* device, uint32_t width, uint32_t height);
     bool FillSharedTexture(IDirect3DSurface9* surface, SharedTextureHolder& holder);
+    // DEBUG "Capture next pause": from the Pause press, the next published
+    // eye pairs and menu-layer images go to VR/pausecap-*.bmp.
+    std::atomic<int> m_PauseCapEyes{ 0 };
+    std::atomic<int> m_PauseCapHud{ 0 };
+    DWORD m_PauseCapStartMs = 0;
     IDirect3DSurface9* SubmitSurfaceForEye(IDirect3DSurface9* eye) const;
     void NoteMsaaEyeScene(IDirect3DSurface9* dst, bool copied);
     void ResolveMsaaEyesToSubmit(IDirect3DDevice9* device);
     void ApplyVulkanYFlip(vr::VRTextureBounds_t& bounds);
-    void RefreshIpdFromHmd();
     void UpdateControllerTracking(const vr::TrackedDevicePose_t& hmdPose);
     void UpdateAutoMatQueueMode();
     void ApplyVrQualityOfLifeCvars();
-    void PollSteamVrRecommendedSize();
-    void TryApplySteamVrRecommendedEyeSize();
-    void TickCompositorFocus();
-    void ReclaimCompositorFocus(const char* reason);
     void PulseAimHaptic(unsigned short durationUs = 2500);
     void PulseHandHaptic(vr::ETrackedControllerRole hand, unsigned short durationUs, float amplitude = 0.6f);
+    // Real vibration time (OpenXR); OpenVR maps it to its 1-3999 us click.
+    void PulseHandHapticSeconds(vr::ETrackedControllerRole hand, float seconds, float amplitude);
+    // Last-shot / empty-trigger buzz patterns (LastShotHaptic, DryFireHaptic); the second
+    // pulse of a double is queued and sent by PumpHapticFollowUp (ProcessInput thread).
+    void StartLastShotHaptic();
+    void StartDryFireHaptic();
+    void PumpHapticFollowUp();
+    // Reload feel (user, 2026-11-18: "doable by touch"): distinct patterns,
+    // felt in both hands where the gun takes something in. The second tick
+    // of a pattern is queued and sent by PumpHapticQueue (game thread).
+    enum class ReloadFeel { Seat, ShellIn, Chamber, PinTaken, PinPulled, Grab };
+    void ReloadHaptic(ReloadFeel feel);
+    void PumpHapticQueue();
     void UpdateViewmodelNumpadAdjust(bool paused);
+    void SyncHeldWeaponAngleRows();
     void ResolveWeaponViewmodelPose(float& ox, float& oy, float& oz, float& ax, float& ay, float& az) const;
     void ApplyViewmodelNumpadExtras(float& ox, float& oy, float& oz, float& ax, float& ay, float& az) const;
     void DrawHandHud(IDirect3DDevice9* device, int stereoEye, UINT w, UINT h,
         bool leftOk, const Vector& leftOrigin, const QAngle& leftAng,
         bool rightOk, const Vector& rightOrigin, const QAngle& rightAng,
         const Vector& eyeOrig, const Vector& fwd, const Vector& right, const Vector& up);
+    // Red eye-edge flash when health/armor drop (the flat HUD's damage
+    // indicator is never drawn in the eyes). Sampled once per frame on eye 1.
+    void UpdateDamageFlash(int stereoEye);
+    void DrawDamageFlash(IDirect3DDevice9* device, int stereoEye, UINT w, UINT h);
+    int m_DmgLastHealth = -1;
+    int m_DmgLastArmor = -1;
+    float m_DmgFlashLevel = 0.f;
+    double m_DmgFlashStartMs = 0.0;
+    bool m_DmgMapLoaded = false;        // LevelInit since the last gameplay sample: longer settle
+    double m_DmgLoadSettleUntilMs = 0.0; // after a map load; kept over the map-start pause
+    double m_DmgSettleUntilMs = 0.0;   // drops before this only move the baseline (just back in gameplay)
     void RefreshActiveWeaponModel();
     void ToggleEmptyHands();
     void Recenter(const char* why);
@@ -1469,8 +1724,31 @@ private:
     void ApplyTwoHandWeaponAim();
     float LeftSupportGripValue() const;
     bool UpdateShoulderGestures(bool paused);
+    // Body frame for the grab zones (shoulders, hips, ammo pouch): a body yaw
+    // that only follows the head on sustained or large turns, and a point
+    // where the eyes would be with the head straight over the neck. With
+    // g_GestureBodyFrame off: the headset itself (the old head-locked zones).
+    // Boxes, per hand: HipCrossLeft = right hand above the left hip, HipAmmo =
+    // left hand at the left hip, HipCrossRight = left hand above the right hip.
+    enum class GestureZone { ShoulderLeft, ShoulderRight, HipRight, HipCrossLeft, HipAmmo, HipCrossRight, AmmoWideLeft, AmmoWideRight };
+    void UpdateBodyFrame();
+    bool HandInGestureZone(const Vector& hand, GestureZone zone, float growM = 0.f) const;
+    // Hand in that slot's zone (bmvr::GestureZoneId); the left hand's forehead
+    // zone is head-framed. No setting / tracking checks.
+    bool LeftHandInSlotZone(int zone, float growM = 0.f) const;
+    bool RightHandInSlotZone(int zone, float growM = 0.f) const;
+    // Left hand in a zone whose left-hand slot is Ammo (manual-reload pouch).
+    bool LeftHandInAmmoZone() const;
+    void ZoneCoords(const Vector& hand, float& along, float& lateral, float& height) const;
+    bool m_BodyFrameValid = false;
+    float m_BodyYawDeg = 0.f;          // tracking space, degrees (atan2 of Source y, x)
+    float m_BodyHeadYawDeg = 0.f;      // head yaw from the looking-down-safe estimate
+    Vector m_ZoneOrigin{};             // tracking space, Source units
+    Vector m_ZoneFwd{ 1.f, 0.f, 0.f };
+    Vector m_ZoneRight{ 0.f, -1.f, 0.f };
     bool ResolveOffhandGripLocal(float& gx, float& gy, float& gz) const;
     bool m_TwoHandActive = false;
+    std::atomic<bool> m_SupportNearGun{ false };   // support hand at the gun (ApplyTwoHandWeaponAim)
     bool m_TwoHandGripWasDown = false;   // TwoHandGripToggle press edge
     bool m_OffhandGripBoneValid = false;
     float m_OffhandGripGx = 0.f;
@@ -1486,6 +1764,26 @@ private:
     Vector m_TwoHandSmoothF{};
     Vector m_TwoHandSmoothU{};
     bool m_TwoHandSmoothValid = false;
+    // Lowered-gun glove follow (NoteViewmodelLowerState / NoteDrawnWeaponRootLocal).
+    std::atomic<int> m_VmLowerState{ kVmLowerOther };
+    std::atomic<const void*> m_VmLowerHdr{ nullptr };
+    std::atomic<ULONGLONG> m_VmLowerIdleSinceMs{ 0 };
+    mutable std::mutex m_StockFingersMutex;
+    float m_StockFingers[15][12]{};
+    const void* m_StockFingersHdr = nullptr;
+    Vector m_GunRootRefPos{};
+    Vector m_GunRootRefAx[3]{};
+    Vector m_GunRootLivePos{};
+    Vector m_GunRootLiveAx[3]{};
+    const void* m_GunRootSampleHdr = nullptr;
+    bool m_GunRootRefValid = false;
+    bool m_GunRootLiveValid = false;
+    bool m_TwoHandLoweredLogged = false;
+    float m_TwoHandLoweredMaxMove = 0.f;
+    float m_TwoHandLoweredMaxTurn = 0.f;
+    // Moves the support glove's gun-frame grip point with the gun body's
+    // lowered-vs-idle move; its angles stay. Caller holds m_ControllerMutex.
+    void ApplyLoweredOffhand(Vector& gripLocal);
     int m_AutoMatQueueModeLastRequested = -999;
     std::chrono::steady_clock::time_point m_AutoMatQueueModeLastCmdTime{};
     bool m_VrCvarsApplied = false;
@@ -1534,6 +1832,9 @@ private:
     bool m_MeleeNewSwing = true;
     void* m_MeleeHitEntity = nullptr;
     Vector m_MeleeTraceOrigin{};
+    Vector m_DrawnCrowbarStartLocal{};
+    Vector m_DrawnCrowbarTipLocal{};
+    DWORD m_DrawnCrowbarMs = 0;
     QAngle m_MeleeBladeAngles{};
     bool m_MeleeBladeAnglesValid = false;
     Vector m_CrowbarPrevTipLocal{};
@@ -1547,6 +1848,9 @@ private:
     // 90-120 poses/s: 512 is over 4 s.
     static constexpr int kThrowSamples = 512;
     double m_ThrowReleaseT = 0.0;               // trigger let go (IN_ATTACK 1 -> 0)
+    // Snark: the real trigger release, set by UpdateSnarkThrow; the pulsed
+    // IN_ATTACK that follows must not move it (until this steady-clock time).
+    double m_ThrowReleaseLockUntil = 0.0;
     double m_ThrowPressT = 0.0;                 // pin pulled (IN_ATTACK 0 -> 1)
     bool m_ThrowAttackHeld = false;
     ThrowSample m_ThrowSamples[kThrowSamples]{};
@@ -1622,6 +1926,7 @@ private:
     int m_LatchedViewmodelIdleSeq = -1;
     bool m_CrouchToggled = false;
     bool m_SprintLatched = false;
+    bool m_SprintMapToggle = true;   // button map: last sprint action pressed was "Sprint toggle"
     bool m_HudOverlayReady = false;
     bool m_HudOverlayCreateAttempted = false;
     IDirect3DSurface9* m_PauseHudPrevRt = nullptr;
@@ -1632,6 +1937,8 @@ private:
     bool m_PauseHudRtSaved = false;
     bool m_PauseHudAlphaOverridden = false;
     bool m_HudOverlayHasImage = false;
+    std::atomic<int> m_HudPaintedKind{ 0 };
+    int m_HudPublishedKind = -1;
     bool m_OpenXrHudOverlayPublished = false;
     std::atomic<bool> m_HudPaintedThisFrame{ false };
     bool m_MenuTriggerWasDown = false;
@@ -1652,6 +1959,11 @@ private:
     uint32_t m_MenuOverlayEpoch = 0;
     L4D2VROpenXrPoseDesc m_MenuPanelPose{};
     Vector m_MenuPanelFwd{};
+    // Menu re-anchor while open: head moved away from the latch point / turned
+    // > 90 deg off the panel since this tick (0 = not pending).
+    DWORD m_MenuPanelMovedSinceMs = 0;
+    DWORD m_MenuPanelTurnedSinceMs = 0;
+    bool m_MenuPanelRoomFront = false;
     Vector m_MenuPanelRight{};
     Vector m_MenuPanelUp{};
     HWND m_MenuCursorHwnd = nullptr;
@@ -1704,13 +2016,18 @@ private:
     // On his maps the entity list is rescanned at most once a second and
     // only the cached entities are checked per frame.
     void UpdateGmanGesture();
+    void ScanMapForGman();
     int m_GmanModelIndex[2] = { -1, -1 };
     int m_GmanMapState = 0;            // 0 unknown, 1 has a G-Man, 2 none
     int m_GmanMapChecks = 0;
+    // From the map's entity lump at LevelInit: 1 lists an npc_gman (placed or
+    // a template spawned later), 0 does not, -1 not read (old 10-try check).
+    int m_GmanMapListed = -1;
     DWORD m_GmanMapCheckMs = 0;
     DWORD m_GmanScanMs = 0;
     int m_GmanEntities[4] = {};
     int m_GmanEntityCount = 0;
+    unsigned m_GmanLoadEpoch = 0;      // m_LoadEpoch the model indexes belong to
     std::atomic<bool> m_GmanGestureActive{ false };
     bool m_OnGun = false;
     int m_GunPropIndex = 0;
@@ -1743,6 +2060,8 @@ private:
     DWORD m_WeaponMenuClickStartMs = 0;
     int m_WeaponMenuHover = -1;
     uint32_t m_PrevHeldButtons = 0;
+    std::atomic<bool> m_TriggerBeforeMagFilter{ false };
+    bool m_PrevTriggerBeforeMagFilter = false;
     int m_WeaponMenuCount = 0;
     Vector m_WeaponMenuOrigin{};
     Vector m_WeaponMenuFwd{};
@@ -1782,6 +2101,10 @@ private:
     WeaponMenuSlot m_WeaponMenuSlots[20]{};
     int m_LastMuzzleFlashParity = -1;
     int m_LastFireClip = -1;
+    unsigned long m_LastShotHapticMs = 0;   // GetTickCount of the last-shot pattern
+    unsigned long m_HapticFollowUpMs = 0;   // 0 = none queued
+    float m_HapticFollowUpSec = 0.f;
+    float m_HapticFollowUpAmp = 0.f;
     void* m_LastFireWeapon = nullptr;
     bool m_StereoEyeBlitOk = false;
     int m_StereoEyeBlitRank = 0;

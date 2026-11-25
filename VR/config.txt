@@ -77,10 +77,6 @@ ControllerPitchTiltVive=-45.0
 # Touch aim origin sits ahead of the grip. Pulls the gun back along -forward.
 ViewmodelPosOffsetXTouch=5.5
 
-# openxr = 64-bit helper. openvr = SteamVR compositor.
-VRRuntimeBackend=openxr
-OpenXRHelper=true
-
 # HUD quad, metres, relative to the headset.
 HudDistance=1.05
 HudSize=0.70
@@ -122,7 +118,7 @@ ScopeEye=right
 # until the stick is centred again (false = hold the click).
 # Right stick up/down: how far (0.3..0.95) it must go before it jumps/crouches; it also has
 # to point within 30 degrees of straight up/down. TurnBlocksJumpCrouch: after the stick went
-# sideways to turn, no jump/crouch until it is back near the centre.
+# sideways to turn, no jump/crouch until it is back near the centre (default false).
 # Two-handed guns: squeezing the support grip on the gun latches the hold (no need to
 # keep squeezing); squeeze again, or take the hand away from the gun, to let go.
 # Frag grenade: thrown from the hand at the hand's speed (smoothed over ~66 ms around the
@@ -138,20 +134,28 @@ ScopeEye=right
 # changes several of these live and writes the ones you changed back here.
 # They are also bmvr_* console cvars.
 
-# Hand behind the shoulder + grip: left = quick save (hold the hand there
-# ~0.25 s until a light buzz, then grip; GAME SAVED shown), right = crowbar
-# (grip right away). Also in the VR settings panel (SHOULDER GESTURES).
+# Grab gestures: hand behind a shoulder, at a hip or (left hand) at the forehead
+# + grip. Every zone has a setting per hand, in the VR settings panel (GRAB
+# GESTURES): the left hand does an action (quick save, flashlight, ammo for
+# manual reloads, quick load = hold the grip ~1 s, screenshot = right eye into
+# the Steam screenshot library, recenter; rest
+# the hand there ~0.25 s until a light buzz, then grip), the right hand takes a
+# weapon (grip right away). Dynamic = the zone keeps the weapon you last put
+# away there. Defaults: left shoulder quick save, left hip ammo, forehead
+# flashlight; right shoulder crowbar, right hip pistol, above the left hip MP5.
 
-# Hold Triangle/Y 0.6 s = VR settings panel; a tap pauses on release.
-# false = Triangle/Y pauses on press; open the panel from the weapon menu's gear.
+# Buttons are set in the VR settings panel (CONTROLS) and saved here as
+# Bind.<controller>.<hand>.<button>[.hold]=<action>. The old switches
+# FlashlightOnSquare, SettingsTriangleHold and CrouchStickHold are turned
+# into such lines once on start and then removed.
 
 # Weapon menu: VR gear slot below the crowbar (opens the VR settings panel).
-# false hides it, but only while SettingsTriangleHold=true (else the panel
-# could not be opened at all).
+# false hides it, but only while some button is mapped to VR settings (else
+# the panel could not be opened at all).
 # Weapon menu opened low (hand by the hip) tilts back to face the eye
 # (max 60 degrees); false = always upright.
 # The VR settings panel pauses the game while it is open (VrSettingsPause; in the panel:
-# Debug -> VIEW TESTS, off to watch a change happen live behind the panel).
+# Controls -> THIS PANEL, off to watch a change happen live behind the panel).
 
 # Bloom and auto-exposure on the eyes (bmvr_eye_bloom). Also in the VR settings panel.
 
@@ -184,6 +188,7 @@ FlareSharedLayout=true
 # Strength of the other layers away from the light (bmvr_flare_ghosts). All three are in the VR settings panel.
 
 # FXAA settings, also in the VR settings panel and as bmvr_fxaa_* console commands.
+# The panel's FXAA Preset sets all three: Sharp 0.25/0.166/0.0833 (default), Balanced 0.5/0.125/0.0625, Smooth 0.75/0.063/0.0312.
 # The game never passes the mat_fxaa_* cvars to the shader and runs FXAA with all values at 0.
 # FxaaApply=true (default) sends these values instead. false keeps the stock behaviour.
 # Sub-pixel smoothing: 0 off, 0.25 about as sharp as with FxaaApply=false, 0.75 FXAA's own default, 1 softest.

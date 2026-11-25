@@ -266,10 +266,6 @@ OpenXrHelperLaunchConfig L4D2VR_ReadOpenXrHelperLaunchConfig()
             return it != values.end() ? it->second : std::string();
         };
 
-    if (const std::string value = get("OpenXRHelper"); !value.empty())
-        config.enabled = ParseBool(value, config.enabled);
-    if (bmvr::g_FakeRuntime)
-        config.enabled = true;
     if (const std::string value = get("OpenXRHelperSwapProjectionEyes"); !value.empty())
         config.swapProjectionEyes = ParseFlipSubmitY(value, config.swapProjectionEyes);
     if (const std::string value = get("OpenXRHelperSwapProjectionViewOrder"); !value.empty())
@@ -615,6 +611,34 @@ bool L4D2VR_ReadOpenXrHmdPose(L4D2VROpenXrPoseDesc& pose, uint32_t* generation)
     return false;
 }
 
+bool L4D2VR_ReadOpenXrStagePose(L4D2VROpenXrPoseDesc& pose)
+{
+    std::lock_guard<std::mutex> lock(g_OpenXrBridgeStateMutex);
+    const L4D2VROpenXrBridgeState* state = g_OpenXrBridgeState;
+    if (!state)
+        return false;
+
+    for (int attempt = 0; attempt < 3; ++attempt)
+    {
+        const uint32_t gen0 = state->stagePoseGeneration;
+        if (gen0 == 0 || (gen0 & 1u))
+            continue;
+
+        L4D2VR_SeqlockAcquire();
+        L4D2VROpenXrPoseDesc snapshot = state->stagePose;
+        L4D2VR_SeqlockAcquire();
+        if (state->stagePoseGeneration == gen0)
+        {
+            if (!snapshot.valid)
+                return false;
+            pose = snapshot;
+            return true;
+        }
+    }
+
+    return false;
+}
+
 bool L4D2VR_ReadOpenXrRuntimeViewConfig(L4D2VROpenXrRuntimeViewConfigDesc& config, uint32_t* generation)
 {
     std::lock_guard<std::mutex> lock(g_OpenXrBridgeStateMutex);
@@ -710,6 +734,32 @@ bool L4D2VR_ReadOpenXrInputState(L4D2VROpenXrInputStateDesc& inputState, uint32_
             inputState = snapshot;
             if (generation)
                 *generation = gen1;
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool L4D2VR_ReadOpenXrEyeGaze(L4D2VROpenXrEyeGazeDesc& gaze)
+{
+    std::lock_guard<std::mutex> lock(g_OpenXrBridgeStateMutex);
+    const L4D2VROpenXrBridgeState* state = g_OpenXrBridgeState;
+    if (!state)
+        return false;
+
+    for (int attempt = 0; attempt < 3; ++attempt)
+    {
+        const uint32_t gen0 = state->inputStateGeneration;
+        if (gen0 == 0 || (gen0 & 1u))
+            continue;
+
+        L4D2VR_SeqlockAcquire();
+        L4D2VROpenXrEyeGazeDesc snapshot = state->inputState.eyeGaze;
+        L4D2VR_SeqlockAcquire();
+        if (state->inputStateGeneration == gen0)
+        {
+            gaze = snapshot;
             return true;
         }
     }
