@@ -81,6 +81,18 @@ namespace
         return out;
     }
 
+    // Rotation about a unit axis (joint frame).
+    VrHandMatrix4 MakeAxisRotation(const float axis[3], float radians)
+    {
+        VrHandMatrix4 out = VrHandMath::Identity();
+        const float ca = std::cos(radians), sa = std::sin(radians), t = 1.f - ca;
+        const float x = axis[0], y = axis[1], z = axis[2];
+        VrHandMath::Set(out, 0, 0, t * x * x + ca);     VrHandMath::Set(out, 0, 1, t * x * y - sa * z); VrHandMath::Set(out, 0, 2, t * x * z + sa * y);
+        VrHandMath::Set(out, 1, 0, t * x * y + sa * z); VrHandMath::Set(out, 1, 1, t * y * y + ca);     VrHandMath::Set(out, 1, 2, t * y * z - sa * x);
+        VrHandMath::Set(out, 2, 0, t * x * z - sa * y); VrHandMath::Set(out, 2, 1, t * y * z + sa * x); VrHandMath::Set(out, 2, 2, t * z * z + ca);
+        return out;
+    }
+
     VrHandMatrix4 MakeLocalZRotation(float radians)
     {
         VrHandMatrix4 out = VrHandMath::Identity();
@@ -154,6 +166,7 @@ namespace
         float lastGripCurlMin = -1.f;
         float lastGmanThumb[3]{};
         float lastStraight = 0.f;
+        float lastTwist = 0.f;
     };
 
     void BuildHandRig(const VrHandMeshAsset& asset, HandRig& rig)
@@ -274,7 +287,8 @@ namespace
         if (rig.paletteValid && outPalette.size() == n && rig.lastGripCurlMin == gripCurlMin
             && std::memcmp(curls, rig.lastCurl, sizeof(curls)) == 0
             && std::memcmp(gmanThumbState, rig.lastGmanThumb, sizeof(gmanThumbState)) == 0
-            && rig.lastStraight == straightMiddle)
+            && rig.lastStraight == straightMiddle
+            && rig.lastTwist == bmvr::g_VrGmanFingerTwistDeg)
             return true;
 
         static const float kMaxCurlRadians[vr::VRFinger_Count][3] =
@@ -354,6 +368,14 @@ namespace
                         + VrHandMath::Get(rig.bindLocal[joint], 1, r) * want[1]
                         + VrHandMath::Get(rig.bindLocal[joint], 2, r) * want[2];
                 localMatrices[joint] = VrHandMath::Multiply(rig.bindLocal[joint], MakeTurnTowards(bone, a, straightMiddle));
+                // Twist (user 2026-11-27: finger looked turned about its
+                // length): the root segment about its own bone, which turns
+                // the whole finger. Mirrored rigs: sign per hand.
+                if (segment == 0 && bmvr::g_VrGmanFingerTwistDeg != 0.f)
+                {
+                    const float twist = (rig.rightHand ? -1.f : 1.f) * DEG2RAD(bmvr::g_VrGmanFingerTwistDeg) * straightMiddle;
+                    localMatrices[joint] = VrHandMath::Multiply(localMatrices[joint], MakeAxisRotation(bone, twist));
+                }
             }
         }
 
@@ -376,6 +398,7 @@ namespace
         std::memcpy(rig.lastCurl, curls, sizeof(curls));
         std::memcpy(rig.lastGmanThumb, gmanThumbState, sizeof(gmanThumbState));
         rig.lastStraight = straightMiddle;
+        rig.lastTwist = bmvr::g_VrGmanFingerTwistDeg;
         rig.lastGripCurlMin = gripCurlMin;
         rig.paletteValid = true;
         return true;
@@ -1097,7 +1120,7 @@ namespace
     // the rung (the wrist tipping up or down). The centre of the middle
     // finger's curl (circle through its three joints) lands on the rung.
     void WrapGloveOnRung(const VrHandMeshAsset& asset, const std::vector<VrHandMatrixRows3x4>& palette,
-        VrHandMatrix4& world, bool rightHand, const Vector& rung, const Vector& axis)
+        VrHandMatrix4& world, bool rightHand, const Vector& rung, const Vector& axis, VrGloveRungXform& xf)
     {
         const char* suf = rightHand ? "r" : "l";
         auto idx = [&](const char* base) { return FindNameIndex(asset.jointNames, std::string(base) + suf); };
@@ -1161,6 +1184,10 @@ namespace
                 M[i][j] = VrHandMath::Get(world, i, j);
         const float t[3] = { M[0][3] - c.x, M[1][3] - c.y, M[2][3] - c.z };
         const float dst[3] = { rung.x, rung.y, rung.z };
+        std::memcpy(xf.R, R, sizeof(R));
+        xf.from = c;
+        xf.to = rung;
+        xf.valid = true;
         for (int i = 0; i < 3; ++i)
         {
             for (int j = 0; j < 3; ++j)
@@ -1293,6 +1320,7 @@ bool BmVrGloves::DrawForEye(
     float zFar,
     bool overlayNoDepth)
 {
+    g_VrGloveRungXform[0].valid = g_VrGloveRungXform[1].valid = false;
     if (!device || !m_Impl || !m_Impl->EnsureAssets())
         return false;
 
@@ -1546,7 +1574,7 @@ bool BmVrGloves::DrawForEye(
             posOffset,
             rotOffset);
         if (rungGrip)
-            WrapGloveOnRung(hand.asset, hand.palette, world, rightHand, rungPoint, rungAxis);
+            WrapGloveOnRung(hand.asset, hand.palette, world, rightHand, rungPoint, rungAxis, g_VrGloveRungXform[rightHand ? 1 : 0]);
         const VrHandMatrix4 wvp = VrHandMath::Multiply(projection, VrHandMath::Multiply(camera, world));
         if (i == 0 && !gripCurl)
             StoreLeftFistCentre(hand.asset, hand.palette, world, *origins[0], *angles[0]);
@@ -1659,6 +1687,8 @@ bool BmVrGloves::DrawForEye(
     }
     return drew;
 }
+
+VrGloveRungXform g_VrGloveRungXform[2];
 
 void VrHands_UpdatePalmLight(int hand, const Vector& pos)
 {

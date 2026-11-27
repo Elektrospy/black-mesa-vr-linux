@@ -32,6 +32,8 @@
 #include "d3d9_reshade_vr.h"
 #include <intrin.h>
 #include "bmvr_flags.h"
+#include "vr_xen_fog.h"
+#include "vr_godrays.h"
 #include "bmvr_prof.h"
 
 #include <algorithm>
@@ -4745,18 +4747,170 @@ namespace dxvk {
     SetShaderConstants<DxsoProgramTypes::VertexShader, D3D9ConstantType::Float>(uint32_t(vs->bmvrParticleProj), saved + 12, 4);
   }
 
+  D3D9Texture2D* D3D9DeviceEx::BmvrGodRaySmallBlur(D3D9CommonTexture* full, bool create) {
+    const int scale = bmvr::GodRayBlurDivisor();
+    if (full == nullptr || scale <= 1)
+      return nullptr;
+    const auto* fd = full->Desc();
+    const UINT w = std::max<UINT>(1u, (fd->Width + scale - 1) / scale);
+    const UINT h = std::max<UINT>(1u, (fd->Height + scale - 1) / scale);
+    auto it = m_bmvrGrSmall.find(full);
+    if (it != m_bmvrGrSmall.end()) {
+      const auto* sd = it->second->GetCommonTexture()->Desc();
+      if (sd->Width == w && sd->Height == h && sd->Format == fd->Format)
+        return it->second.ptr();
+      if (!create)
+        return nullptr;
+      m_bmvrGrSmall.erase(it);
+    }
+    if (!create)
+      return nullptr;
+    if (m_bmvrGrSmall.size() >= 8)
+      m_bmvrGrSmall.clear();   // stale entries (map changes)
+    IDirect3DTexture9* t = nullptr;
+    if (FAILED(CreateTexture(w, h, 1, D3DUSAGE_RENDERTARGET, D3DFORMAT(fd->Format), D3DPOOL_DEFAULT, &t, nullptr)) || !t) {
+      bmvr::Log("God rays: blur stand-in %ux%u could not be created, full size kept", w, h);
+      return nullptr;
+    }
+    Com<D3D9Texture2D, false> smallTex = static_cast<D3D9Texture2D*>(t);
+    t->Release();
+    if (!m_bmvrGrSmallLogged) {
+      m_bmvrGrSmallLogged = true;
+      bmvr::Log("God rays: blur at 1/%d size (%ux%u instead of %ux%u)", scale, w, h, fd->Width, fd->Height);
+    }
+    D3D9Texture2D* ptr = smallTex.ptr();
+    m_bmvrGrSmall.emplace(full, std::move(smallTex));
+    return ptr;
+  }
+
+  bool D3D9DeviceEx::BmvrGodRayBegin(BmvrGodRaySaved& saved) {
+    auto* vs = m_state.vertexShader.ptr();
+    auto* ps = m_state.pixelShader.ptr();
+    if (likely((!vs || !vs->bmvrGrMask) && (!ps || (!ps->bmvrGrBlur && !ps->bmvrGrFinal))))
+      return false;
+    const int eye = bmvr::CurrentDrawEye();
+    static std::atomic<int> s_seen{0};
+    if (s_seen.fetch_add(1) < 6)
+      bmvr::Log("God rays: %s draw, eye %d, light depth %.6f",
+        (ps && ps->bmvrGrBlur) ? "blur" : (ps && ps->bmvrGrFinal) ? "final" : "mask", eye,
+        m_state.vsConsts->fConsts[27].data[2]);
+    bool any = false;
+    if (ps && (ps->bmvrGrBlur || ps->bmvrGrFinal)) {
+      if (ps->bmvrGrBlur)
+        bmvr::GodRayNoteBlur(eye, m_state.psConsts->fConsts[10].data);
+      // GodRayBlurScale: the blur writes our smaller target; anything that
+      // samples a blur result (final pass, a second blur pass) reads it,
+      // filtered linearly.
+      if (bmvr::GodRayBlurDivisor() > 1) {
+        for (DWORD i = 0; i < 4; i++) {
+          IDirect3DBaseTexture9* t = m_state.textures[i];
+          if (t == nullptr || t->GetType() != D3DRTYPE_TEXTURE)
+            continue;
+          D3D9Texture2D* smallTex = BmvrGodRaySmallBlur(GetCommonTexture(t), false);
+          if (smallTex == nullptr)
+            continue;
+          const DWORD st = RemapSamplerState(i);
+          saved.tex[i] = t;
+          saved.filter[i][0] = m_state.samplerStates[st][D3DSAMP_MINFILTER];
+          saved.filter[i][1] = m_state.samplerStates[st][D3DSAMP_MAGFILTER];
+          saved.filter[i][2] = m_state.samplerStates[st][D3DSAMP_MIPFILTER];
+          saved.texSwapped |= 1u << i;
+          SetStateTexture(st, smallTex);
+          SetStateSamplerState(st, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
+          SetStateSamplerState(st, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+          SetStateSamplerState(st, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
+          any = true;
+        }
+        if (ps->bmvrGrBlur && m_state.renderTargets[0] != nullptr) {
+          D3D9Surface* rt = m_state.renderTargets[0].ptr();
+          D3D9Texture2D* smallTex = BmvrGodRaySmallBlur(GetCommonTexture(rt), true);
+          IDirect3DSurface9* surf = nullptr;
+          if (smallTex != nullptr && SUCCEEDED(smallTex->GetSurfaceLevel(0, &surf)) && surf) {
+            saved.rt0 = rt;
+            saved.viewport = m_state.viewport;
+            saved.scissor = m_state.scissorRect;
+            saved.rtSwapped = true;
+            SetRenderTargetInternal(0, surf);
+            surf->Release();
+            any = true;
+          }
+        }
+      }
+      return any;
+    }
+    if (!bmvr::g_GodRayRadialMask || m_bmvrGrMaskPsFailed)
+      return false;
+    const auto& pc = m_state.psConsts->fConsts;
+    float m[16];
+    for (uint32_t r = 0; r < 4; r++)
+      std::memcpy(m + r * 4, pc[52 + r].data, sizeof(float) * 4);
+    float c[12] = {};
+    if (bmvr::g_GodRayLog >= 1.f)
+      bmvr::Log("God rays trace: mask state zenable %u zfunc %u zwrite %u vp minz %.4f maxz %.4f clipping %u",
+        unsigned(m_state.renderStates[D3DRS_ZENABLE]), unsigned(m_state.renderStates[D3DRS_ZFUNC]),
+        unsigned(m_state.renderStates[D3DRS_ZWRITEENABLE]), m_state.viewport.MinZ, m_state.viewport.MaxZ,
+        unsigned(m_state.renderStates[D3DRS_CLIPPING]));
+    // c106.xy = 1 / target size for the replacement PS (pixel -> NDC).
+    c[8] = m_state.viewport.Width ? 1.f / float(m_state.viewport.Width) : 0.f;
+    c[9] = m_state.viewport.Height ? 1.f / float(m_state.viewport.Height) : 0.f;
+    if (!bmvr::GodRayMaskConstants(eye, m_state.vsConsts->fConsts[27].data[2], pc[51].data, m, c))
+      return false;
+    if (m_bmvrGrMaskPs == nullptr) {
+      size_t n = 0;
+      const uint32_t* code = bmvr::GodRayMaskPs(&n);
+      IDirect3DPixelShader9* created = nullptr;
+      if (FAILED(CreatePixelShader(reinterpret_cast<const DWORD*>(code), &created)) || !created) {
+        m_bmvrGrMaskPsFailed = true;
+        bmvr::Log("God rays: radial mask shader (%u tokens) rejected, stock mask kept", unsigned(n));
+        return false;
+      }
+      m_bmvrGrMaskPs = static_cast<D3D9PixelShader*>(created);
+      created->Release();
+    }
+    saved.ps = ps;
+    saved.psSwapped = true;
+    SetPixelShader(m_bmvrGrMaskPs.ptr());
+    SetShaderConstants<DxsoProgramTypes::PixelShader, D3D9ConstantType::Float>(
+      bmvr::kGodRayConstReg, c, 3);
+    return true;
+  }
+
+  void D3D9DeviceEx::BmvrGodRayEnd(BmvrGodRaySaved& saved) {
+    if (saved.psSwapped)
+      SetPixelShader(saved.ps.ptr());
+    if (saved.rtSwapped) {
+      SetRenderTargetInternal(0, saved.rt0.ptr());
+      SetViewport(&saved.viewport);
+      SetScissorRect(&saved.scissor);
+    }
+    for (DWORD i = 0; i < 4; i++) {
+      if (!(saved.texSwapped & (1u << i)))
+        continue;
+      const DWORD st = RemapSamplerState(i);
+      SetStateTexture(st, saved.tex[i]);
+      SetStateSamplerState(st, D3DSAMP_MINFILTER, saved.filter[i][0]);
+      SetStateSamplerState(st, D3DSAMP_MAGFILTER, saved.filter[i][1]);
+      SetStateSamplerState(st, D3DSAMP_MIPFILTER, saved.filter[i][2]);
+    }
+    saved = BmvrGodRaySaved();
+  }
+
   namespace {
     struct BmvrViewProjNormalScope {
       D3D9DeviceEx* dev;
       bool on;
       bool particle;
+      bool godRay;
       float saved[12];
       float particleSaved[28];
+      D3D9DeviceEx::BmvrGodRaySaved godRaySaved;
       explicit BmvrViewProjNormalScope(D3D9DeviceEx* d) : dev(d) {
         on = dev->BmvrViewProjNormalsBegin(saved);
         particle = dev->BmvrParticleLevelBegin(particleSaved);
+        godRay = dev->BmvrGodRayBegin(godRaySaved);
       }
       ~BmvrViewProjNormalScope() {
+        if (godRay) dev->BmvrGodRayEnd(godRaySaved);
         if (particle) dev->BmvrParticleLevelEnd(particleSaved);
         if (on) dev->BmvrViewProjNormalsEnd(saved);
       }
@@ -5334,6 +5488,9 @@ namespace dxvk {
       module,
       pFunction,
       bytecodeLength);
+    vs->bmvrGrMask = bmvr::GodRayIsMaskVs(reinterpret_cast<const uint32_t*>(pFunction));
+    if (vs->bmvrGrMask)
+      bmvr::Log("God rays: mask VS %p (quad at the light's depth)", (void*)vs);
     if (!bmvrCode.empty()) {
       vs->bmvrViewProjNormals = true;
       bmvr::Log("ViewProjNormalFix: VS %p turns normals with cViewProj (%u dp3 sources -> c%u-c%u)",
@@ -5711,21 +5868,45 @@ namespace dxvk {
     DxsoModuleInfo moduleInfo;
     moduleInfo.options = m_dxsoOptions;
 
+    // BMVR: Xen global fog noise from world position (src/vr_xen_fog.cpp).
+    std::vector<uint32_t> bmvrPatched;
+    const bmvr::XenFogShader bmvrFog = bmvr::XenFogPatchPixelShader(
+      reinterpret_cast<const uint32_t*>(pFunction), bmvrPatched);
+    bool bmvrUsePatch = bmvrFog == bmvr::XenFogShader::Patched;
+    const DWORD* function = bmvrUsePatch
+      ? reinterpret_cast<const DWORD*>(bmvrPatched.data()) : pFunction;
+
     D3D9CommonShader module;
     uint32_t bytecodeLength;
 
     if (FAILED(this->CreateShaderModule(&module,
       &bytecodeLength,
       VK_SHADER_STAGE_FRAGMENT_BIT,
-      pFunction,
-      &moduleInfo)))
-      return D3DERR_INVALIDCALL;
+      function,
+      &moduleInfo))) {
+      if (!bmvrUsePatch)
+        return D3DERR_INVALIDCALL;
+      // BMVR: never lose the game's shader over the patch.
+      bmvr::XenFogPatchFailed(uint32_t(bmvrPatched.size() * 4));
+      bmvrUsePatch = false;
+      function = pFunction;
+      if (FAILED(this->CreateShaderModule(&module,
+        &bytecodeLength,
+        VK_SHADER_STAGE_FRAGMENT_BIT,
+        function,
+        &moduleInfo)))
+        return D3DERR_INVALIDCALL;
+    }
 
-    *ppShader = ref(new D3D9PixelShader(this,
+    auto* shader = new D3D9PixelShader(this,
       &m_shaderAllocator,
       module,
-      pFunction,
-      bytecodeLength));
+      function,
+      bytecodeLength);
+    shader->bmvrXenFog = bmvrUsePatch;
+    shader->bmvrGrBlur = bmvr::GodRayIsBlurPs(reinterpret_cast<const uint32_t*>(pFunction));
+    shader->bmvrGrFinal = bmvr::GodRayIsFinalPs(reinterpret_cast<const uint32_t*>(pFunction));
+    *ppShader = ref(shader);
 
     return D3D_OK;
   }
@@ -5738,6 +5919,17 @@ namespace dxvk {
 
     if (unlikely(ShouldRecord()))
       return m_recorder->SetPixelShader(shader);
+
+    // BMVR: the patched Xen fog shader reads its noise mode + anchor from c100/c101.
+    if (unlikely(shader != nullptr && shader->bmvrXenFog)) {
+      float c[8];
+      bmvr::XenFogShaderConstant(c);
+      SetShaderConstants<DxsoProgramTypes::PixelShader, D3D9ConstantType::Float>(
+        bmvr::kXenFogConstReg, c, bmvr::kXenFogConstCount);
+      const BOOL world = bmvr::XenFogWorldLookups() ? TRUE : FALSE;
+      SetShaderConstants<DxsoProgramTypes::PixelShader, D3D9ConstantType::Bool>(
+        bmvr::kXenFogBoolReg, &world, 1);
+    }
 
     if (shader == m_state.pixelShader.ptr())
       return D3D_OK;

@@ -293,15 +293,25 @@ namespace bmvr
     extern float g_HandHudSide;
     extern float g_HandHudTilt;
     extern float g_HandHudRoll;
-    // World-space aim reticle at the controller firing ray. Off by default;
-    // VrCrosshair=true in config.txt turns it on.
-    extern bool g_VrCrosshair;
-    // Reticle size multiplier, for players who want it smaller or bolder.
+    // Aim marker preset (AimMarker, user 2026-11-27): 0 = off, 1 = red dot only
+    // on guns without sights (tau, gluon, unscoped crossbow), 2 = red dot
+    // (default), 3 = red dot + laser beam from the gun to where it points.
+    // Replaces the VrCrosshair / VrLaserBeam switches (still read once as a
+    // migration when AimMarker is missing).
+    extern float g_AimMarker;
+    // Dim "0" backing digits on the wrist HUD (HudLeadingZeros, TESTS row, user 2026-11-27:
+    // "006" rockets looks lame): 0 = shown everywhere, 1 = off on ammo, 2 = off on ammo + health.
+    extern float g_HudLeadingZeros;
+    inline int AimMarkerMode()
+    {
+        const int m = static_cast<int>(g_AimMarker + 0.5f);
+        return m < 0 ? 0 : (m > 3 ? 3 : m);
+    }
+    inline bool AimLaserBeamOn() { return AimMarkerMode() == 3; }
+    // Reticle size multiplier (panel developer row "Red dot size").
     extern float g_VrCrosshairScale;
-    // Reticle drawn as a red laser dot instead of the amber ticks.
+    // Reticle drawn as a red laser dot; false (config.txt only) = the amber ticks.
     extern bool g_VrCrosshairDot;
-    // Thin red beam from the gun along the firing ray to where it lands.
-    extern bool g_VrLaserBeam;
     // Beam half width in game units (1 unit ~ 2.5 cm).
     extern float g_VrLaserWidth;
     // Moves the beam start along the barrel (game units, + = forward).
@@ -309,6 +319,22 @@ namespace bmvr
     // AimDebug=true: per shot, log the server bullet origin/direction and its
     // traced hit next to the reticle ray and hit (bmvr_log "AimDebug").
     extern bool g_AimDebug;
+    // AimHitLog=true (Debug tab "Log what the laser hits"): on every trigger
+    // press, one bmvr_log "AimHit" line with what the laser/bullet ray hit
+    // (class, model, surface, contents, distance) and the same aim traced from
+    // the eye, to tell clip brushes and prop hulls from the muzzle sitting lower.
+    extern bool g_AimHitLog;
+    // HandSyncLog=true (Debug tab "Log hand/gun sync"): per stereo pair, how
+    // far the gun viewmodel's controller pose (CalcViewModelView) is from the
+    // pose the ammo HUD / gloves draw with, and pairs where an eye drew no
+    // viewmodel while a weapon is held (bmvr_log "Hand sync"). User 2026-11-27:
+    // ammo HUD a frame ahead of the gun hand, gun hand missing for one frame
+    // in heavy scenes.
+    extern bool g_HandSyncLog;
+    // bmvr_sync_probe N: the next N eye draws log "SyncProbe" (eye, HUD hand,
+    // gun wrist, cuff-cap wrist, laser start in world units) for an offline
+    // frame-by-frame check of what each consumer draws (2026-11-27).
+    extern float g_SyncProbeEyes;
     // OffCenterTest=true (flat only, diagnostic): while VR/offcenter_test_on
     // exists, the main view renders the PSVR2 left-eye off-centre subrect
     // (left 0, right 0.758 of the frustum) to check the engine's off-centre
@@ -327,6 +353,8 @@ namespace bmvr
     // "<TestDir>\VR\<leaf>" when BMVR_TESTDIR is set, else "VR\<leaf>"
     // (relative to the game folder, as before).
     std::string VrFilePath(const char* leaf);
+    // The mod log this process writes (<exe or TestDir>\bmvr_log.txt).
+    std::wstring LogFilePath();
     // VRRuntimeBackend=fake: the OpenXR helper path with an in-process fake
     // helper (scripted poses/buttons from VR\fake.txt, PSVR2 projection, no
     // SteamVR). See vr_fake_helper.cpp.
@@ -356,6 +384,8 @@ namespace bmvr
     extern unsigned long g_ScreenshotAt;     // VR panel "Screenshot": GetTickCount when to dump the eyes (0 = none)
     extern unsigned long g_SteamScreenshotAt; // gesture screenshot: GetTickCount when to send the right eye to Steam (0 = none)
     extern unsigned long g_DebugCaptureAt;   // VR panel "Capture debug frame": GetTickCount when to capture (0 = none)
+    extern unsigned long g_FogDumpAt;        // VR panel "Fog dump": GetTickCount of the next fog dump step (0 = none)
+    extern int g_FogDumpOverride;            // Fog dump: global Xen fog 0 = as set, 1 = drawn, 2 = hidden (not saved)
     extern bool g_FlareLog;              // VR panel DEBUG "Flare position log" / bmvr_flare_log / env BMVR_FLARE_LOG=1: log lens flare positions + visibility; each switch-on starts fresh line caps (not saved)
     extern bool g_FreezeHead;            // VR panel debug row / bmvr_freeze_head: game view keeps the head pose of the moment it was switched on (not saved)
     extern float g_DebugHideXog;         // VR panel debug row: skip Xen fog draws, 1 = global (__gbxog0), 2 = volumes, 3 = both (not saved)
@@ -657,9 +687,45 @@ namespace bmvr
     // identity model matrix around the draw. Both set identity view + projection but inherit the model
     // matrix; a leftover translation drew the warp / flares shifted for a whole launch (2026-11-17).
     extern bool g_ScreenSpaceModelFix;
-    // Black Mesa's global Xen fog pass (__gbxog0) is not drawn in VR: view-direction noise at infinite stereo
-    // depth, also inside rooms where flat shows none. Local fog volumes stay.
+    // Debug (not saved): identity MODEL matrix before each eye pass. Some launches draw world brushes
+    // with a leftover model translation of (+1,+1,0) (2026-11-26: lobby walls ~2.5 cm off doors/props;
+    // Capture debug frame logs "audit world model"); this repairs it headless. A/B row for bad launches.
+    extern bool g_DebugModelReset;
+    // World model leak fix (bmvr_world_model_fix, default on): the VS constant hook sees the leftover
+    // (+1,+1,0) model rows being uploaded (g_ModelLeakSeen set); the next eye pass then loads an identity
+    // MODEL matrix once. A launch without the leak never triggers it.
+    extern bool g_WorldModelFix;
+    extern volatile long g_ModelLeakSeen;
+    // true = Black Mesa's global Xen fog pass (__gbxog0) is not drawn in VR. Default false since its noise is
+    // looked up per world position / centre eye (g_XenFogNoiseMode Auto, vr_xen_fog.cpp); stock noise was by view
+    // direction = infinite stereo depth. Local fog volumes are drawn either way.
     extern bool g_XenGlobalFogOff;
+    // Xen fog stereo fix (src/vr_xen_fog.cpp), XenFogNoise: 0 stock (each
+    // eye's view direction, noise at infinity), 1 direction from the centre eye
+    // (stock look, on the surfaces in stereo; default), 2 fixed to the world
+    // with XenFogNoiseSize units per repeat, 3 Auto (default, user
+    // 2026-11-27): world up to XenFogWorldNear units from the centre eye,
+    // centre-eye direction from XenFogWorldFar on, faded between. Live, Debug
+    // FIXES rows.
+    extern float g_XenFogNoiseMode;
+    // God rays (GodRayRadialMask, default on): mask depth tested as if the head
+    // looked level toward the light (src/vr_godrays.h). false = stock depth
+    // along the view axis (rays come and go with head pitch).
+    extern bool g_GodRayRadialMask;
+    // God rays blur size (GodRayBlurScale): 0 full (stock), 1 half, 2 quarter
+    // (src/vr_godrays.h GodRayBlurDivisor).
+    extern float g_GodRayBlurScale;
+    // Debug (not saved, cvar bmvr_godray_log): log this many god ray blur/mask
+    // draws (eye, light index, screen position, mask constants), then stop.
+    extern float g_GodRayLog;
+    // Debug A/B (not saved): god ray taps, 0 = the game's (the menus force
+    // np_gr_quality_sample_count 3 = 64), 1 = 32, 2 = 16. Applied only while a
+    // level is loaded; the game's value goes back on level shutdown so the
+    // archived cvar never reaches config.cfg (vr_settings_panel.cpp).
+    extern float g_GodRaySamples;
+    extern float g_XenFogNoiseSize;
+    extern float g_XenFogWorldNear;
+    extern float g_XenFogWorldFar;
     extern bool g_FlareEyeAxis;
     // Lens flare layers are turned so their streaks stay level with the world
     // horizon at the light, not with the eye's image (which rolls with the head).
@@ -702,6 +768,10 @@ namespace bmvr
     // only values that differ from it, so a later default change reaches players
     // who never touched that setting.
     void CapturePanelDefaults();
+    // Header of VR/config.txt as the mod writes it (new file, or once over the
+    // full file older releases shipped). The marker line says it is done.
+    const char* UserConfigHeader();
+    const char* UserConfigHeaderMarker();
     // Debug capture: the VR panel's switches and engine settings as bm-scenario
     // "cmd" lines (bmvr_* cvars, engine cvars), so a headless restore runs with
     // exactly the session's settings. Game thread (reads engine cvars).
@@ -818,6 +888,10 @@ namespace bmvr
     // Config VrGmanThumbCurl / VrGmanThumbSwing, cvars bmvr_gman_thumb_curl / _swing.
     extern float g_VrGmanThumbCurl;
     extern float g_VrGmanThumbSwing;
+    // Gesture middle finger turned about its own length, degrees (same visual
+    // direction on both hands; Black Mesa gloves). Config VrGmanFingerTwist,
+    // cvar bmvr_gman_finger_twist, dev row G-MAN GESTURE TUNING.
+    extern float g_VrGmanFingerTwistDeg;
     // Test aid (cvar bmvr_gman_gesture_force, not saved): gesture on without a G-Man in view.
     extern bool g_VrGmanGestureForce;
     // L4D2VR BuildControllerWorld local translation (meters, before model
@@ -878,8 +952,8 @@ namespace bmvr
     extern float g_VrPinchThumb;
     extern float g_VrPinchIndex;
     extern bool g_VrPinchForce;
-    // "Physical weapons (beta)" master switch (VR panel HANDS & WEAPONS, off by
-    // default = the stable release's gun handling). The rows under it
+    // "Physical weapons" master switch (VR panel HANDS & WEAPONS; on by default
+    // since 2026-11-26, off = button reloads as in older releases). The rows under it
     // (manual reloads, grenade pin, support hand pose and
     // lock, satchel detonator in the hand, snark hand throw, recoil) only act
     // while it is on; read them through PhysicalWeapon().
@@ -890,9 +964,10 @@ namespace bmvr
     // Frag grenade: pull the pin with the left hand before it can be thrown
     // (only with VrMagReload on). On by default.
     extern bool g_VrGrenadePin;
-    // Small "PUMP IT" / "PULL THE CHARGING HANDLE" toasts on a dead trigger
-    // (twice each per game start). On by default.
-    extern bool g_VrReloadHints;
+    // Small usage hints (VR::ShowUsageHint): reload steps ("PUMP IT"), and the
+    // first two carried props / mounted guns of a game start. On by default.
+    // config.txt key VrUsageHints (old VrReloadHints migrated at startup).
+    extern bool g_VrUsageHints;
     // Left glove takes Black Mesa's own reload-clip hand pose on a held magazine, the MP5 bolt
     // and the glock slide (vr_clip_hand_poses.h); the magazine sits where that hand holds it.
     extern bool g_VrClipHandPose;
@@ -931,6 +1006,14 @@ namespace bmvr
     // the duck is a physical one. Off by default.
     extern bool g_PhysicalCrouch;
     extern float g_PhysicalCrouchDropCm;
+    // Roomscale (beta): the player's body walks after the real head once the
+    // head is more than RoomscaleDeadzoneCm from it (engine movement, so
+    // walls and steps apply); the view stays within that distance + 10 cm of
+    // the body, so walking into a wall does not put the head through it.
+    // Turns pivot around the head. On by default.
+    extern bool g_Roomscale;
+    extern float g_RoomscaleDeadzoneCm;
+    extern int g_RoomscaleTrace;   // config RoomscaleTrace=N: log N follow steps (tests)
     // VR panel DEBUG "HELD WEAPON ANGLE": pitch/yaw/roll (degrees) of the held
     // weapon, on top of the built-in table; live, saved per weapon in
     // VR/viewmodel_offsets.txt (ax ay az), not in config.txt.
@@ -972,6 +1055,11 @@ namespace bmvr
     // gun) / up in game units, tilt / turn / roll in degrees, size in game units
     // (2 = the old fixed size). Live, saved per weapon in VR/ammo_hud.txt.
     extern float g_AmmoHudForward, g_AmmoHudSide, g_AmmoHudUp, g_AmmoHudTilt, g_AmmoHudTurn, g_AmmoHudRoll, g_AmmoHudSize;
+    // Health/HEV panel next to the ammo panel while the gun is held with both hands (HudHealthOnGun),
+    // in the ammo panel's plane: 0 above, 1 left, 2 right, 3 below. Saved per weapon (VR/ammo_hud.txt).
+    extern float g_AmmoHudHealthSide;
+    // Extra space between that health panel and the ammo panel, in panel widths (per weapon, 10th column).
+    extern float g_AmmoHudHealthGap;
     // Panel row `f` is one of the ammo HUD rows: `def` = its built-in value
     // for the weapon in the hand (what "Reset tab" puts back).
     bool AmmoHudRowDefault(const float* f, float& def);

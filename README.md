@@ -24,29 +24,35 @@ A macOS version lives here: https://github.com/armax9/black-mesa-vr-macos
 - **Two-handed weapons:** put your off-hand on the forend of a rifle, shotgun, MP5, crossbow and so on and hold grip;
   the glove sits on the gun and steadies it. Hands & Weapons tab, Weapon grip: **Toggle grip** (squeeze once to hold,
   again to let go) and **Grip area scale** (a bigger zone if the gun is hard to take).
-- **Manual reloads (beta, optional):** pull the magazine, take a new one from your hip and seat it, rack the slide or
-  bolt, load shotgun shells one by one. Hands & Weapons > Physical weapons; off = reload with a button.
+- **Manual reloads:** pull the magazine, take a new one from your hip and seat it, rack the slide or bolt, load
+  shotgun shells one by one. On by default; Hands & Weapons > Physical weapons off = reload with a button.
 - **Grab gestures:** a hand behind a shoulder, at a hip or (left hand) at the forehead + grip. Each zone has a setting
   per hand: the right hand draws a weapon (default: right shoulder crowbar, right hip pistol, above the left hip MP5;
   "Dynamic" zones keep what you put away there), the left hand does an action (quick save, flashlight, ammo, quick
   load, screenshot into the Steam library, recenter; default: left shoulder quick save, left hip ammo, forehead flashlight).
 - **Crowbar swinging** that hits where you swing (HL2VR style).
-- **HL2VR-style weapon wheel**, with the VR settings gear below the crowbar.
+- **HL2VR-style weapon wheel** (the VR settings gear below the crowbar is optional, General > This panel).
 - **Grenades thrown at the speed of your hand.**
 - **Crossbow scope built for VR:** bring the crossbow to your face with both hands to zoom; the zoomed view follows the
   crossbow, with smoothing for hand tremor.
 - **Mounted guns** (50 cal, TOW) you steer with your hands.
 - **Ladders that work in VR:** push the stick roughly towards a ladder to get on, also while swimming; no need to
-  face it exactly as the game normally wants. Or turn on **Physical ladders** (beta, General tab) and climb hand over
-  hand by the rungs.
+  face it exactly as the game normally wants. With **Physical ladders** (General tab, on by default) you climb hand
+  over hand by the rungs.
 - **Per-hand item holding and use.**
+- **Gun, hands, HUD and laser locked together:** all drawn from one tracking sample for both eyes, so nothing jitters
+  or lags behind in heavy scenes or fast moves.
 - **Health, suit and ammo on your hands**, an ammo counter on the weapon, and a **short red flash over the view when
   you get hit**.
-- **Aim marker and laser:** red laser dot, laser beam with adjustable width, or the classic amber ticks; all optional.
+- **Usage hints:** short messages the first times you carry a prop or take a mounted gun, naming your own alt-fire
+  button, and when a reload step is missing ("PUMP IT"). General tab > Usage hints.
+- **Aim marker and laser:** one preset: off, a red dot only on guns without sights (tau, gluon, crossbow), a red dot (default), or a red dot with a laser beam.
 - **Flashlight** on the right grip, optionally in the left hand or on the left Square/X button.
 - Snap or smooth turning, crouch while held or toggle, sprint toggle, recenter. Cutscene cameras can take your view
   with them as the scene was made; turn that off if it is too much for your VR legs.
 - **Physical crouching** (optional, General tab): crouch in real life to crouch in the game.
+- **Roomscale (beta, on by default):** walk around your play space and your body follows your head, also on trains
+  and trams. General > View.
 - **Subtitles / closed captions** below your view when they are on in the game's audio options; height and size in
   General > View.
 - **Bare hands until you get the HEV suit** (and throughout Blue Shift), HEV gloves after that.
@@ -64,14 +70,16 @@ A macOS version lives here: https://github.com/armax9/black-mesa-vr-macos
 - **FXAA tuned for VR**, with Sharp / Balanced / Smooth presets.
 - **Less shimmer:** calmer cubemap reflections on shiny walls and floors (Full / Balanced / Subtle), lens flares,
   light glows and smoke that stay level and agree between the eyes.
+- **God rays made for VR:** the blur runs at quarter size (blur 0.80 -> 0.17 ms per frame, same look), and the shafts
+  stay steady when you look up or down.
 - **MulticoreMode:** the game's render thread runs next to the game, and heavy outdoor areas keep a much higher
   frame rate than before.
 - Many fixes for things that only break in VR: water and mirror reflections per eye, objects popping in one eye,
   glows shining through walls, Xen fog, and more.
 
 ### The VR settings panel
-**Hold Triangle/Y** (about half a second) or pick the gear in the weapon wheel. Six tabs:
-- **General:** turning, ladders, view, menus.
+**Hold Triangle/Y** (about half a second) or click **VR SETTINGS** on the pause menu. Six tabs:
+- **General:** turning, ladders, view, usage hints, menus.
 
   <img src="docs/images/panel-general.jpg" alt="VR settings: General tab" width="90%">
 
@@ -127,8 +135,9 @@ defaults reach you with each update.
      world upside-down.
 7. Launch Black Mesa from Steam. `bmvr_log.txt` next to `bms.exe` should appear and start with `BMVR d3d9.dll loaded`.
 
-**Updating:** copy the new zip over the old install the same way. Keep your `VR\config.txt` unless the release notes
-say otherwise; it only holds what you changed.
+**Updating:** copy the new zip over the old install the same way. The zip has no `VR\config.txt`, so your settings
+are kept: that file holds only what you changed. Installs from before 2026-11-26 get it cleaned up once on the first
+start (old shipped defaults and comments removed, your own changes kept, the old file saved as `VR\config.txt.bak`).
 
 **Uninstall:** quit the game, then in the Black Mesa folder delete `d3d9.dll`, `BMVR_README.txt`, `bmvr_*` files,
 the `VR\` folder, `bin\d3d9.dll`, `bms\cfg\bmvr.cfg` and `bms\sound\bmvr\` (same under `bshift\` if you played Blue
@@ -159,7 +168,8 @@ keeps bare hands for the whole campaign, and the weapon wheel and wrist HUD turn
 
 ### In `VR\config.txt` (not in the panel)
 A few settings can only be changed in this file, because they set up the eye images when the game starts.
-**Quit the game fully before you edit it**; it is read once at launch.
+**Quit the game fully before you edit it**; it is read once at launch. No `VR\config.txt` yet: create it (plain
+text, one `Key=value` per line).
 
 | Setting | Default | What it does |
 |---|---|---|
@@ -173,7 +183,7 @@ A few settings can only be changed in this file, because they set up the eye ima
 | `IPDScale` | `1.0` | Stereo depth strength (0.8–1.2): multiplies the eye separation your headset reports. Higher = more depth and a smaller-feeling world. Leave it at 1.0; it does not change movement or hand scale, and it is not the place to fix your headset's IPD. |
 | `HeightOffset` | `0.0` | Player height in cm (+ = taller; also in the VR panel, General > View). |
 
-The file explains every setting in comments.
+`VR\config.example.txt` lists these and more settings with explanations; it is never read itself.
 
 ## Known issues
 - **Thin lit objects stay jagged even with MSAA 4x** (railings, thin bars). Black Mesa lights the scene in a separate

@@ -21,6 +21,7 @@
 #include "openxr_helper_bridge.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -71,7 +72,8 @@ namespace
     // Toggle console commands (god, noclip, notarget): "cmd:" rows send the
     // command on every click and are never saved. Noclip is read back from
     // the player's move type; god/notarget live only in server flags, so
-    // their rows show what the panel last set this run.
+    // their rows show what the panel last set since the last map/save load
+    // (ResetDevCheatRows).
     bool g_DevGod = false;
     bool g_DevNoclip = false;
     bool g_DevNotarget = false;
@@ -131,8 +133,8 @@ namespace
             { "Snap angle", RowKind::Number, "SnapTurnAngle", nullptr, &bmvr::g_SnapTurnAngle, 15.f, 15.f, 90.f, "%.0f\xB0" },
             { "Smooth turn speed", RowKind::Number, "TurnSpeed", nullptr, &bmvr::g_TurnSpeed, 0.05f, 0.05f, 1.f, "%.2f" },
             // Off = stick ladders as in the stable release; the rows below only act while it is on.
-            { "PHYSICAL LADDERS (BETA)", RowKind::Section, nullptr, nullptr, nullptr, 0, 0, 0, nullptr },
-            { "Physical ladders (beta)", RowKind::Toggle, "PhysicalLadders", &bmvr::g_PhysicalLadders, nullptr, 0, 0, 0, nullptr },
+            { "PHYSICAL LADDERS", RowKind::Section, nullptr, nullptr, nullptr, 0, 0, 0, nullptr },
+            { "Physical ladders", RowKind::Toggle, "PhysicalLadders", &bmvr::g_PhysicalLadders, nullptr, 0, 0, 0, nullptr },
             { "Ladder distance follows arms", RowKind::Toggle, "LadderBodyFollowsArms", &bmvr::g_LadderBodyFollowsArms, nullptr, 0, 0, 0, nullptr },
             { "Centre on the ladder", RowKind::Toggle, "LadderCentreHead", &bmvr::g_LadderCentreHead, nullptr, 0, 0, 0, nullptr },
             { "Gun hand on ladders", RowKind::Choice, "LadderGunHand", nullptr, &bmvr::g_LadderGunHand, 1.f, 0.f, 2.f, "Holster + draw again|Needs empty hand|Holster only" },
@@ -144,6 +146,9 @@ namespace
             { "Physical crouching", RowKind::Toggle, "PhysicalCrouch", &bmvr::g_PhysicalCrouch, nullptr, 0, 0, 0, nullptr },
             { "Head drop to crouch", RowKind::Number, "PhysicalCrouchDropCm", nullptr, &bmvr::g_PhysicalCrouchDropCm, 5.f, 15.f, 80.f, "%.0f cm" },
             { "VIEW", RowKind::Section, nullptr, nullptr, nullptr, 0, 0, 0, nullptr },
+            // Body walks after the real head past the deadzone; view kept near the body (VR::RoomscaleWish/RoomscaleFollow).
+            { "Roomscale (beta)", RowKind::Toggle, "Roomscale", &bmvr::g_Roomscale, nullptr, 0, 0, 0, nullptr },
+            { "Body follows head past", RowKind::Number, "RoomscaleDeadzoneCm", nullptr, &bmvr::g_RoomscaleDeadzoneCm, 1.f, 5.f, 40.f, "%.0f cm" },
             { "Recenter after pause menu", RowKind::Toggle, "AutoRecenterOnResume", &bmvr::g_AutoRecenterOnResume, nullptr, 0, 0, 0, nullptr },
             { "Cutscene cameras move the view", RowKind::Toggle, "FollowScriptedCamera", &bmvr::g_FollowScriptedCamera, nullptr, 0, 0, 0, nullptr },
             // Main + pause menu at the room's front (STAGE forward) instead of the head (user 2026-11-24: off by default).
@@ -153,6 +158,8 @@ namespace
             // Subtitles / closed captions (turn them on in the game's audio options).
             { "Subtitle height", RowKind::Number, "CaptionHeight", nullptr, &bmvr::g_CaptionHeightDeg, 1.f, -30.f, 30.f, "%+.0f\xB0" },
             { "Subtitle size", RowKind::Number, "CaptionScale", nullptr, &bmvr::g_CaptionScale, 0.05f, 0.5f, 2.f, "%.2fx" },
+            // Small toasts: reload steps, first carried prop / mounted gun (VR::ShowUsageHint).
+            { "Usage hints", RowKind::Toggle, "VrUsageHints", &bmvr::g_VrUsageHints, nullptr, 0, 0, 0, nullptr },
             { "Near clip (7 = game)", RowKind::Number, "VrNearZ", nullptr, &bmvr::g_VrNearZ, 0.5f, 1.f, 7.f, "%.1f" },
             // No key/fmt: the button's default action is a recenter (closes the panel).
             { "Recenter", RowKind::Button, nullptr, nullptr, nullptr, 0, 0, 0, nullptr },
@@ -199,10 +206,10 @@ namespace
             { "Toggle grip auto release", RowKind::Toggle, "TwoHandToggleAutoRelease", &bmvr::g_TwoHandToggleAutoRelease, nullptr, 0, 0, 0, nullptr },
             { "Grip area scale", RowKind::Number, "TwoHandGripScale", nullptr, &bmvr::g_TwoHandGripScale, 0.1f, 0.5f, 2.f, "%.1fx" },
             { "AIMING", RowKind::Section, nullptr, nullptr, nullptr, 0, 0, 0, nullptr },
-            { "Aim marker", RowKind::Toggle, "VrCrosshair", &bmvr::g_VrCrosshair, nullptr, 0, 0, 0, nullptr },
-            { "Marker as red dot", RowKind::Toggle, "VrCrosshairDot", &bmvr::g_VrCrosshairDot, nullptr, 0, 0, 0, nullptr },
-            { "Marker size", RowKind::Number, "VrCrosshairScale", nullptr, &bmvr::g_VrCrosshairScale, 0.1f, 0.2f, 3.f, "%.1f" },
-            { "Laser beam", RowKind::Toggle, "VrLaserBeam", &bmvr::g_VrLaserBeam, nullptr, 0, 0, 0, nullptr },
+            // One preset for dot + beam (user 2026-11-27); "without sights" = tau, gluon,
+            // crossbow unscoped. Dot size and beam width are developer rows.
+            { "Aim marker", RowKind::Choice, "AimMarker", nullptr, &bmvr::g_AimMarker, 1.f, 0.f, 3.f, "Off|Guns without sights|Red dot|Dot + laser beam" },
+            { "Red dot size", RowKind::Number, "VrCrosshairScale", nullptr, &bmvr::g_VrCrosshairScale, 0.1f, 0.2f, 3.f, "%.1f" },
             { "Laser width", RowKind::Number, "VrLaserWidth", nullptr, &bmvr::g_VrLaserWidth, 0.01f, 0.01f, 0.3f, "%.2f" },
             { "Gun angle", RowKind::Number, "GunPitchOffset", nullptr, &bmvr::g_GunPitchOffset, 1.f, -45.f, 45.f, "%+.0f\xB0" },
             { "GRENADES", RowKind::DevSection, nullptr, nullptr, nullptr, 0, 0, 0, nullptr },
@@ -232,10 +239,9 @@ namespace
             // Off = the stable release's reloads; the rows below only act while it is on (manual
             // mag/shell/RPG reloads always, snarks thrown from the hand too). The support hand's
             // finger pose + lock and the satchel hands are always on (user 2026-11-19).
-            { "PHYSICAL WEAPONS (BETA)", RowKind::Section, nullptr, nullptr, nullptr, 0, 0, 0, nullptr },
-            { "Physical weapons (beta)", RowKind::Toggle, "PhysicalWeapons", &bmvr::g_PhysicalWeapons, nullptr, 0, 0, 0, nullptr },
+            { "PHYSICAL WEAPONS", RowKind::Section, nullptr, nullptr, nullptr, 0, 0, 0, nullptr },
+            { "Physical weapons", RowKind::Toggle, "PhysicalWeapons", &bmvr::g_PhysicalWeapons, nullptr, 0, 0, 0, nullptr },
             { "Ejected rounds are lost", RowKind::Toggle, "VrMagDiscard", &bmvr::g_VrMagDiscard, nullptr, 0, 0, 0, nullptr },
-            { "Reload hints", RowKind::Toggle, "VrReloadHints", &bmvr::g_VrReloadHints, nullptr, 0, 0, 0, nullptr },
             // Developer row: A/B for the hand poses taken from Black Mesa's reload clips.
             { "Hand pose from reload clips", RowKind::Toggle, "VrClipHandPose", &bmvr::g_VrClipHandPose, nullptr, 0, 0, 0, nullptr },
             { "Hand locks onto bolt/slide", RowKind::Toggle, "VrClipHandSnap", &bmvr::g_VrClipHandSnap, nullptr, 0, 0, 0, nullptr },
@@ -372,12 +378,23 @@ namespace
             // OF DATE" toast, debug-only ones (PerfLog stats, profiling) only show here.
             { "Missing hooks", RowKind::Info, nullptr, nullptr, nullptr, 0, 0, 0, "missing_hooks" },
             { "Capture debug frame", RowKind::Button, nullptr, nullptr, nullptr, 0, 0, 0, "debug_capture" },
+            // User 2026-11-26 (Xen ground fog through the floor in the research camp): a capture
+            // with the global Xen fog drawn + the same eyes without it (VR/fogdump-*).
+            { "Fog dump", RowKind::Button, nullptr, nullptr, nullptr, 0, 0, 0, "fog_dump" },
             { "Screenshot (eyes only)", RowKind::Button, nullptr, nullptr, nullptr, 0, 0, 0, "screenshot" },
             // Back (user 2026-11-20, Xen plant glow that follows the hand): 20 s of every
             // light glow's world position + brightness into VR/glowtrace-*.csv.
             { "Record glow trace (20 s)", RowKind::Button, nullptr, nullptr, nullptr, 0, 0, 0, "glow_trace" },
+            // Leftover MODEL matrix on world brushes (2026-11-26): A/B when walls look off doors/props. Not saved.
+            { "Reset model each eye", RowKind::Toggle, nullptr, &bmvr::g_DebugModelReset, nullptr, 0, 0, 0, nullptr },
             // One shot: the next Pause press saves 12 eye pairs + 12 menu layers (VR/pausecap-*).
             { "Capture next pause", RowKind::Toggle, nullptr, &bmvr::g_PauseCaptureArm, nullptr, 0, 0, 0, nullptr },
+            // User 2026-11-27 (laser stops in mid-air next to cover): per trigger press, what the
+            // shot ray hit + the same aim from the eye (bmvr_log "AimHit"). Saved, so it can stay on.
+            { "Log what the laser hits", RowKind::Toggle, "AimHitLog", &bmvr::g_AimHitLog, nullptr, 0, 0, 0, nullptr },
+            // User 2026-11-27 (ammo HUD a frame ahead of the gun hand, gun hand gone for a frame
+            // in heavy scenes): bmvr_log "Hand sync" lines + a 10 s summary. Saved.
+            { "Log hand/gun sync", RowKind::Toggle, "HandSyncLog", &bmvr::g_HandSyncLog, nullptr, 0, 0, 0, nullptr },
             { "Performance log (costs fps)", RowKind::Toggle, "PerfLog", &bmvr::g_PerfLog, nullptr, 0, 0, 0, nullptr },
             // Eye GPU ms every ~5 s (timestamp queries); with the always-on "Frame budget" CPU line it shows
             // whether a scene is CPU- or GPU-limited.
@@ -406,6 +423,8 @@ namespace
             // Experiments; saved like the other settings, off by default.
             { "TESTS", RowKind::DevSection, nullptr, nullptr, nullptr, 0, 0, 0, nullptr },
             { "Glow test area size", RowKind::Number, "GlowProxyScale", nullptr, &bmvr::g_GlowProxyScale, 0.5f, 1.f, 8.f, "%.1fx" },
+            // User 2026-11-27: "006" rockets; A/B the HUD without the dim leading zeros.
+            { "HUD leading zeros", RowKind::Choice, "HudLeadingZeros", nullptr, &bmvr::g_HudLeadingZeros, 1.f, 0.f, 2.f, "Shown|Off on ammo|Off on ammo + health" },
             { "RPG laser ring size", RowKind::Number, "VrRpgRingScale", nullptr, &bmvr::g_VrRpgRingScale, 0.05f, 0.1f, 3.f, "%.2fx" },
             // Grab-zone body frame (see "Grab zones follow the body" under FIXES).
             { "Body yaw: dead zone", RowKind::Number, "BodyYawDeadzoneDeg", nullptr, &bmvr::g_BodyYawDeadzoneDeg, 5.f, 0.f, 90.f, "%.0f\xB0" },
@@ -434,12 +453,23 @@ namespace
             // brings back the defaults.
             { "FIXES: RENDERING", RowKind::DevSection, nullptr, nullptr, nullptr, 0, 0, 0, nullptr },
             { "Glow queries per eye", RowKind::Toggle, nullptr, &bmvr::g_PixelVisPerEye, nullptr, 0, 0, 0, nullptr },
+            { "World model leak fix", RowKind::Toggle, "WorldModelFix", &bmvr::g_WorldModelFix, nullptr, 0, 0, 0, nullptr },
             { "Glow through objects fix", RowKind::Toggle, nullptr, &bmvr::g_GlowCountDepthFix, nullptr, 0, 0, 0, nullptr },
             { "Lights culled per eye", RowKind::Toggle, nullptr, &bmvr::g_LightCullEyeView, nullptr, 0, 0, 0, nullptr },
             { "Flares on each eye's axis", RowKind::Toggle, nullptr, &bmvr::g_FlareEyeAxis, nullptr, 0, 0, 0, nullptr },
             { "Sky water per eye", RowKind::Toggle, nullptr, &bmvr::g_SkyWaterPerEye, nullptr, 0, 0, 0, nullptr },
             { "Underwater world fix", RowKind::Toggle, nullptr, &bmvr::g_EyeUnderwaterWorld, nullptr, 0, 0, 0, nullptr },
             { "Xen ground fog off", RowKind::Toggle, nullptr, &bmvr::g_XenGlobalFogOff, nullptr, 0, 0, 0, nullptr },
+            // User 2026-11-27: fog noise was looked up by view direction (at infinity in stereo).
+            // Auto (user 2026-11-27): the lab floor needs World, far walls blotch with it.
+            { "Xen fog noise", RowKind::Choice, "XenFogNoise", nullptr, &bmvr::g_XenFogNoiseMode, 1.f, 0.f, 3.f, "Stock|Centre eye|World|Auto" },
+            { "Xen fog noise size", RowKind::Number, "XenFogNoiseSize", nullptr, &bmvr::g_XenFogNoiseSize, 32.f, 32.f, 2048.f, "%.0f u" },
+            { "Xen fog: world noise up to", RowKind::Number, "XenFogWorldNear", nullptr, &bmvr::g_XenFogWorldNear, 50.f, 0.f, 4000.f, "%.0f u" },
+            { "Xen fog: centre eye from", RowKind::Number, "XenFogWorldFar", nullptr, &bmvr::g_XenFogWorldFar, 100.f, 100.f, 8000.f, "%.0f u" },
+            // User 2026-11-27: god rays changed with head pitch (mask depth along the view axis).
+            { "God rays steady with head pitch", RowKind::Toggle, "GodRayRadialMask", &bmvr::g_GodRayRadialMask, nullptr, 0, 0, 0, nullptr },
+            { "God rays samples (test)", RowKind::Choice, nullptr, nullptr, &bmvr::g_GodRaySamples, 1.f, 0.f, 2.f, "Game|32|16" },
+            { "God rays blur size", RowKind::Choice, "GodRayBlurScale", nullptr, &bmvr::g_GodRayBlurScale, 1.f, 0.f, 2.f, "Full|Half|Quarter" },
             { "Particles after water", RowKind::Toggle, "ParticlesLast", &bmvr::g_ParticlesLast, nullptr, 0, 0, 0, nullptr },
             { "Titles glow + scanlines", RowKind::Toggle, nullptr, &bmvr::g_TitleGlow, nullptr, 0, 0, 0, nullptr },
             { "HEV boot-up HUD inset", RowKind::Number, nullptr, nullptr, &bmvr::g_BootHudInset, 25.f, 0.f, 500.f, "%.0f px" },
@@ -470,6 +500,10 @@ namespace
             { "Ammo HUD turn (front toward you)", RowKind::Number, nullptr, nullptr, &bmvr::g_AmmoHudTurn, 5.f, -115.f, 115.f, "%+.0f\xB0" },
             { "Ammo HUD roll", RowKind::Number, nullptr, nullptr, &bmvr::g_AmmoHudRoll, 5.f, -225.f, 225.f, "%+.0f\xB0" },
             { "Ammo HUD size", RowKind::Number, nullptr, nullptr, &bmvr::g_AmmoHudSize, 0.25f, 0.4f, 7.5f, "%.2f" },
+            // Where the health/HEV panel sits next to it with both hands on the gun
+            // (user 2026-11-27), in the ammo panel's plane.
+            { "Health HUD with two hands", RowKind::Choice, nullptr, nullptr, &bmvr::g_AmmoHudHealthSide, 1.f, 0.f, 3.f, "Above ammo|Left of ammo|Right of ammo|Below ammo" },
+            { "Health HUD gap", RowKind::Number, nullptr, nullptr, &bmvr::g_AmmoHudHealthGap, 0.05f, -1.f, 2.f, "%+.2f" },
             // A/B (user 2026-11-25): off = with both hands on a long gun the panel
             // stays on the gun's aim; on = the old gun-hand controller rotation.
             { "Two hands: ammo HUD follows hand", RowKind::Toggle, nullptr, &bmvr::g_TwoHandAmmoHudFollowsHand, nullptr, 0, 0, 0, nullptr },
@@ -483,6 +517,7 @@ namespace
             { "Finger straight", RowKind::Number, nullptr, nullptr, &bmvr::g_VrGmanFingerStraight, 0.05f, 0.f, 0.5f, "%.2f" },
             { "Thumb curl", RowKind::Number, nullptr, nullptr, &bmvr::g_VrGmanThumbCurl, 0.1f, 0.f, 2.f, "%.1f" },
             { "Thumb swing", RowKind::Number, nullptr, nullptr, &bmvr::g_VrGmanThumbSwing, 0.1f, 0.f, 1.5f, "%.1f" },
+            { "Finger twist", RowKind::Number, "VrGmanFingerTwist", nullptr, &bmvr::g_VrGmanFingerTwistDeg, 1.f, -30.f, 30.f, "%+.0f deg" },
             // Drawn at the bottom of every tab.
             { "Close", RowKind::Close, nullptr, nullptr, nullptr, 0, 0, 0, nullptr },
             // In the bottom bar, far left: resets the tab shown (second click confirms).
@@ -503,7 +538,7 @@ namespace
             "ControlsPicture", "DamageFlashStrength", "VrHandsBlackMesaScale", "VrGunRightHand", "VrHandsRollDeg",
             "HandHudUp", "HandHudForward", "HandHudSide", "HandHudTilt", "HandHudRoll",
             "ScopeRaiseMeters", "ScopeGunSmoothSec", "ThrowStroke", "MountedGunGain", "LastShotHapticStrength", "DryFireHapticStrength", "VrClipHandPose", "VrClipHandSnap",
-            "TwoHandToggleAutoRelease",
+            "TwoHandToggleAutoRelease", "VrCrosshairScale", "VrLaserWidth",
             "MsaaParticles1x", "FxaaSubpixel", "FxaaEdgeThreshold", "FxaaEdgeThresholdMin",
             "EnvmapScaleWorld", "EnvmapScaleModels", "LodBias",
             "FlareFadeAngle", "FlareLightScale", "FlareHazeScale", "FlareHazeMinSize", "FlareGhostScale", "flare_default",
@@ -1047,7 +1082,7 @@ namespace
                 Game::logMsg("VR settings reset: %s -> %s", r.label, r.defB ? "on" : "off");
                 ++changed;
             }
-            else if (float ammoDef = 0.f; r.kind == RowKind::Number && bmvr::AmmoHudRowDefault(r.f, ammoDef))
+            else if (float ammoDef = 0.f; (r.kind == RowKind::Number || r.kind == RowKind::Choice) && bmvr::AmmoHudRowDefault(r.f, ammoDef))
             {
                 // Per-weapon ammo HUD rows: back to the held weapon's built-in values.
                 if (std::fabs(*r.f - ammoDef) > 1e-4f)
@@ -1445,18 +1480,20 @@ namespace
             return !g_PhysicalLadders;
         if (is({ "PhysicalCrouchDropCm" }))
             return !g_PhysicalCrouch;
+        if (is({ "RoomscaleDeadzoneCm" }))
+            return !g_Roomscale;
         if (is({ "DamageFlashStrength" }))
             return !g_DamageFlash;
         if (is({ "HandHudSize", "HandHudUp", "HandHudForward", "HandHudSide", "HandHudTilt", "HandHudRoll" }))
             return !g_HandHud;
-        if (is({ "VrRecoil", "VrMagDiscard", "VrReloadHints", "VrClipHandPose", "VrClipHandSnap", "VrClipHandRpg", "VrClipHandRpgFlip" }))
+        if (is({ "VrRecoil", "VrMagDiscard", "VrClipHandPose", "VrClipHandSnap", "VrClipHandRpg", "VrClipHandRpgFlip" }))
             return !g_PhysicalWeapons;
         if (is({ "VrRecoilScale", "VrRecoilTwoHand" }))
             return !PhysicalWeapon(g_VrRecoil);
-        if (is({ "VrCrosshairDot", "VrCrosshairScale" }))
-            return !g_VrCrosshair;
+        if (is({ "VrCrosshairScale" }))
+            return AimMarkerMode() == 0;
         if (is({ "VrLaserWidth" }))
-            return !g_VrLaserBeam;
+            return !AimLaserBeamOn();
         if (is({ "LastShotHapticStrength" }))
             return g_LastShotHaptic < 0.5f;
         if (is({ "DryFireHapticStrength" }))
@@ -1624,6 +1661,8 @@ namespace
                 text.append(buf, n);
             std::fclose(f);
         }
+        if (text.empty())
+            text = bmvr::UserConfigHeader();   // first save: the zip ships no config.txt
         const std::string eol = (text.find("\r\n") != std::string::npos) ? "\r\n" : "\n";
         for (const std::string& key : drop)
         {
@@ -1776,7 +1815,37 @@ namespace
             for (int i = 0; i < w * h; ++i)
                 px[i] = (px[i] & 0x00FFFFFFu) | (static_cast<uint32_t>(a) << 24);
         }
+        void setAlpha(uint8_t a, const RECT& r)
+        {
+            GdiFlush();
+            const int x0 = (std::max)(0, static_cast<int>(r.left)), x1 = (std::min)(w, static_cast<int>(r.right));
+            for (int y = (std::max)(0, static_cast<int>(r.top)); y < (std::min)(h, static_cast<int>(r.bottom)); ++y)
+                for (int x = x0; x < x1; ++x)
+                {
+                    uint32_t& p = px[static_cast<size_t>(y) * w + x];
+                    p = (p & 0x00FFFFFFu) | (static_cast<uint32_t>(a) << 24);
+                }
+        }
     };
+
+    // Hover-only repaints (2026-11-27 handover: a full repaint per hover change
+    // cost ~41 ms on the render thread on the DEBUG tab): body-texture rects
+    // that are redrawn, nullptr = whole panel.
+    using PanelClip = std::vector<RECT>;
+    bool RectsOverlap(const RECT& a, const RECT& b)
+    {
+        return a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom;
+    }
+    bool ClipHits(const PanelClip* clip, int x0, int y0, int x1, int y1)
+    {
+        if (!clip)
+            return true;
+        const RECT r{ x0, y0, x1, y1 };
+        for (const RECT& c : *clip)
+            if (RectsOverlap(c, r))
+                return true;
+        return false;
+    }
 
     bool Upload(IDirect3DDevice9* device, const Canvas& c, IDirect3DTexture9*& sys, IDirect3DTexture9*& gpu)
     {
@@ -1792,6 +1861,152 @@ namespace
                 c.px + static_cast<size_t>(y) * c.w, static_cast<size_t>(c.w) * 4u);
         sys->UnlockRect(0);
         return SUCCEEDED(device->UpdateTexture(sys, gpu));
+    }
+
+    // Panel canvases, kept between repaints while the panel is open. Each
+    // repaint used to create two fresh DIB sections (~27 MB each for the
+    // 3354 px Debug tab); late in a long session the 32-bit game ran out of
+    // contiguous address space for them (2026-11-27 headset: clicks applied
+    // without feedback, then no panel at all and ~20 ms render work per frame
+    // from repainting every frame, until a map load freed memory).
+    std::unique_ptr<Canvas> g_BodyCanvas, g_WideCanvas;
+
+    Canvas* PanelCanvas(std::unique_ptr<Canvas>& c, int w, int h)
+    {
+        if (!c || c->w != w || c->h != h)
+        {
+            c.reset();   // free the old one before asking for the new size
+            c = std::make_unique<Canvas>(w, h);
+        }
+        return c->ok() ? c.get() : nullptr;
+    }
+
+    // Closed panel: give the big buffers back (the GPU texture stays for the next open).
+    void ReleasePanelBuffers()
+    {
+        g_BodyCanvas.reset();
+        g_WideCanvas.reset();
+        if (g_Gfx.sys)
+        {
+            g_Gfx.sys->Release();
+            g_Gfx.sys = nullptr;
+        }
+    }
+
+    // Largest free block of the process address space, MB (failure reports).
+    unsigned LargestFreeVaMb()
+    {
+        size_t best = 0;
+        MEMORY_BASIC_INFORMATION mbi{};
+        for (uintptr_t a = 0x10000; VirtualQuery(reinterpret_cast<void*>(a), &mbi, sizeof(mbi)) == sizeof(mbi);)
+        {
+            if (mbi.State == MEM_FREE && mbi.RegionSize > best)
+                best = mbi.RegionSize;
+            const uintptr_t next = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+            if (next <= a)
+                break;
+            a = next;
+        }
+        return static_cast<unsigned>(best >> 20);
+    }
+
+    // Upload into the panel textures. New-size textures are made before the
+    // old GPU texture goes, so a failed allocation keeps the last panel image
+    // on screen. Returns nullptr or the step that failed.
+    const char* UploadPanel(IDirect3DDevice9* device, const Canvas& c)
+    {
+        const bool sameSize = g_Gfx.w == c.w && g_Gfx.h == c.h;
+        if (!sameSize && g_Gfx.sys)
+        {
+            g_Gfx.sys->Release();   // only the GPU texture is needed to draw
+            g_Gfx.sys = nullptr;
+        }
+        IDirect3DTexture9* gpu = sameSize ? g_Gfx.gpu : nullptr;
+        bool newGpu = false;
+        if (!g_Gfx.sys && FAILED(device->CreateTexture(c.w, c.h, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM, &g_Gfx.sys, nullptr)))
+        {
+            g_Gfx.sys = nullptr;
+            return "system-memory texture";
+        }
+        if (!gpu)
+        {
+            if (FAILED(device->CreateTexture(c.w, c.h, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &gpu, nullptr)))
+                return "GPU texture";
+            newGpu = true;
+        }
+        const char* fail = nullptr;
+        D3DLOCKED_RECT lr{};
+        if (FAILED(g_Gfx.sys->LockRect(0, &lr, nullptr, 0)))
+            fail = "lock";
+        else
+        {
+            for (int y = 0; y < c.h; ++y)
+                std::memcpy(static_cast<uint8_t*>(lr.pBits) + static_cast<size_t>(y) * lr.Pitch,
+                    c.px + static_cast<size_t>(y) * c.w, static_cast<size_t>(c.w) * 4u);
+            g_Gfx.sys->UnlockRect(0);
+            if (FAILED(device->UpdateTexture(g_Gfx.sys, gpu)))
+                fail = "update";
+        }
+        if (fail)
+        {
+            if (newGpu)
+                gpu->Release();
+            return fail;
+        }
+        if (newGpu)
+        {
+            if (g_Gfx.gpu)
+                g_Gfx.gpu->Release();
+            g_Gfx.gpu = gpu;
+            g_Gfx.w = c.w;
+            g_Gfx.h = c.h;
+        }
+        return nullptr;
+    }
+
+    // Hover-only repaint upload: only `rects` (body coordinates, shifted by
+    // xOff into c) go to the GPU. The locked rect is the system texture's
+    // dirty box, and UpdateTexture copies only that, so one update per rect
+    // (two far-apart rows would otherwise send everything between them).
+    const char* UploadPanelRects(IDirect3DDevice9* device, const Canvas& c, const PanelClip& rects, int xOff)
+    {
+        if (!g_Gfx.sys || !g_Gfx.gpu || g_Gfx.w != c.w || g_Gfx.h != c.h)
+            return "partial upload without textures";
+        for (const RECT& r0 : rects)
+        {
+            RECT r{ (std::max)(0L, r0.left + xOff), (std::max)(0L, r0.top),
+                (std::min)(static_cast<LONG>(c.w), r0.right + xOff), (std::min)(static_cast<LONG>(c.h), r0.bottom) };
+            if (r.left >= r.right || r.top >= r.bottom)
+                continue;
+            D3DLOCKED_RECT lr{};
+            if (FAILED(g_Gfx.sys->LockRect(0, &lr, &r, 0)))
+                return "lock";
+            const size_t bytes = static_cast<size_t>(r.right - r.left) * 4u;
+            for (int y = r.top; y < r.bottom; ++y)
+                std::memcpy(static_cast<uint8_t*>(lr.pBits) + static_cast<size_t>(y - r.top) * lr.Pitch,
+                    c.px + static_cast<size_t>(y) * c.w + r.left, bytes);
+            g_Gfx.sys->UnlockRect(0);
+            if (FAILED(device->UpdateTexture(g_Gfx.sys, g_Gfx.gpu)))
+                return "update";
+        }
+        return nullptr;
+    }
+
+    // Hover-only repaint with wings: the body rects into the wide canvas
+    // (the wings themselves do not change; TabHasFigures tabs repaint fully).
+    void CopyBodyRects(const Canvas& body, Canvas& out, const PanelClip& rects)
+    {
+        const int wing = (out.w - body.w) / 2;
+        GdiFlush();
+        for (const RECT& r0 : rects)
+        {
+            const int x0 = (std::max)(0, static_cast<int>(r0.left)), x1 = (std::min)(body.w, static_cast<int>(r0.right));
+            if (x0 >= x1)
+                continue;
+            for (int y = (std::max)(0, static_cast<int>(r0.top)); y < (std::min)((std::min)(body.h, out.h), static_cast<int>(r0.bottom)); ++y)
+                std::memcpy(out.px + static_cast<size_t>(y) * out.w + wing + x0, body.px + static_cast<size_t>(y) * body.w + x0,
+                    static_cast<size_t>(x1 - x0) * 4u);
+        }
     }
 
     constexpr COLORREF kBg = RGB(18, 22, 27);
@@ -2273,8 +2488,80 @@ namespace
         return false;
     }
 
-    void Paint(Canvas& c, int hoverRow, int hoverZone)
+    // Body-texture rect a row paints into (Paint below draws nothing outside it).
+    RECT RowPaintRect(int i)
     {
+        const Row& r = Rows()[i];
+        const Layout& l = GetLayout();
+        if (r.kind == RowKind::Tab)   // with the missing-hooks frame
+            return RECT{ l.x0[i] - 6, l.top[i] - 2, l.x1[i] + 6, l.top[i] + kTabPx + 6 };
+        if (r_IsTabReset(r))          // with the "+N dev rows changed" note
+            return RECT{ l.x0[i], l.top[i], l.x1[i] + 340, l.top[i] + kRowPx };
+        if (r.kind == RowKind::Close)
+            return RECT{ 0, l.top[i], kTexW, l.top[i] + kRowPx };
+        const int x = RowX(i), y = RowTop(i);
+        return RECT{ x, y, x + kColW, y + RowHeight(r) };
+    }
+
+    // Where hover state `hover` (row, 1000 + picker cell, -1) is drawn, for a
+    // hover-only repaint. False: not a plain rect (controller-picture card
+    // lines and leader lines, gesture zones): repaint everything.
+    bool HoverPaintRect(int hover, std::vector<RECT>& out)
+    {
+        if (hover < 0)
+            return true;
+        if (hover >= 1000)
+        {
+            if (g_PickerRow < 0)
+                return false;
+            const int a = hover - 1000;
+            if (a == kPickerCancel)
+            {
+                const int cy = PickerCancelY();
+                out.push_back(RECT{ kTexW / 2 - 200, cy, kTexW / 2 + 200, cy + kPickerCellH });
+                return true;
+            }
+            const int cx0 = PickerX0() + (a % kPickerCols) * (kPickerCellW + kPickerGap);
+            const int cy0 = PickerGridY() + (a / kPickerCols) * (kPickerCellH + kPickerGap);
+            out.push_back(RECT{ cx0 - 4, cy0 - 4, cx0 + kPickerCellW + 4, cy0 + kPickerCellH + 4 });
+            return true;
+        }
+        const auto& rows = Rows();
+        if (hover >= static_cast<int>(rows.size()) || g_PickerRow >= 0)
+            return false;
+        const Row& r = rows[hover];
+        const bool always = r.kind == RowKind::Tab || r.kind == RowKind::Close || r_IsTabReset(r);
+        if (!always && (GetLayout().tab[hover] != g_Tab || r.kind == RowKind::BindPicture || r.kind == RowKind::GestureFigure))
+            return false;
+        out.push_back(RowPaintRect(hover));
+        return true;
+    }
+
+    // Tab shows controller pictures (ComposeWings draws over the body) or the gesture figure.
+    bool TabHasFigures()
+    {
+        const auto& rows = Rows();
+        const Layout& l = GetLayout();
+        for (int i = 0; i < static_cast<int>(rows.size()); ++i)
+            if ((rows[i].kind == RowKind::BindPicture || rows[i].kind == RowKind::GestureFigure) && l.tab[i] == g_Tab)
+                return true;
+        return false;
+    }
+
+    void Paint(Canvas& c, int hoverRow, int hoverZone, const PanelClip* clip = nullptr)
+    {
+        HRGN clipRgn = nullptr;
+        if (clip)
+        {
+            clipRgn = CreateRectRgn(0, 0, 0, 0);
+            for (const RECT& r : *clip)
+            {
+                HRGN one = CreateRectRgnIndirect(&r);
+                CombineRgn(clipRgn, clipRgn, one, RGN_OR);
+                DeleteObject(one);
+            }
+            SelectClipRgn(c.dc, clipRgn);
+        }
         c.fill(0, 0, c.w, c.h, kBg);
         c.fill(0, 0, c.w, 6, kAmber);
         c.text("VR SETTINGS", 40, 10, c.w - 40, kHeaderPx - 10, kAmber, 46, true, DT_LEFT);
@@ -2292,6 +2579,12 @@ namespace
             if (r.kind == RowKind::Tab)
             {
                 const bool active = (tabIndex++ == g_Tab);
+                if (clip)
+                {
+                    const RECT pr = RowPaintRect(i);
+                    if (!ClipHits(clip, pr.left, pr.top, pr.right, pr.bottom))
+                        continue;
+                }
                 const int y0 = l.top[i], y1 = y0 + kTabPx;
                 // Missing hooks: the DEBUG tab button is filled red (gameplay) or amber (debug only)
                 // with "!" on both sides, so it shows from any tab; selected, a red/amber frame.
@@ -2317,6 +2610,12 @@ namespace
                 if (TabChangedCount(tabIndex - 1) > 0)
                     c.fill(l.x1[i] - 22, y0 + 12, l.x1[i] - 10, y0 + 24, active ? RGB(0, 0, 0) : kAmber);
                 continue;
+            }
+            if (clip && (r_IsTabReset(r) || RowVisible(i)))
+            {
+                const RECT pr = RowPaintRect(i);
+                if (!ClipHits(clip, pr.left, pr.top, pr.right, pr.bottom))
+                    continue;
             }
             if (r_IsTabReset(r))
             {
@@ -2510,7 +2809,15 @@ namespace
             c.fill(c.w / 2 - 200, cy, c.w / 2 + 200, cy + kPickerCellH, hvCancel ? kBtnHover : kOff);
             c.text("Cancel", c.w / 2 - 200, cy, c.w / 2 + 200, cy + kPickerCellH, hvCancel ? RGB(0, 0, 0) : kText, 32, true, DT_CENTER);
         }
-        c.setAlpha(238);
+        if (!clip)
+        {
+            c.setAlpha(238);
+            return;
+        }
+        for (const RECT& r : *clip)
+            c.setAlpha(238, r);
+        SelectClipRgn(c.dc, nullptr);
+        DeleteObject(clipRgn);
     }
 
     struct MenuVertTex
@@ -2590,6 +2897,45 @@ void bmvr::CapturePanelDefaults()
     g_DefaultsCaptured = true;
 }
 
+namespace
+{
+    // Debug row "God rays samples (test)": np_gr_quality_sample_count is an
+    // archived cvar the menus set to 3 (64 taps). Override it only while a
+    // level runs, keep the game's value, and put it back on level shutdown
+    // (before quit writes config.cfg) or when the row goes back to Game.
+    int g_GrSamplesSaved = -1;   // the game's value while overridden
+
+    void TickGodRaySamples(Game* game, bool inLevel)
+    {
+        const int row = static_cast<int>(bmvr::g_GodRaySamples + 0.5f);
+        const int want = row == 1 ? 2 : row == 2 ? 1 : -1;   // 2 = 32 taps, 1 = 16
+        int cur = -1;
+        if (!game->GetConVarInt("np_gr_quality_sample_count", cur))
+            return;
+        if (want >= 0 && inLevel)
+        {
+            if (g_GrSamplesSaved < 0)
+                g_GrSamplesSaved = cur;
+            if (cur != want && game->SetConVarInt("np_gr_quality_sample_count", want))
+                Game::logMsg("God rays samples: np_gr_quality_sample_count %d -> %d (test row, game value %d kept)",
+                    cur, want, g_GrSamplesSaved);
+        }
+        else if (g_GrSamplesSaved >= 0)
+        {
+            if (cur != g_GrSamplesSaved)
+                game->SetConVarInt("np_gr_quality_sample_count", g_GrSamplesSaved);
+            Game::logMsg("God rays samples: back to the game's %d", g_GrSamplesSaved);
+            g_GrSamplesSaved = -1;
+        }
+    }
+}
+
+void VR::RestoreGodRaySamples()
+{
+    if (m_Game)
+        TickGodRaySamples(m_Game, false);
+}
+
 // Game thread (FlushPendingGameUi): runs the panel's engine console commands
 // and, while the panel is open, reads the engine cvars back into the rows so
 // a refused command (cheat-protected) shows the real value.
@@ -2597,6 +2943,7 @@ void VR::FlushPanelEngineCommands()
 {
     if (!m_Game)
         return;
+    TickGodRaySamples(m_Game, m_GameplayEligible);
     std::vector<std::string> cmds;
     {
         std::lock_guard<std::mutex> lock(g_EngCmdLock);
@@ -2702,6 +3049,62 @@ IDirect3DTexture9* VR::SettingsGearTexture(IDirect3DDevice9* device)
     return g_Gfx.gearGpu;
 }
 
+IDirect3DTexture9* VR::PauseVrButtonTexture(IDirect3DDevice9* device, bool hover)
+{
+    // Own storage, not g_Gfx: this runs on the material thread (pause HUD
+    // stamp), the panel and toasts on the render thread. Render-target
+    // textures so StretchRect may read them.
+    static IDirect3DDevice9* s_device = nullptr;
+    static IDirect3DTexture9* s_tex[2] = {};
+    if (!device)
+        return nullptr;
+    if (s_device != device)
+    {
+        for (IDirect3DTexture9*& t : s_tex)
+            if (t) { t->Release(); t = nullptr; }
+        s_device = device;
+    }
+    IDirect3DTexture9*& tex = s_tex[hover ? 1 : 0];
+    if (tex)
+        return tex;
+    Canvas c(512, 128);
+    if (!c.ok())
+        return nullptr;
+    const int b = 6;
+    c.fill(0, 0, c.w, c.h, kAmber);
+    c.fill(b, b, c.w - b, c.h - b, hover ? kAmber : kBg);
+    c.text("VR SETTINGS", 0, 0, c.w, c.h, hover ? kBg : kAmber, 56, true, DT_CENTER);
+    c.setAlpha(240);
+    IDirect3DTexture9* sys = nullptr;
+    if (FAILED(device->CreateTexture(c.w, c.h, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM, &sys, nullptr))
+        || FAILED(device->CreateTexture(c.w, c.h, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &tex, nullptr)))
+    {
+        if (sys) sys->Release();
+        if (tex) { tex->Release(); tex = nullptr; }
+        return nullptr;
+    }
+    D3DLOCKED_RECT lr{};
+    bool ok = SUCCEEDED(sys->LockRect(0, &lr, nullptr, 0));
+    if (ok)
+    {
+        for (int y = 0; y < c.h; ++y)
+            std::memcpy(static_cast<uint8_t*>(lr.pBits) + static_cast<size_t>(y) * lr.Pitch,
+                c.px + static_cast<size_t>(y) * c.w, static_cast<size_t>(c.w) * 4u);
+        sys->UnlockRect(0);
+        ok = SUCCEEDED(device->UpdateTexture(sys, tex));
+    }
+    sys->Release();
+    if (!ok)
+    {
+        tex->Release();
+        tex = nullptr;
+    }
+    static int s_log;
+    if (s_log++ < 2)
+        Game::logMsg("Pause VR button texture (%s): %s", hover ? "hover" : "normal", ok ? "ok" : "FAILED");
+    return tex;
+}
+
 void VR::OpenSettingsPanel()
 {
     // Test only: BMVR_TEST_PANEL_TAB=<n> opens the panel on tab n (headless screenshots).
@@ -2748,6 +3151,20 @@ void VR::OpenSettingsPanel()
     if (m_SettingsPausedGame)
         m_PendingPauseCmd.store(1, std::memory_order_release);
     Game::logMsg("VR settings panel opened pause=%d", m_SettingsPausedGame ? 1 : 0);
+}
+
+void VR::ResetDevCheatRows()
+{
+    // User 2026-11-27: after a load or map change the rows still said on while
+    // god / notarget were off. The flags are server-only (not in the client's
+    // 11 networked player-flag bits), so the rows follow the load instead.
+    if (!g_DevGod && !g_DevNotarget)
+        return;
+    Game::logMsg("VR settings: map load, God mode / No target rows reset to off (were %d/%d)",
+        g_DevGod ? 1 : 0, g_DevNotarget ? 1 : 0);
+    g_DevGod = false;
+    g_DevNotarget = false;
+    m_SettingsDirty = true;
 }
 
 void VR::CloseSettingsPanel(const char* why)
@@ -2842,27 +3259,11 @@ void VR::WelcomeStep(bool paused)
     m_WelcomeTriedThisMap = true;
 
     // Name the button that opens the panel on this controller (hold slot first).
-    const L4D2VROpenXrInputStateDesc& in = m_OpenXrLastInputState;
-    const uint32_t family = in.reserved0;
+    const bool mapped = m_ButtonMapActive;
     const char* label = nullptr;
     int labelHand = 0;
     bool hold = false;
-    const bool mapped = m_ButtonMapActive;
-    for (int pass = 0; pass < 2 && !label; ++pass)
-        for (int hand = 0; hand < bmvr::kBindHands && !label; ++hand)
-            for (int i = 0; i < bmvr::kBindInputCount && !label; ++i)
-            {
-                const auto input = static_cast<bmvr::BindInput>(i);
-                const bmvr::BindSlot slot = mapped ? bmvr::EffectiveBind(family, hand, input)
-                                                   : bmvr::DefaultBind(family, hand, input);
-                const bmvr::BindAction a = pass == 0 ? slot.hold : slot.press;
-                if (a == bmvr::BindAction::VrSettings)
-                {
-                    label = bmvr::BindInputLabel(family, in.systemName, hand, input);
-                    labelHand = hand;
-                    hold = pass == 0;
-                }
-            }
+    FindBoundButton(bmvr::BindAction::VrSettings, true, label, labelHand, hold);
     if (!label || !label[0] || (!mapped && !bmvr::g_SettingsTriangleHold))
     {
         Game::logMsg("Welcome: skipped, no button opens the VR panel (mapping=%d)", mapped ? 1 : 0);
@@ -2981,7 +3382,7 @@ void VR::UpdateSettingsPanel()
             PulseHandHaptic(vr::TrackedControllerRole_RightHand, 300, 0.15f);
         m_SettingsHover = row;
         m_SettingsHoverZone = zone;
-        m_SettingsDirty = true;
+        m_SettingsHoverDirty = true;
     }
 
     // Trigger only, full pull (Cross and a resting finger on the trigger
@@ -3260,6 +3661,17 @@ void VR::UpdateSettingsPanel()
             CloseSettingsPanel("debug capture");
             return;
         }
+        // Closes the panel; 2 s later a debug capture with the global Xen fog
+        // drawn, then the eyes again with it hidden (head pose frozen between).
+        if (r.fmt && std::strcmp(r.fmt, "fog_dump") == 0)
+        {
+            bmvr::g_FogDumpAt = GetTickCount() + 2000;
+            if (!bmvr::g_FogDumpAt)
+                bmvr::g_FogDumpAt = 1;
+            Game::logMsg("fog dump: armed, in 2 s");
+            CloseSettingsPanel("fog dump");
+            return;
+        }
         // Lightweight share (user 2026-11-18): closes the panel, 2 s later the
         // two eye images at 1/3 size, no save / audit (VR/screenshot-*).
         if (r.fmt && std::strcmp(r.fmt, "screenshot") == 0)
@@ -3363,9 +3775,17 @@ void VR::DrawSettingsPanel(IDirect3DDevice9* device, int stereoEye, UINT w, UINT
     const Vector& eyeOrig, const Vector& fwd, const Vector& right, const Vector& up)
 {
     if (!m_SettingsOpen || !device)
+    {
+        if (!m_SettingsOpen && (g_BodyCanvas || g_WideCanvas || g_Gfx.sys) && device && g_Gfx.device == device)
+            ReleasePanelBuffers();
         return;
+    }
     if (g_Gfx.device && g_Gfx.device != device)
+    {
+        g_BodyCanvas.reset();
+        g_WideCanvas.reset();
         ReleaseGfx();
+    }
     g_Gfx.device = device;
     // exchange before Paint: a click on the game thread while this paints
     // sets the flag again, so it is drawn next frame. (A plain bool cleared
@@ -3409,17 +3829,88 @@ void VR::DrawSettingsPanel(IDirect3DDevice9* device, int stereoEye, UINT w, UINT
         s_paintedModelGen = bmvr::ctlmodel::Generation();
         m_SettingsDirty = true;
     }
-    if (m_SettingsDirty.exchange(false) || !g_Gfx.gpu)
+    // Repaint cost (render thread, inside the eye's overlay): per 10 s while
+    // the panel is open, count + mean/max ms of paint, wings, upload (user
+    // 2026-11-27: panel frames p99 ~40 ms vs ~20 in play).
+    // [0] full repaints, [1] hover-only ones.
+    struct RepaintStats { int n = 0; double sum[3]{}, max[3]{}; };
+    static RepaintStats s_rs[2];
+    static DWORD s_rsSince = 0;
+    auto qpcMs = []() {
+        LARGE_INTEGER f, c;
+        QueryPerformanceFrequency(&f);
+        QueryPerformanceCounter(&c);
+        return static_cast<double>(c.QuadPart) * 1000.0 / static_cast<double>(f.QuadPart);
+    };
     {
-        Canvas body(kTexW, TexH());
-        const int wing = WingPx();
-        Canvas wide(wing ? kTexW + 2 * wing : 1, wing ? TexH() : 1);
-        if (body.ok() && (!wing || wide.ok()))
+        const DWORD t = GetTickCount();
+        if (!s_rsSince)
+            s_rsSince = t;
+        else if (t - s_rsSince >= 10000)
         {
-            Paint(body, m_SettingsHover, m_SettingsHoverZone);
-            if (wing)
-                ComposeWings(body, wide, m_SettingsHover);
-            Canvas& c = wing ? wide : body;
+            for (int k = 0; k < 2; ++k)
+            {
+                const RepaintStats& rs = s_rs[k];
+                if (rs.n > 0)
+                    Game::logMsg("VR settings panel %s repaints (10 s): %d, paint %.1f ms mean / %.1f max, wings %.1f / %.1f, upload %.1f / %.1f (tab %d)",
+                        k ? "hover" : "full", rs.n, rs.sum[0] / rs.n, rs.max[0], rs.sum[1] / rs.n, rs.max[1], rs.sum[2] / rs.n, rs.max[2], g_Tab);
+                s_rs[k] = RepaintStats{};
+            }
+            s_rsSince = t;
+        }
+    }
+    // After a failed repaint, retry every 500 ms instead of every frame.
+    static DWORD s_gfxRetryAt = 0;
+    static int s_gfxFailLog = 0;
+    static DWORD s_gfxFailSince = 0;
+    const DWORD nowMs = GetTickCount();
+    const bool backoff = s_gfxRetryAt != 0 && static_cast<int32_t>(s_gfxRetryAt - nowMs) > 0;
+    // Hover painted into the kept canvases; s_paintedValid false = they are
+    // not a complete image (new canvas, failed repaint), so no partial repaint.
+    static int s_paintedHover = -1, s_paintedZone = -1;
+    static bool s_paintedValid = false;
+    if (!g_BodyCanvas || !g_Gfx.gpu)
+        s_paintedValid = false;
+    // Flags exchanged before the hover is read (see above).
+    const bool fullDirty = !backoff && m_SettingsDirty.exchange(false);
+    const bool hoverDirty = !backoff && m_SettingsHoverDirty.exchange(false);
+    if (!backoff && (fullDirty || hoverDirty || !g_Gfx.gpu))
+    {
+        const int hover = m_SettingsHover, hoverZone = m_SettingsHoverZone;
+        const char* fail = nullptr;
+        const int wing = WingPx();
+        // Hover-only: old + new hover rects, when both are plain rects and the
+        // canvases still hold the last full image at this size.
+        PanelClip clipRects;
+        const bool canvasesKept = !fullDirty && g_Gfx.gpu && s_paintedValid && g_BodyCanvas
+            && g_BodyCanvas->w == kTexW && g_BodyCanvas->h == TexH()
+            && (!wing || (g_WideCanvas && g_WideCanvas->w == kTexW + 2 * wing && g_WideCanvas->h == TexH()));
+        // Hover moved and came back before this frame: the image is already right.
+        const bool unchanged = canvasesKept && s_paintedHover == hover && s_paintedZone == hoverZone;
+        const bool partial = canvasesKept && !unchanged && !TabHasFigures()
+            && HoverPaintRect(s_paintedHover, clipRects) && HoverPaintRect(hover, clipRects) && !clipRects.empty();
+        if (!wing)
+            g_WideCanvas.reset();
+        Canvas* body = PanelCanvas(g_BodyCanvas, kTexW, TexH());
+        Canvas* wide = (body && wing) ? PanelCanvas(g_WideCanvas, kTexW + 2 * wing, TexH()) : nullptr;
+        if (!body)
+            fail = "panel canvas";
+        else if (wing && !wide)
+            fail = "controller-picture canvas";
+        else if (unchanged)
+            ;
+        else
+        {
+            const double t0 = qpcMs();
+            Paint(*body, hover, hoverZone, partial ? &clipRects : nullptr);
+            GdiFlush();
+            const double t1 = qpcMs();
+            if (wing && partial)
+                CopyBodyRects(*body, *wide, clipRects);
+            else if (wing)
+                ComposeWings(*body, *wide, hover);
+            const double t2 = qpcMs();
+            Canvas& c = wing ? *wide : *body;
             // Test only: BMVR_TEST_PANEL_DUMP=1 saves every repaint as
             // VR/panel-tab<N>[-picker].bmp (full size, for screenshots).
             static int s_dumpPanel = -1;
@@ -3457,18 +3948,86 @@ void VR::DrawSettingsPanel(IDirect3DDevice9* device, int stereoEye, UINT w, UINT
                     std::fclose(f);
                 }
             }
-            if (g_Gfx.w != c.w || g_Gfx.h != c.h)
+            // Test only: BMVR_TEST_PANEL_VERIFY=1 paints every hover-only
+            // repaint again in full into scratch canvases and logs the
+            // pixels that differ (expect 0).
+            static int s_verifyPanel = -1;
+            if (s_verifyPanel < 0)
             {
-                if (g_Gfx.sys) { g_Gfx.sys->Release(); g_Gfx.sys = nullptr; }
-                if (g_Gfx.gpu) { g_Gfx.gpu->Release(); g_Gfx.gpu = nullptr; }
-                g_Gfx.w = c.w;
-                g_Gfx.h = c.h;
+                char v[8]{};
+                s_verifyPanel = GetEnvironmentVariableA("BMVR_TEST_PANEL_VERIFY", v, sizeof(v)) && v[0] == '1' ? 1 : 0;
             }
-            if (!Upload(device, c, g_Gfx.sys, g_Gfx.gpu))
-                m_SettingsDirty = true;
+            if (partial && s_verifyPanel == 1)
+            {
+                Canvas refBody(body->w, body->h);
+                std::unique_ptr<Canvas> refWide = wing ? std::make_unique<Canvas>(wide->w, wide->h) : nullptr;
+                if (refBody.ok() && (!wing || refWide->ok()))
+                {
+                    Paint(refBody, hover, hoverZone);
+                    if (wing)
+                        ComposeWings(refBody, *refWide, hover);
+                    GdiFlush();
+                    const Canvas& ref = wing ? *refWide : refBody;
+                    int diff = 0, bx0 = ref.w, by0 = ref.h, bx1 = -1, by1 = -1;
+                    for (int y = 0; y < ref.h; ++y)
+                        for (int x = 0; x < ref.w; ++x)
+                            if (ref.px[static_cast<size_t>(y) * ref.w + x] != c.px[static_cast<size_t>(y) * c.w + x])
+                            {
+                                ++diff;
+                                bx0 = (std::min)(bx0, x); by0 = (std::min)(by0, y);
+                                bx1 = (std::max)(bx1, x); by1 = (std::max)(by1, y);
+                            }
+                    Game::logMsg("VR settings panel verify: hover %d -> %d (zone %d), %d rect(s), %d px differ%s",
+                        s_paintedHover, hover, hoverZone, static_cast<int>(clipRects.size()), diff, diff ? "" : " (ok)");
+                    if (diff)
+                        Game::logMsg("VR settings panel verify: differences in %d,%d - %d,%d", bx0, by0, bx1, by1);
+                }
+            }
+            const double t3 = qpcMs();   // the verify paint above is not counted
+            fail = partial ? UploadPanelRects(device, c, clipRects, wing) : UploadPanel(device, c);
+            if (partial && fail)
+            {
+                // Fall back to a full upload of the (complete) canvas.
+                Game::logMsg("VR settings panel: hover upload failed (%s), full upload", fail);
+                fail = UploadPanel(device, c);
+            }
+            const double ms[3] = { t1 - t0, t2 - t1, qpcMs() - t3 };
+            RepaintStats& rs = s_rs[partial ? 1 : 0];
+            ++rs.n;
+            for (int k = 0; k < 3; ++k)
+            {
+                rs.sum[k] += ms[k];
+                rs.max[k] = (std::max)(rs.max[k], ms[k]);
+            }
+        }
+        if (!fail)
+        {
+            s_paintedHover = hover;
+            s_paintedZone = hoverZone;
+            s_paintedValid = true;
         }
         else
+            s_paintedValid = false;
+        if (fail)
+        {
             m_SettingsDirty = true;
+            s_gfxRetryAt = nowMs + 500;
+            if (!s_gfxFailSince)
+                s_gfxFailSince = nowMs;
+            if (s_gfxFailLog < 20)
+            {
+                ++s_gfxFailLog;
+                Game::logMsg("VR settings panel: repaint failed (%s), %dx%d tab %d, largest free address block %u MB; %s, retry in 500 ms",
+                    fail, kTexW + 2 * wing, TexH(), g_Tab, LargestFreeVaMb(),
+                    g_Gfx.gpu ? "last image kept" : "no image to show");
+            }
+        }
+        else if (s_gfxFailSince)
+        {
+            Game::logMsg("VR settings panel: repaint ok again after %u ms", static_cast<unsigned>(nowMs - s_gfxFailSince));
+            s_gfxFailSince = 0;
+            s_gfxRetryAt = 0;
+        }
     }
     if (!g_Gfx.gpu)
         return;
@@ -3562,14 +4121,73 @@ void VR::DrawSettingsPanel(IDirect3DDevice9* device, int stereoEye, UINT w, UINT
     device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
 }
 
-void VR::ShowReloadHint(int id, const char* text)
+void VR::ShowUsageHint(UsageHint id, const char* text, int maxPerStart, const char* detail)
 {
-    static int s_shown[8]{};
-    if (!bmvr::g_VrReloadHints || id < 0 || id >= 8 || s_shown[id] >= 2)
+    static int s_shown[static_cast<int>(UsageHint::Count)]{};
+    const int i = static_cast<int>(id);
+    if (!bmvr::g_VrUsageHints || i < 0 || i >= static_cast<int>(UsageHint::Count) || s_shown[i] >= maxPerStart)
         return;
-    ++s_shown[id];
-    ShowToast(text, 1800);
-    m_ToastSmall = true;
+    ++s_shown[i];
+    ShowToast(text, detail ? 4000 : 1800, detail);
+    m_ToastSmall = !detail;
+    Game::logMsg("Usage hint %d: \"%s\"%s (%d/%d this game start)", i, text, detail ? " + detail line" : "",
+        s_shown[i], maxPerStart);
+}
+
+bool VR::FindBoundButton(bmvr::BindAction a, bool holdFirst, const char*& label, int& hand, bool& hold) const
+{
+    const L4D2VROpenXrInputStateDesc& in = m_OpenXrLastInputState;
+    const uint32_t family = in.reserved0;
+    const bool mapped = m_ButtonMapActive;
+    label = nullptr;
+    for (int pass = 0; pass < 2; ++pass)
+    {
+        const bool wantHold = holdFirst ? pass == 0 : pass == 1;
+        for (int h = 0; h < bmvr::kBindHands; ++h)
+            for (int i = 0; i < bmvr::kBindInputCount; ++i)
+            {
+                const auto input = static_cast<bmvr::BindInput>(i);
+                const bmvr::BindSlot slot = mapped ? bmvr::EffectiveBind(family, h, input)
+                                                   : bmvr::DefaultBind(family, h, input);
+                if ((wantHold ? slot.hold : slot.press) != a)
+                    continue;
+                const char* l = bmvr::BindInputLabel(family, in.systemName, h, input);
+                if (!l || !l[0] || l[0] == '?')
+                    continue;
+                label = l;
+                hand = h;
+                hold = wantHold;
+                return true;
+            }
+    }
+    return false;
+}
+
+bool VR::BoundButtonHint(bmvr::BindAction a, const char* fallback, const char* what, char* out, size_t n) const
+{
+    const char* label = nullptr;
+    int hand = 0;
+    bool hold = false;
+    char button[32]{};
+    const bool bound = FindBoundButton(a, false, label, hand, hold);
+    if (bound)
+    {
+        // Name the hand when the other hand's button has the same name (Trigger, Grip, A on Index).
+        const L4D2VROpenXrInputStateDesc& in = m_OpenXrLastInputState;
+        bool shared = false;
+        for (int i = 0; i < bmvr::kBindInputCount && !shared; ++i)
+        {
+            const char* o = bmvr::BindInputLabel(in.reserved0, in.systemName, 1 - hand, static_cast<bmvr::BindInput>(i));
+            shared = o && std::strcmp(o, label) == 0;
+        }
+        std::snprintf(button, sizeof(button), "%s%s%s", hold ? "HOLD " : "", shared ? (hand == 0 ? "LEFT " : "RIGHT ") : "", label);
+    }
+    else
+        strncpy_s(button, fallback, _TRUNCATE);
+    for (char* c = button; *c; ++c)
+        *c = static_cast<char>(std::toupper(static_cast<unsigned char>(*c)));
+    std::snprintf(out, n, "%s = %s", button, what);
+    return bound;
 }
 
 void VR::ShowToast(const char* text, DWORD ms, const char* detail)

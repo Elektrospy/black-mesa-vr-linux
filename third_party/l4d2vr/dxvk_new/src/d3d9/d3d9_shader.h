@@ -181,6 +181,8 @@ namespace dxvk {
     // BMVR: screen-aligned particle shader (spritecard): first registers of
     // cModelView (3) and cProj (4), both read only by dp4. -1 = not one.
     int bmvrParticleModelView = -1;
+    // BMVR: god ray mask VS (quad at the light's depth, c27.z; vr_godrays.h).
+    bool bmvrGrMask = false;
     int bmvrParticleProj = -1;
 
   };
@@ -196,6 +198,13 @@ namespace dxvk {
       const void*                pShaderBytecode,
             uint32_t             BytecodeLength)
       : D3D9Shader<IDirect3DPixelShader9>( pDevice, pAllocator, CommonShader, pShaderBytecode, BytecodeLength ) { }
+
+    // BMVR: Xen fog shader patched at creation (vr_xen_fog.cpp); c100 on bind.
+    bool bmvrXenFog = false;
+    // BMVR: god ray blur PS (its c10 = the light's screen position).
+    bool bmvrGrBlur = false;
+    // BMVR: god ray final PS (reads the blur result; vr_godrays.h).
+    bool bmvrGrFinal = false;
 
   };
 

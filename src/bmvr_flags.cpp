@@ -121,13 +121,15 @@ namespace bmvr
     float g_HandHudSide = 0.3f;
     float g_HandHudTilt = -18.f;
     float g_HandHudRoll = 14.f;
-    bool g_VrCrosshair = true;
+    float g_AimMarker = 2.f;
+    float g_HudLeadingZeros = 0.f;
     float g_VrCrosshairScale = 0.5f;
     bool g_VrCrosshairDot = true;
-    bool g_VrLaserBeam = true;
     float g_VrLaserWidth = 0.06f;
     float g_VrLaserStartForward = 0.f;
     bool g_AimDebug = false;
+    bool g_AimHitLog = false;
+    bool g_HandSyncLog = false;
     bool g_OffCenterTest = false;
     bool g_OffCenterEyes = true;
     bool g_FakeRuntime = false;
@@ -140,8 +142,9 @@ namespace bmvr
     bool g_TwoHandGripToggle = false;
     bool g_TwoHandToggleAutoRelease = true;
     float g_TwoHandGripScale = 1.f;
-    bool g_VrPistolSemiAuto = false;
-    bool g_VrGlockRapidAlt = false;
+    // On by default since the 2026-11-26 defaults review (user: immersive VR play).
+    bool g_VrPistolSemiAuto = true;
+    bool g_VrGlockRapidAlt = true;
     float g_FlashlightFrom = 0.f;
     float g_LastShotHaptic = 1.f;
     float g_DryFireHaptic = 2.f;
@@ -152,6 +155,8 @@ namespace bmvr
     float g_PauseMenuAlphaPasses = 3.f;
     bool g_PauseMenuColourFromFrame = true;
     unsigned long g_DebugCaptureAt = 0;
+    unsigned long g_FogDumpAt = 0;
+    int g_FogDumpOverride = 0;
     unsigned long g_ScreenshotAt = 0;
     unsigned long g_SteamScreenshotAt = 0;
     float g_DebugBlankEye = 0.f;
@@ -203,6 +208,7 @@ namespace bmvr
     static bool g_OldGestureKeysSeen = false;
     static bool g_VrHolsterDynamic = false;    // old switch, read only for the migration
     static bool g_OldHolsterDynamicSeen = false;
+    static bool g_OldReloadHintsSeen = false;  // VrReloadHints, renamed VrUsageHints 2026-11-26
     // Defaults: left shoulder quick save, left hip ammo, forehead flashlight;
     // right shoulder crowbar, above the left hip MP5, right hip pistol.
     float g_GestureLeft[kGestureZoneCount] = { 0.f, -1.f, 2.f, -1.f, 1.f };
@@ -295,7 +301,7 @@ namespace bmvr
         return kGestureWeapons[(index >= 0 && index < kGestureWeaponCount) ? index : 0].parts;
     }
     bool g_SettingsTriangleHold = true;
-    bool g_WeaponMenuSettingsGear = true;
+    bool g_WeaponMenuSettingsGear = false; // off by default (user 2026-11-27); shown anyway when no button opens the panel
     bool g_WeaponMenuTilt = true;
     bool g_CrouchStickHold = true;
     float g_StickJumpCrouchThreshold = 0.8f;
@@ -328,11 +334,27 @@ namespace bmvr
     bool g_GlowCountDepthFix = true;
     // MulticoreMode: hands/laser of both eyes drawn from one per-frame snapshot (VR::HandDrawSnap).
     bool g_McHandSnapshot = true;
+    // Off since 2026-11-27 (SyncProbe headless, live settings): placed at the
+    // pair, the drawn gun trailed the HUD/laser by ~0.7 frame of walking
+    // (1.6 u at 2.3 u/frame); off + the per-frame snapshot kept gun, HUD,
+    // laser and cuff cap on the same frame for hand steps and walking.
+    float g_SyncProbeEyes = 0.f;
     bool g_SkyWaterPerEye = true;
     bool g_EyeUnderwaterWorld = true;
     bool g_WaterLineClipFix = true;
     bool g_ScreenSpaceModelFix = true;
-    bool g_XenGlobalFogOff = true;
+    bool g_DebugModelReset = false;
+    bool g_WorldModelFix = true;
+    volatile long g_ModelLeakSeen = 0;
+    bool g_XenGlobalFogOff = false;   // on since the Auto noise fix (user 2026-11-27)
+    float g_XenFogNoiseMode = 3.f;
+    bool g_GodRayRadialMask = true;
+    float g_GodRayBlurScale = 2.f;   // quarter: blur 0.80 -> 0.17 ms, same look (user headset 2026-11-27)
+    float g_GodRayLog = 0.f;
+    float g_GodRaySamples = 0.f;
+    float g_XenFogNoiseSize = 256.f;
+    float g_XenFogWorldNear = 300.f;
+    float g_XenFogWorldFar = 1200.f;
     bool g_FlareEyeAxis = true;
     bool g_FlareLevel = true;
     bool g_SpriteLevel = true;
@@ -381,6 +403,7 @@ namespace bmvr
     float g_VrGmanFingerStraight = 0.3f;
     float g_VrGmanThumbCurl = 1.f;
     float g_VrGmanThumbSwing = 0.6f;
+    float g_VrGmanFingerTwistDeg = 8.f;   // user headset 2026-11-27
     bool g_VrGmanGestureForce = false;
     // ~one hand-length back along aim after yaw 180 (user: gloves sat ahead
     // of the controller). Flip the Z sign in VR/config.txt if this goes the
@@ -424,22 +447,25 @@ namespace bmvr
     float g_VrPinchThumb = 0.50f;
     float g_VrPinchIndex = 0.30f;
     bool g_VrPinchForce = false;
-    bool g_PhysicalWeapons = false;
+    bool g_PhysicalWeapons = true;   // out of beta, on by default (user 2026-11-26)
     bool g_VrMagReload = true;
     bool g_VrGrenadePin = true;
-    bool g_VrReloadHints = true;
+    bool g_VrUsageHints = true;
     bool g_VrClipHandPose = true;
     bool g_VrClipHandSnap = true;
     bool g_VrClipHandRpg = true;
     bool g_VrClipHandRpgFlip = true;
-    bool g_VrMagDiscard = true;
+    bool g_VrMagDiscard = false;     // user 2026-11-26 (was true)
     float g_VrNearZ = 4.f;
     float g_CaptionHeightDeg = 0.f;
     float g_CaptionScale = 1.f;
     bool g_VrRecoil = false;
-    bool g_PhysicalLadders = false;
+    bool g_PhysicalLadders = true;   // out of beta, on by default (user 2026-11-26)
     bool g_PhysicalCrouch = false;
     float g_PhysicalCrouchDropCm = 50.f; // user 2026-11-25 (was 35)
+    bool g_Roomscale = true;             // beta, on by default (user 2026-11-27)
+    float g_RoomscaleDeadzoneCm = 15.f;
+    int g_RoomscaleTrace = 0;
     float g_VmTunePitch = 0.f, g_VmTuneYaw = 0.f, g_VmTuneRoll = 0.f, g_VmTuneSupportCm = 0.f;
     float g_VmTuneSeatCm = 6.f, g_VmTuneSeatDeg = 45.f;
     bool g_PhysicalLadderSmooth = true;
@@ -452,6 +478,8 @@ namespace bmvr
     float g_LadderGripCurl = 0.7f;
     float g_LadderTuneOutCm = 0.f, g_LadderTuneUpCm = 0.f, g_LadderTuneCurl = 0.7f;
     float g_AmmoHudForward = 0.f, g_AmmoHudSide = 0.f, g_AmmoHudUp = 0.f, g_AmmoHudTilt = 0.f, g_AmmoHudTurn = 0.f, g_AmmoHudRoll = 0.f, g_AmmoHudSize = 2.f;
+    float g_AmmoHudHealthSide = 0.f;
+    float g_AmmoHudHealthGap = 0.f;
     bool g_TwoHandAmmoHudFollowsHand = false;
     float g_SatchelGripCurl = 0.75f;
     float g_SatchelBagDepth = 1.5f;
@@ -537,12 +565,13 @@ namespace bmvr
     // the HWND (gbmatch squash-blit). LITERAL FullFrame/G-buffer at rec
     // filled only the top HWND slice of the eyes (2026-08-26, user miss).
     static bool g_TryOffscreenHmd = true;
-    static bool g_TryOffscreenWorldGrow = false;
-    // WorldRenderAtEyeSize=true in VR/config.txt opts back into the world-RT
-    // grow. Set it back to false to return to the window-sized world + eye
-    // upscale. The opt-in also overrides the policy hmd_world skip. Leftover
+    // World RTs grown to the eye size: on by default since 2026-11-26 (every
+    // release shipped WorldRenderAtEyeSize=true in config.txt, which no longer
+    // ships). WorldRenderAtEyeSize=false returns to the window-sized world + eye
+    // upscale. On also overrides the policy hmd_world skip. Leftover
     // bmvr_in_hmd_world.flag (install killing bms.exe) is deleted, not honored.
-    static bool g_WorldEyeSizeOptIn = false;
+    static bool g_TryOffscreenWorldGrow = true;
+    static bool g_WorldEyeSizeOptIn = true;
     static bool g_GameplayWorldRts = false;
     // `_rt_FullFrameFB*` is created at map-load *before* client LevelInit.
     // Waiting for that hook (2026-09-01) left FullFrame at 2560x1440 while
@@ -600,6 +629,11 @@ namespace bmvr
         if (slash == std::wstring::npos)
             return L".";
         return full.substr(0, slash);
+    }
+
+    std::wstring LogFilePath()
+    {
+        return ExeDir() + L"\\bmvr_log.txt";
     }
 
     static std::wstring SkipPath()
@@ -732,17 +766,113 @@ namespace bmvr
     // config.txt (turned into Bind.* mappings once, see InitFromDisk).
     static bool g_LegacyBindKeysSeen = false;
 
+    const char* UserConfigHeaderMarker() { return "# Black Mesa VR: only the settings you changed"; }
+    const char* UserConfigHeader()
+    {
+        return "# Black Mesa VR: only the settings you changed (the VR panel writes here too).\r\n"
+               "# The settings only this file holds, explained: VR\\config.example.txt\r\n"
+               "# Read once at launch: quit the game fully before you edit this file.\r\n";
+    }
+
+    // Releases up to 2026-11 shipped a full VR/config.txt: these lines (all at
+    // the built-in default) plus about 170 comment lines. Since then the zip ships
+    // VR/config.example.txt and config.txt holds only the player's own changes,
+    // so better defaults reach them. Once (no header yet): drop the shipped
+    // lines and comments, keep every other setting, back up the old file.
+    static void MigrateShippedUserConfig(const std::wstring& path)
+    {
+        const std::string text = ReadConfigFileText(path);
+        if (text.empty() || text.find(UserConfigHeaderMarker()) != std::string::npos)
+            return;
+        static const char* const kShipped[] = {
+            "RenderScale=1.0", "MaxEyeSize=4096", "OpenXRHelperDownsample=", "ReflectionRtScale=0.5",
+            "RefractCopyRtScale=0.5", "WorldRenderAtEyeSize=true", "DesktopEye=right",
+            "ViewmodelPosOffsetX=0.0", "ViewmodelPosOffsetY=0.0", "ViewmodelPosOffsetZ=0.0",
+            "ViewmodelAngOffsetX=0.0", "ViewmodelAngOffsetY=0.0", "ViewmodelAngOffsetZ=0.0",
+            "ViewmodelScale=0.68", "ControllerPitchTilt=-35.0", "ControllerPitchTiltTouch=0",
+            "ControllerPitchTiltIndex=0", "ControllerPitchTiltVive=-45.0", "ViewmodelPosOffsetXTouch=5.5",
+            "HudDistance=1.05", "HudSize=0.70", "IPDScale=1.0", "HeightOffset=0", "OffCenterEyes=true",
+            "Haptics=true", "HideCrosshair=true", "DisableViewBob=true", "LeftHanded=false",
+            "ScopeZoomFovScale=0.28", "ScopeEye=right", "LightCullEyeView=true", "FlareEyeAxis=true",
+            "FlareLevel=true", "FlareSharedLayout=true",
+        };
+        auto trim = [](std::string v) {
+            const size_t a = v.find_first_not_of(" \t\r");
+            if (a == std::string::npos)
+                return std::string();
+            const size_t b = v.find_last_not_of(" \t\r");
+            return v.substr(a, b - a + 1);
+        };
+        std::string out = UserConfigHeader();
+        int kept = 0, dropped = 0;
+        size_t pos = 0;
+        while (pos < text.size())
+        {
+            size_t eol = text.find('\n', pos);
+            if (eol == std::string::npos)
+                eol = text.size();
+            const std::string line = trim(text.substr(pos, eol - pos));
+            pos = eol + 1;
+            if (line.empty() || line[0] == '#' || line[0] == ';' || line.compare(0, 2, "//") == 0)
+                continue;
+            const size_t eq = line.find('=');
+            std::string norm = line;
+            if (eq != std::string::npos)
+            {
+                std::string val = line.substr(eq + 1);
+                const size_t cut = val.find('#');
+                if (cut != std::string::npos)
+                    val.erase(cut);
+                norm = trim(line.substr(0, eq)) + "=" + trim(val);
+            }
+            bool shipped = false;
+            for (const char* s : kShipped)
+                shipped = shipped || norm == s;
+            if (shipped)
+            {
+                ++dropped;
+                continue;
+            }
+            out += line + "\r\n";
+            ++kept;
+        }
+        const std::wstring bak = path + L".bak";
+        if (!CopyFileW(path.c_str(), bak.c_str(), FALSE))
+        {
+            Log("VR config: old shipped config.txt not cleaned up (backup failed, error %lu)", GetLastError());
+            return;
+        }
+        const std::wstring tmp = path + L".tmp";
+        FILE* f = nullptr;
+        _wfopen_s(&f, tmp.c_str(), L"wb");
+        bool ok = f && fwrite(out.data(), 1, out.size(), f) == out.size();
+        if (f)
+            fclose(f);
+        ok = ok && MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING);
+        if (!ok)
+            DeleteFileW(tmp.c_str());
+        Log("VR config: shipped config.txt cleaned up, %d shipped default%s and the comments removed, %d own "
+            "setting%s kept, old file in config.txt.bak: %s",
+            dropped, dropped == 1 ? "" : "s", kept, kept == 1 ? "" : "s", ok ? "ok" : "FAILED");
+    }
+
     static void ReadUserConfig(const std::wstring& path)
     {
         std::string text = ReadConfigFileText(path);
         if (text.empty())
+        {
+            Log("VR config %ls: none, built-in defaults", path.c_str());
             return;
+        }
         for (char& c : text)
         {
             if (c == '\r')
                 c = '\n';
         }
         bool sawWorldEyeSize = false;
+        // Old aim switches (-1 = not in the file), mapped onto AimMarker below.
+        bool sawAimMarker = false;
+        int oldCrosshair = -1, oldLaserBeam = -1;
         size_t cursor = 0;
         while (cursor < text.size())
         {
@@ -907,20 +1037,35 @@ namespace bmvr
                 g_HandHudTilt = std::clamp(static_cast<float>(atof(val)), -90.f, 90.f);
             else if (std::strcmp(n, "HandHudRoll") == 0)
                 g_HandHudRoll = std::clamp(static_cast<float>(atof(val)), -180.f, 180.f);
+            else if (std::strcmp(n, "HudLeadingZeros") == 0)
+                g_HudLeadingZeros = static_cast<float>(std::clamp(atoi(val), 0, 2));
+            else if (std::strcmp(n, "AimMarker") == 0)
+            {
+                const int v = atoi(val);
+                if (v >= 0 && v <= 3)
+                {
+                    g_AimMarker = static_cast<float>(v);
+                    sawAimMarker = true;
+                }
+            }
             else if (std::strcmp(n, "VrCrosshair") == 0)
-                g_VrCrosshair = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+                oldCrosshair = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0) ? 1 : 0;
             else if (std::strcmp(n, "VrCrosshairScale") == 0)
                 g_VrCrosshairScale = static_cast<float>(atof(val));
             else if (std::strcmp(n, "VrCrosshairDot") == 0)
                 g_VrCrosshairDot = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
             else if (std::strcmp(n, "VrLaserBeam") == 0)
-                g_VrLaserBeam = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+                oldLaserBeam = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0) ? 1 : 0;
             else if (std::strcmp(n, "VrLaserWidth") == 0)
                 g_VrLaserWidth = static_cast<float>(atof(val));
             else if (std::strcmp(n, "VrLaserStartForward") == 0)
                 g_VrLaserStartForward = static_cast<float>(atof(val));
             else if (std::strcmp(n, "AimDebug") == 0)
                 g_AimDebug = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "AimHitLog") == 0)
+                g_AimHitLog = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "HandSyncLog") == 0)
+                g_HandSyncLog = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
             else if (std::strcmp(n, "VrShotOriginFix") == 0)
                 g_VrShotOriginFix = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
             else if (std::strcmp(n, "CrouchStickHold") == 0)
@@ -1211,8 +1356,34 @@ namespace bmvr
                 g_EyeUnderwaterWorld = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
             else if (std::strcmp(n, "XenGlobalFogOff") == 0)
                 g_XenGlobalFogOff = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "XenFogNoise") == 0)
+            {
+                const int v = std::atoi(val);
+                if (v >= 0 && v <= 3)
+                    g_XenFogNoiseMode = static_cast<float>(v);
+            }
+            else if (std::strcmp(n, "XenFogWorldNear") == 0)
+            {
+                const float v = static_cast<float>(atof(val));
+                if (v >= 0.f && v <= 8192.f)
+                    g_XenFogWorldNear = v;
+            }
+            else if (std::strcmp(n, "XenFogWorldFar") == 0)
+            {
+                const float v = static_cast<float>(atof(val));
+                if (v >= 16.f && v <= 16384.f)
+                    g_XenFogWorldFar = v;
+            }
+            else if (std::strcmp(n, "XenFogNoiseSize") == 0)
+            {
+                const float v = static_cast<float>(atof(val));
+                if (v >= 16.f && v <= 4096.f)
+                    g_XenFogNoiseSize = v;
+            }
             else if (std::strcmp(n, "WaterLineClipFix") == 0)
                 g_WaterLineClipFix = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "WorldModelFix") == 0)
+                g_WorldModelFix = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
             else if (std::strcmp(n, "ScreenSpaceModelFix") == 0)
                 g_ScreenSpaceModelFix = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
             else if (std::strcmp(n, "LightCullEyeView") == 0)
@@ -1227,6 +1398,14 @@ namespace bmvr
                 g_FlareEyeAxis = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
             else if (std::strcmp(n, "PixelVisPerEye") == 0)
                 g_PixelVisPerEye = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "GodRayBlurScale") == 0)
+            {
+                const float v = static_cast<float>(std::atof(val));
+                if (v >= 0.f && v <= 2.f)
+                    g_GodRayBlurScale = v;
+            }
+            else if (std::strcmp(n, "GodRayRadialMask") == 0)
+                g_GodRayRadialMask = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
             else if (std::strcmp(n, "GlowCountDepthFix") == 0)
                 g_GlowCountDepthFix = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
             else if (std::strcmp(n, "ViewProjNormalFix") == 0)
@@ -1301,6 +1480,12 @@ namespace bmvr
                 if (v >= 0.f && v <= 1.5f)
                     g_VrGmanThumbSwing = v;
             }
+            else if (std::strcmp(n, "VrGmanFingerTwist") == 0)
+            {
+                const float v = static_cast<float>(atof(val));
+                if (v >= -30.f && v <= 30.f)
+                    g_VrGmanFingerTwistDeg = v;
+            }
             else if (std::strcmp(n, "VrHandsPoseOffsetMeters") == 0)
             {
                 float x = 0.f, y = 0.f, z = -0.20f;
@@ -1349,6 +1534,16 @@ namespace bmvr
                 g_PhysicalLadders = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
             else if (std::strcmp(n, "PhysicalCrouch") == 0)
                 g_PhysicalCrouch = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "Roomscale") == 0)
+                g_Roomscale = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "RoomscaleTrace") == 0)
+                g_RoomscaleTrace = atoi(val);
+            else if (std::strcmp(n, "RoomscaleDeadzoneCm") == 0)
+            {
+                const float v = static_cast<float>(atof(val));
+                if (v >= 5.f && v <= 40.f)
+                    g_RoomscaleDeadzoneCm = v;
+            }
             else if (std::strcmp(n, "PhysicalCrouchDropCm") == 0)
             {
                 const float v = static_cast<float>(atof(val));
@@ -1405,8 +1600,14 @@ namespace bmvr
                 g_CaptionScale = std::clamp(static_cast<float>(std::atof(val)), 0.5f, 2.f);
             else if (std::strcmp(n, "VrMagDiscard") == 0)
                 g_VrMagDiscard = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "VrUsageHints") == 0)
+                g_VrUsageHints = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
             else if (std::strcmp(n, "VrReloadHints") == 0)
-                g_VrReloadHints = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            {
+                // Old name: migrated to VrUsageHints after the config is read.
+                g_VrUsageHints = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+                g_OldReloadHintsSeen = true;
+            }
             else if (std::strcmp(n, "VrClipHandPose") == 0)
                 g_VrClipHandPose = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
             else if (std::strcmp(n, "VrClipHandSnap") == 0)
@@ -1514,9 +1715,16 @@ namespace bmvr
             else if (std::strcmp(n, "WorldRenderAtEyeSize") == 0)
             {
                 sawWorldEyeSize = true;
-                g_WorldEyeSizeOptIn = ParseCfgBool(val, false);
+                g_WorldEyeSizeOptIn = ParseCfgBool(val, true);
                 g_TryOffscreenWorldGrow = g_WorldEyeSizeOptIn;
             }
+        }
+        if (!sawAimMarker && (oldCrosshair >= 0 || oldLaserBeam >= 0))
+        {
+            // Old defaults were marker on + beam on.
+            const bool cross = oldCrosshair != 0, beam = oldLaserBeam != 0;
+            g_AimMarker = beam ? 3.f : (cross ? 2.f : 0.f);
+            Log("VR config: VrCrosshair=%d VrLaserBeam=%d -> AimMarker=%.0f", oldCrosshair, oldLaserBeam, g_AimMarker);
         }
         Log("VR config %ls RenderScale=%.2f TurnSpeed=%.2f snap=%d vm=(%.1f,%.1f,%.1f) touchOx=%.1f tilt=%.1f ipd=%.2f autoQueue=%d multicore=%d aa=%u worldEyeSize=%d key=%s",
             path.c_str(), g_RenderScale, g_TurnSpeed, g_SnapTurning ? 1 : 0,
@@ -1808,7 +2016,7 @@ namespace bmvr
         static int s_unflushed = 0;
         if (exeLog.empty())
         {
-            exeLog = ExeDir() + L"\\bmvr_log.txt";
+            exeLog = LogFilePath();
             modLog = ModuleDir() + L"\\bmvr_log.txt";
         }
         static std::string exeLogN;
@@ -2333,6 +2541,16 @@ namespace bmvr
             Log("Grab zones: old VrHolsterDynamic=%d migrated (%zu value%s), %s", g_VrHolsterDynamic ? 1 : 0,
                 set.size(), set.size() == 1 ? "" : "s", ok ? "ok" : "FAILED");
         }
+        // VrReloadHints became VrUsageHints (2026-11-26: hints beyond reloads).
+        // config.txt keeps only non-defaults, so the new key is written only when off.
+        if (g_OldReloadHintsSeen)
+        {
+            std::vector<std::pair<std::string, std::string>> set;
+            if (!g_VrUsageHints)
+                set.emplace_back("VrUsageHints", "false");
+            const bool ok = WriteVrConfigValues(set, { "VrReloadHints" });
+            Log("Usage hints: old VrReloadHints=%d migrated to VrUsageHints, %s", g_VrUsageHints ? 1 : 0, ok ? "ok" : "FAILED");
+        }
         // Panel rows removed in the 2026-11-19 review: their values are fixed
         // at the defaults, whatever an older config.txt still says.
         g_PhysicalLadderSmooth = true;
@@ -2364,6 +2582,7 @@ namespace bmvr
             Log("Button map: old button switches migrated (%zu mapping%s), removed from config.txt: %s",
                 set.size(), set.size() == 1 ? "" : "s", ok ? "ok" : "FAILED");
         }
+        MigrateShippedUserConfig(ExeDir() + L"\\VR\\config.txt");   // after the key migrations above
         g_FoveatedAtStart = g_Foveated > 0.f;
         ClearSkipsOnBuildChange();
         ReadSkipFile(SkipPath());

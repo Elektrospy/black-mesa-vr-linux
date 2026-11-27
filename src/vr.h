@@ -31,6 +31,7 @@ class ICallQueue;
 class CFunctor;
 class CViewSetup;
 class CUserCmd;
+class CGameTrace;
 class Hl2vrAwaitFrameFunctor;
 class McPauseHudFunctor;
 
@@ -236,6 +237,8 @@ public:
     void TickRestoreView();
     std::mutex m_CaptureMutex;
     std::string m_CaptureEngineName;          // set by the render thread, written by the game thread
+    std::string m_CaptureLogName;             // game thread: capture whose logs are copied at m_CaptureLogAt
+    DWORD m_CaptureLogAt = 0;
     Vector m_SetupVelPrev{};
     DWORD m_SetupVelPrevMs = 0;
     Vector m_SetupVelocity{};
@@ -404,7 +407,7 @@ public:
     // throw (set at the trigger release).
     std::atomic<unsigned> m_SnarkHandThrowUntil{ 0 };
     std::atomic<bool> m_ThrowFromLeft{ false }; // satchel: throw samples from the left hand
-    int MagReloadWeaponNow() const;
+    int MagReloadWeaponNow(bool holstered = false) const;
     // Left controller world pose for the viewmodel draw (render thread).
     bool OffhandWorldPoseForDraw(Vector& pos, QAngle& ang) const;
     bool ViewmodelIsShotgun() const { return (m_VmClassFlags.load(std::memory_order_relaxed) & kVmFlagShotgun) != 0; }
@@ -907,6 +910,30 @@ public:
     QAngle m_StereoFrameRightCtrlAng{};
     Vector m_StereoFrameLeftCtrlPos{};
     Vector m_StereoFrameRightCtrlPos{};
+    // Turn, recenter point, height offset and IPD as of BeginStereoFramePose.
+    // MulticoreMode turns on the render thread (VR::Update after Present)
+    // while the main thread draws the pair: both eyes must use one value.
+    float m_StereoFrameYaw = 0.f;
+    // Sync probe: tracking update count at the pair latch, and the turn yaw
+    // the last UpdateControllerTracking built the gun axes with.
+    uint32_t m_StereoFrameSeq = 0;
+    // Turn yaw the published controller poses and viewmodel axes were built
+    // with (UpdateControllerTracking, under m_ControllerMutex). The pair
+    // latches it as its yaw, so a turn step from the other thread between that
+    // update and the latch cannot rotate gun vs view/HUD (stick-turn jitter).
+    float m_CtrlYawUsed = 0.f;
+    bool m_CtrlYawSet = false;
+    Vector m_StereoFrameGunPos{};
+    QAngle m_StereoFrameGunAng{};
+    Vector m_StereoFrameVmF{}, m_StereoFrameVmR{}, m_StereoFrameVmU{};
+    Vector m_StereoFrameZero{};
+    bool m_StereoFrameOriginLatched = false;
+    float m_StereoFrameHeightUnits = 0.f;
+    float m_StereoFrameIpd = 0.f;
+    float PairYaw() const;
+    const Vector& PairZero() const;
+    bool PairOriginLatched() const;
+    float PairHeightUnits() const;
     bool m_PosesWaitedThisFrame = false;
     uint32_t m_OpenXrLastSeenHelperSubmitted = 0;
     uint32_t m_OpenXrSubmitAttempts = 0;
@@ -935,7 +962,9 @@ public:
     void CreateVRTextures();
     void SubmitVRTextures();
     void WaitPosesForStereoFrame(bool allowQueued = true);
-    void BeginStereoFramePose();
+    // body = this frame's engine view origin (the body the eyes hang on);
+    // roomscale measures how far it moved since the last pair.
+    void BeginStereoFramePose(const Vector* body = nullptr);
     void EndStereoFramePose();
     void LogOpenXrPublishRate();
     void ApplyFrameCap(int nominalHz, float sourceHz, const char* source);
@@ -952,7 +981,33 @@ public:
     void GetViewBasis(Vector* forward, Vector* right, Vector* up) const;
     Vector GetViewOriginLeft(const Vector& setupOrigin) const;
     Vector GetViewOriginRight(const Vector& setupOrigin) const;
-    Vector ControllerTrackingToWorld(const Vector& setupOrigin, const Vector& trackingPos) const;
+    // Pair state ControllerTrackingToWorld converts with (head, recenter point,
+    // turn, height). The MulticoreMode render thread draws the hand overlay of
+    // the pair before the one the game thread is latching now, so it passes the
+    // frame its HandDrawSnap captured instead of reading the live pair state
+    // (that turned the HUD/gloves with the next pair's yaw while stick turning).
+    struct TrackFrame
+    {
+        bool valid = false;
+        Vector hmdPos{}, zero{};
+        bool originLatched = false;
+        float yaw = 0.f, heightUnits = 0.f;
+    };
+    TrackFrame CurrentTrackFrame() const;
+    Vector ControllerTrackingToWorld(const Vector& setupOrigin, const Vector& trackingPos,
+        const TrackFrame* frame = nullptr) const;
+    // Gun-hand aim pose and viewmodel axes as of the stereo pair latch while a
+    // pair is drawn (live otherwise): the gun's draw-time bone re-target, the
+    // laser start and the shot direction use the same tracking sample as the
+    // HUD and gloves, also when the render thread updates tracking mid-pair.
+    const Vector& GunTrackPos() const { return m_StereoFramePoseActive ? m_StereoFrameGunPos : m_RightControllerPosAbs; }
+    const QAngle& GunTrackAng() const { return m_StereoFramePoseActive ? m_StereoFrameGunAng : m_RightControllerAngAbs; }
+    void GunBasis(Vector& f, Vector& r, Vector& u) const
+    {
+        f = m_StereoFramePoseActive ? m_StereoFrameVmF : m_ViewmodelForward;
+        r = m_StereoFramePoseActive ? m_StereoFrameVmR : m_ViewmodelRight;
+        u = m_StereoFramePoseActive ? m_StereoFrameVmU : m_ViewmodelUp;
+    }
     Vector GetRightControllerAbsPos(const Vector& eyePosition) const;
     QAngle GetRightControllerAbsAngle() const;
     Vector GetLeftControllerAbsPos(const Vector& eyePosition) const;
@@ -1021,6 +1076,8 @@ public:
         ULONGLONG centreStartMs = 0;  // centring window start (0 = none)
         float centreFrom = 0.f;       // head's sideways offset when it started
         float centred = 0.f;          // moved so far this climb (units)
+        bool centreOnLine = false;    // target = the ladder's line (else the body)
+        Vector centreLine{};          // that line's bottom (only x/y used)
     } m_LadderView;
     // Physical crouching (PhysicalCrouch). ProcessInput: head this far below
     // the recenter height holds IN_DUCK (hysteresis). RenderView: while the
@@ -1038,6 +1095,32 @@ public:
         float offset = 0.f;       // last offset sent
         ULONGLONG lastMs = 0;
     } m_CrouchView;
+    // Roomscale (bmvr::g_Roomscale). CreateMove: world-space horizontal
+    // velocity (units/s) that walks the body toward the real head, false =
+    // nothing to send (off, paused, stick in use, head inside the deadzone).
+    bool RoomscaleWish(Vector& wish);
+    // Stereo pair latch (main thread, before the zero is latched): the part
+    // of the body's move since the last pair that went toward the head is
+    // taken out of the head offset (zero shifts), so the view stays where
+    // the real head is; then the head offset is held within deadzone + 10 cm.
+    void RoomscaleFollow(const Vector& viewOrigin);
+    // Turn around the head instead of the recenter point (roomscale on):
+    // rebases the zero for a turn offset change before -> after. Caller
+    // holds m_ControllerMutex.
+    void RoomscaleTurnPivot(float yawBefore, float yawAfter);
+    struct RoomscaleState
+    {
+        bool haveBody = false;
+        Vector lastBody{0.f, 0.f, 0.f};
+        LONGLONG lastQpc = 0;       // time of lastBody (QPC), for velocity x dt
+        float carriedUnits = 0.f;   // body moves not from its own velocity (since the last summary)
+        ULONGLONG wishUntilMs = 0;  // absorb body moves until (wish + settle)
+        bool paused = true;         // last RoomscaleWish verdict, for the log
+        const char* pauseWhy = "";
+        float followedUnits = 0.f;  // since the last summary line
+        float clampedUnits = 0.f;
+        ULONGLONG lastLogMs = 0;
+    } m_Roomscale;
     // ProcessInput: grip state per hand (0 left, 1 right) for PhysicalLadderStep.
     void UpdateLadderGrips();
     std::atomic<bool> m_LadderGrip[2]{};
@@ -1050,6 +1133,10 @@ public:
     // runs; ms of the last time): a right-grip flashlight press waits a
     // moment there in case it is a ladder grab.
     std::atomic<unsigned long long> m_LadderNearMs{ 0 };
+    // Ladder trace (hooks.cpp CreateMove, wet ladders only): ms of the last
+    // fresh grip with a hand near a ladder line, rung or not; starts a
+    // per-tick log window.
+    std::atomic<unsigned long long> m_LadderGrabMs{ 0 };
     // Hand climbing: the rung each hand took hold of (world), from the
     // map's ladder props (vr_ladder_rungs). The glove is drawn there.
     struct LadderPin
@@ -1288,8 +1375,36 @@ public:
         bool gunHudTwoHand = false;
         QAngle gunHudAng{};
         Vector gunHudShift{};
+        // Sync probe: pair counter + tracking seq at capture.
+        uint32_t pairId = 0, seq = 0;
+        // Pair frame toWorld uses on the render thread (CurrentTrackFrame at capture).
+        TrackFrame track{};
     };
     void CaptureHandDrawSnap(HandDrawSnap& s);
+    // HandSyncLog (bmvr::g_HandSyncLog). CalcViewModelView: the gun-hand
+    // controller pose the viewmodel is placed from; CaptureHandDrawSnap:
+    // compared with the pose the HUD/gloves draw with; StereoCostLog: the
+    // pair's viewmodel draws per eye.
+    void NoteViewmodelPoseForSync();
+    // bmvr_sync_probe: one line per gun placement (where = cvmv / pair).
+    void SyncProbePlacement(const char* where, const Vector& base, const Vector& org, const QAngle& ang) const;
+    void CheckHandSync(const HandDrawSnap& s);
+    void NoteViewmodelDrawsForSync(int vmLeft, int vmRight, double pairMs);
+    struct HandSyncState
+    {
+        bool have = false;
+        Vector pos{ 0.f, 0.f, 0.f };
+        QAngle ang{ 0.f, 0.f, 0.f };
+        uint32_t trackSeq = 0;
+        double qpcMs = 0.0;
+        int vmCalls = 0;            // CalcViewModelView calls since the last pair
+        // 10 s summary
+        int pairs = 0, off = 0, noCall = 0, eyeMissing = 0, lines = 0, missLines = 0;
+        float maxCm = 0.f, maxDeg = 0.f, sumCm = 0.f;
+        int seqDiff[3] = { 0, 0, 0 }; // tracking updates between: 0, 1, 2+
+        ULONGLONG nextLogMs = 0;
+    } m_HandSync;
+    std::atomic<uint32_t> m_TrackingUpdateSeq{ 0 };
     // HUD values for drawing: the drawing frame's snapshot while one is drawn
     // (MC), else read live.
     bool HudValuesForDraw(int& health, int& armor, int& clip, int& reserve, int& secondary, int& air) const;
@@ -1368,6 +1483,12 @@ public:
     static constexpr float kMenuTriggerRearm = 0.5f;
     bool MenuTriggerClickHeld(bool& latch) const;
     void DrawMenuCursorOnSurface(IDirect3DDevice9* device, IDirect3DSurface9* surf);
+    // "VR SETTINGS" button stamped on the in-game pause menu (top right):
+    // a click closes the pause menu and opens the VR settings panel.
+    bool PauseVrButtonShown() const;
+    static bool PauseVrButtonRect(int w, int h, RECT& r);
+    void DrawPauseVrButtonOnSurface(IDirect3DDevice9* device, IDirect3DSurface9* surf);
+    void OpenPanelFromPauseButtonStep();
     void ApplyMenuNavigation();
     void QueueEscapeKey();
     void QueueVirtualKey(int vk);
@@ -1375,6 +1496,7 @@ public:
     void FlushPendingGameUi();
     void SyncLadderUseOnly();
     void FlushPanelEngineCommands();
+    void RestoreGodRaySamples();   // Debug "God rays samples": game value back (level shutdown, quit)
     void FlushPendingQuit();
     void NoteEngineVGui(void* engineVgui);
     // Intro logo (env_credits -> HudCredits) and env_message / game_text
@@ -1487,6 +1609,8 @@ public:
     bool TryGetAimCrosshairWorld(Vector& out) const;
     // Controller position + aim basis right now (render thread safe).
     bool AimFrameNow(Vector& pivot, Vector& f, Vector& r, Vector& u) const;
+    // AimHitLog: one log line per trigger press about what the shot ray hit.
+    void LogAimHit(const std::string& weaponKey, const Vector& origin, const Vector& dir, const CGameTrace& tr, void* player);
     // Beam ends and marker from the current pose and the last trace.
     bool AimOverlayPointsNow(Vector& beamStart, Vector& beamEnd, Vector& dot) const;
     bool GunFrameNow(Vector& origin, Vector& f, Vector& r, Vector& u) const;
@@ -1528,11 +1652,29 @@ public:
     bool SettingsPanelOpen() const { return m_SettingsOpen; }
     void OpenSettingsPanel();
     void CloseSettingsPanel(const char* why);
+    // Map or save load: god / notarget rows back to off (server flags, not read back).
+    void ResetDevCheatRows();
     // Short head-locked message (quick save); detail = optional smaller second line.
     void ShowToast(const char* text, DWORD ms = kToastMs, const char* detail = nullptr);
-    // Manual-reload hint (small toast), each id at most twice per game start;
-    // VrReloadHints off = never.
-    void ShowReloadHint(int id, const char* text);
+    // Usage hint (small toast), each id at most maxPerStart times per game
+    // start (not saved); VrUsageHints off = never.
+    enum class UsageHint : uint8_t
+    {
+        ChargingHandle, RackSlide, Pump, FlickClose, TiltDump, // reload steps
+        CarryThrow, MountedFire,                               // first two carries / mounted guns
+        Count
+    };
+    // With `detail`: the larger toast with a second line, 4 s (e.g. the action
+    // is on no button).
+    void ShowUsageHint(UsageHint id, const char* text, int maxPerStart = 2, const char* detail = nullptr);
+    // The button the player has set to action `a` on the detected controller
+    // (press slot first unless holdFirst; the default layout while mapping is
+    // off). False = none bound.
+    bool FindBoundButton(bmvr::BindAction a, bool holdFirst, const char*& label, int& hand, bool& hold) const;
+    // Hint text "<BUTTON> = <what>", e.g. "CIRCLE = THROW", "HOLD B = THROW",
+    // "RIGHT GRIP = FIRE" (hand named when the other hand has the same button);
+    // "<fallback> = <what>" and false when the action is not bound.
+    bool BoundButtonHint(bmvr::BindAction a, const char* fallback, const char* what, char* out, size_t n) const;
     bool m_ToastSmall = false;
     bool ToastVisible() const;
     void DrawToast(IDirect3DDevice9* device, int stereoEye, UINT w, UINT h,
@@ -1552,6 +1694,7 @@ public:
         const Vector& eyeOrig, const Vector& fwd, const Vector& right, const Vector& up);
     void SettingsPanelFrame(Vector& origin, Vector& fwd, Vector& right, Vector& up) const;
     static IDirect3DTexture9* SettingsGearTexture(IDirect3DDevice9* device);
+    static IDirect3DTexture9* PauseVrButtonTexture(IDirect3DDevice9* device, bool hover);
     bool m_SettingsOpen = false;
     // First-run welcome: once per map until the player opened the VR panel
     // from it, pause the game and show "hold <button> to open the VR menu"
@@ -1571,6 +1714,9 @@ public:
     // Set by the game thread, cleared by the render thread before it paints:
     // a change during a paint stays set and is painted next frame.
     std::atomic<bool> m_SettingsDirty{ false };
+    // Only the hover row/zone changed: the render thread repaints just the
+    // old and new hover rects (full repaint if it cannot).
+    std::atomic<bool> m_SettingsHoverDirty{ false };
     bool m_SettingsChanged = false;
     bool m_SettingsClickHeld = false;
     bool m_SettingsBackHeld = false;
@@ -2008,6 +2154,7 @@ private:
     float m_MenuCursorSmoothY = 0.f;
     int m_MenuCursorX = 0;
     int m_MenuCursorY = 0;
+    DWORD m_PauseButtonOpenMs = 0;   // pause menu's VR button clicked: open the panel once the menu is gone
     double m_MenuCursorSmoothMs = 0.0;
     bool m_MenuPointerLastValid = false;
     // Pointer moving (last change past the dead zone < 0.2 s ago): no dead zone.

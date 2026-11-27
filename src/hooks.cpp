@@ -4,6 +4,7 @@
 #include "game.h"
 #include "sdk.h"
 #include "bmvr_seh.h"
+#include "vr_xen_fog.h"
 #include "vr.h"
 #include "offsets.h"
 
@@ -633,6 +634,24 @@ namespace ScreenModel
         ClientCtx(const ClientCtx&) = delete;
         ClientCtx& operator=(const ClientCtx&) = delete;
     };
+
+    // Debug row "Reset model each eye" (bmvr_debug_model_reset): identity MODEL matrix before each eye
+    // pass. Repairs the leftover (+1,+1,0) on world draws headless (2026-11-26); for A/B in a bad launch.
+    inline void ResetEyeModel(bool debugRow = true)
+    {
+        ClientCtx cc;
+        if (!cc.ctx)
+            return;
+        void** vt = Vt(cc.ctx);
+        reinterpret_cast<IntFn>(vt[0x50 / 4])(cc.ctx, kModeModel);
+        reinterpret_cast<VoidFn>(vt[0x7C / 4])(cc.ctx);
+        static bool s_logged;
+        if (debugRow && !s_logged)
+        {
+            s_logged = true;
+            Game::logMsg("Reset model each eye: on (identity MODEL before each eye pass)");
+        }
+    }
 }
 // Flare log (bmvr::g_FlareLog): every switch-on is a new session, so each
 // logger starts with fresh line caps and forgets what it has seen.
@@ -2829,6 +2848,8 @@ namespace
         int dmeR = 0;
         int dmeEnt = 0;
         int dmeVm = 0;
+        int dmeVmL = 0;
+        int dmeVmR = 0;
         int dmeShadow = 0;
         int dmeBones32 = 0;
         int uniqEnt = 0;
@@ -2875,6 +2896,8 @@ namespace
         const double pairMs = leftMs + rightMs;
         const double blitMs = QpcMs(g_Cost.blitTicks);
         const double handsMs = QpcMs(g_Cost.handsTicks);
+        if (Hooks::m_VR)
+            Hooks::m_VR->NoteViewmodelDrawsForSync(g_Cost.dmeVmL, g_Cost.dmeVmR, pairMs);
         const double origMs = QpcMs(g_Cost.dmeOrigTicks);
         const double hookMs = QpcMs(g_Cost.dmeHookTicks);
         static DWORD s_lastLogMs;
@@ -3628,6 +3651,24 @@ namespace
         // drawn bones (HoldLeftHandOnMp5Body).
         // Manual magazines: the hands do the reload, so the stock reload clip
         // (also the game's own refill after firing dry) is not shown.
+        const int holsteredGun = MagReload::g_HolsteredWeapon.load(std::memory_order_relaxed);
+        if (label && Hooks::m_Game && viewmodel == static_cast<void*>(Hooks::m_Game->GetViewModelEntity())
+            && holsteredGun != MagReload::kWeaponNone)
+        {
+            // Empty hands: only the stock reload / shell clips, nothing else
+            // below (crossbow idle swaps need the drawn gun).
+            char lb[64]{};
+            for (int i = 0; i < 63 && label[i]; ++i)
+                lb[i] = static_cast<char>(tolower(static_cast<unsigned char>(label[i])));
+            if (std::strstr(lb, "reload") || (holsteredGun == MagReload::kWeaponShotgun && std::strstr(lb, "shell")))
+            {
+                static int s_log;
+                if (s_log++ < 20)
+                    Game::logMsg("Mag reload: stock clip '%s' not shown (gun put away)", label);
+                ForceViewmodelIdlePose(viewmodel, hdr);
+                return;
+            }
+        }
         if (label && Hooks::m_Game && viewmodel == static_cast<void*>(Hooks::m_Game->GetViewModelEntity())
             && MagReload::g_Weapon.load(std::memory_order_relaxed) != MagReload::kWeaponNone)
         {
@@ -4358,6 +4399,10 @@ namespace
             for (int k = 0; k < 12; ++k)
                 MagReload::g_GunWrist[h][k].store(m[k], std::memory_order_relaxed);
             MagReload::g_GunWristMs[h].store(now ? now : 1, std::memory_order_release);
+            if (h == 1 && bmvr::g_SyncProbeEyes >= 1.f && Hooks::m_VR)
+                Game::logMsg("SyncBones pairs=%u act=%d t=%.2f wrist=%.2f,%.2f,%.2f yaw=%.3f thr=%lu",
+                    Hooks::m_VR->m_OpenXrStereoPairs, Hooks::m_VR->m_StereoFramePoseActive ? 1 : 0,
+                    [] { LARGE_INTEGER f{}, c{}; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&c); return f.QuadPart ? 1000.0 * (double)c.QuadPart / (double)f.QuadPart : 0.0; }(), m[3], m[7], m[11], atan2f(m[4], m[0]) * 57.29578f, GetCurrentThreadId());
         }
     }
 
@@ -9833,6 +9878,19 @@ void __fastcall Hooks::dRenderView(void* ecx, void* edx, CViewSetup& setup, int 
         BMVR_PROF("RenderView eye pass (game)");
         if (m_VR)
             ReplayOccluderView(m_VR->m_StereoEye);
+        if (bmvr::g_DebugModelReset)
+            ScreenModel::ResetEyeModel();
+        else if (bmvr::g_WorldModelFix && InterlockedExchange(&bmvr::g_ModelLeakSeen, 0))
+        {
+            ScreenModel::ResetEyeModel(false);
+            static int s_fixLog;
+            if (s_fixLog < 20)
+            {
+                ++s_fixLog;
+                Game::logMsg("World model leak: leftover (+1,+1,0) model matrix seen on uploads -> identity model loaded (eye %d)",
+                    m_VR ? m_VR->m_StereoEye : -1);
+            }
+        }
         hkRenderView.fOriginal(ecx, view, clearFlags, drawFlags);
     };
 
@@ -9901,7 +9959,12 @@ void __fastcall Hooks::dRenderView(void* ecx, void* edx, CViewSetup& setup, int 
         setup.origin.y += shift.y;
     }
     if (m_VR && mainView)
+    {
         m_VR->m_SetupOrigin = setup.origin;
+        // Xen fog noise "Centre eye": one point both eyes' fog passes share.
+        const Vector centre = m_VR->GetViewOrigin(setup.origin);
+        bmvr::SetXenFogAnchor(centre.x, centre.y, centre.z);
+    }
     {
         // Headless diagnostic (BMVR_VIEW_TRACE=1): the engine's view for the
         // main pass ~4x per second, to compare scripted cameras with ours.
@@ -10169,7 +10232,7 @@ void __fastcall Hooks::dRenderView(void* ecx, void* edx, CViewSetup& setup, int 
             return;
         }
         m_VR->m_StereoEyesDrawnThisFrame = true;
-        m_VR->BeginStereoFramePose();
+        m_VR->BeginStereoFramePose(&setup.origin);
         if (m_VR->ShouldHwndBlitStereo())
         {
             // Simulator 1280 eyes / 2560 G-buffer: do not shrink CViewSetup to
@@ -11033,7 +11096,23 @@ bool __fastcall Hooks::dCreateMove(void* ecx, void* edx, float flInputSampleTime
             else if (physLadderOn && physLadder.topExit)
                 pitch = 0.f;     // level head view: the dismount faced, or forward over the edge
             else if (ladderMountAssist)
+            {
                 yaw = ladderMountYaw;
+                // Hand mount fully under water: the use press and the
+                // engine's forced move onto the ladder (movetype NONE) look
+                // straight up. The first ladder tick after that move is
+                // processed with this view, and FullLadderMove floats the
+                // player off to an info_ladder_dismount faced within 40 u
+                // (see the hand-climb case above). At the bm_c2a5a dam
+                // ladder a node at its foot (-5048,-660,785) sits right
+                // behind the rungs, so grabs at the lower rungs mounted and
+                // were then pushed there (LadderTrace, user 2026-11-27).
+                // The use still mounts: LookingAtLadder only checks the
+                // flat view direction, and Findladder ignores the view.
+                if (physLadderOn && m_Game && m_Game->LocalPlayerWaterLevel() >= 3
+                    && (physLadder.useEdge || m_Game->LocalPlayerMoveType() == 0))
+                    pitch = -89.f;
+            }
             static int s_ladderLog;
             if (s_ladderLog < 24)
             {
@@ -11135,6 +11214,14 @@ bool __fastcall Hooks::dCreateMove(void* ecx, void* edx, float flInputSampleTime
             const Vector wish = hmdF * analogF + hmdR * analogS;
             cmd->forwardmove += DotProduct2D(wish, cF);
             cmd->sidemove += DotProduct2D(wish, cR);
+            // Roomscale (beta): walk the body after the real head (world
+            // velocity, same aim basis as the stick; engine collision/steps).
+            Vector roomWish;
+            if (!ladderMode && m_VR->RoomscaleWish(roomWish))
+            {
+                cmd->forwardmove += DotProduct2D(roomWish, cF);
+                cmd->sidemove += DotProduct2D(roomWish, cR);
+            }
             // Swimming: the engine's WaterMove goes along the full 3D view
             // (forward * fmove + right * smove, upmove added to z), and the
             // view is the weapon aim, so a two-handed gun aimed up/down made
@@ -11240,6 +11327,74 @@ bool __fastcall Hooks::dCreateMove(void* ecx, void* edx, float flInputSampleTime
     applyControllerAim();
     if (m_VR)
         ZeroPlayerViewRecoil(localPlayer);
+    // Ladder trace, wet ladders only (user 2026-11-27: a grab under water
+    // pushes the player sideways instead of climbing; headless swimming is
+    // impractical, so the headset run logs it). A grab near a ladder or a
+    // ladder movetype change with water at the feet or higher opens a 3 s
+    // window that logs every tick: the final usercmd, our ladder step, and
+    // where the player went. A movetype change off the ladder that we did
+    // not ask for (no drop / top exit / use) is the engine's own exit, e.g.
+    // HL2 FullLadderMove's underwater float to a dismount node.
+    if (m_VR && m_Game)
+    {
+        static ULONGLONG s_traceUntil = 0, s_traceStart = 0, s_lastGrab = 0;
+        static int s_windows = 0, s_prevMt = -1;
+        static Vector s_prevOrg{};
+        static bool s_havePrev = false;
+        const ULONGLONG tNow = GetTickCount64();
+        const int wl = m_Game->LocalPlayerWaterLevel();
+        const int mt = m_Game->LocalPlayerMoveType();
+        Vector org{};
+        const bool haveOrg = m_Game->LocalPlayerAbsOrigin(org);
+        const ULONGLONG grab = m_VR->m_LadderGrabMs.load(std::memory_order_relaxed);
+        const bool freshGrab = grab != s_lastGrab;
+        s_lastGrab = grab;
+        const bool mtChange = s_prevMt >= 0 && mt != s_prevMt && (mt == 9 || s_prevMt == 9);
+        if ((freshGrab || mtChange) && wl >= 1)
+        {
+            if (tNow >= s_traceUntil && s_windows < 40)
+            {
+                ++s_windows;
+                s_traceStart = tNow;
+                Game::logMsg("LadderTrace: window %d (%s), water %d, movetype %d, origin (%.1f,%.1f,%.1f)",
+                    s_windows, freshGrab ? "grab" : "movetype change", wl, mt, org.x, org.y, org.z);
+            }
+            if (s_traceStart && tNow < s_traceStart + 15000)
+                s_traceUntil = tNow + 3000;
+        }
+        static ULONGLONG s_oursMs = 0;   // our drop / top exit (a mount's use press is not an exit)
+        if (physLadderOn && (physLadder.drop || physLadder.topExit))
+            s_oursMs = tNow;
+        if (mtChange && tNow < s_traceUntil)
+        {
+            const bool ours = s_oursMs && tNow - s_oursMs < 300;
+            Game::logMsg("LadderTrace: movetype %d -> %d, water %d, %s", s_prevMt, mt, wl,
+                mt == 9 ? "mounted" : (ours ? "our exit (drop / top)" : "ENGINE EXIT (not asked for by us)"));
+        }
+        if (tNow < s_traceUntil && haveOrg)
+        {
+            const Vector d = s_havePrev ? org - s_prevOrg : Vector(0.f, 0.f, 0.f);
+            const float ti = m_Game->TickInterval();
+            const int b = cmd->buttons;
+            Game::logMsg("LadderTrace +%.3f wl %d mt %d org (%.1f,%.1f,%.1f) v (%.0f,%.0f,%.0f) "
+                "cmd f %.0f s %.0f u %.0f ang %.0f/%.0f btn%s%s%s%s%s | step %d%s%s%s%s%s%s dir %d | pins %d%d touch %d%d",
+                (tNow - s_traceStart) * 0.001f, wl, mt, org.x, org.y, org.z,
+                d.x / ti, d.y / ti, d.z / ti,
+                cmd->forwardmove, cmd->sidemove, cmd->upmove, cmd->viewangles.x, cmd->viewangles.y,
+                (b & IN_USE) ? " USE" : "", (b & IN_FORWARD) ? " FWD" : "", (b & IN_BACK) ? " BACK" : "",
+                (b & IN_JUMP) ? " JUMP" : "", (b & (IN_MOVELEFT | IN_MOVERIGHT)) ? " STRAFE" : "",
+                physLadderOn ? 1 : 0,
+                physLadder.onLadder ? " on" : "", physLadder.mountPush ? " push" : "", physLadder.mountRise ? " rise" : "",
+                physLadder.useEdge ? " use" : "", physLadder.drop ? " drop" : "", physLadder.topExit ? " top" : "",
+                physLadder.dir,
+                m_VR->m_LadderPin[0].valid ? 1 : 0, m_VR->m_LadderPin[1].valid ? 1 : 0,
+                m_VR->m_LadderTouch[0].load(std::memory_order_relaxed) ? 1 : 0,
+                m_VR->m_LadderTouch[1].load(std::memory_order_relaxed) ? 1 : 0);
+        }
+        s_prevMt = mt;
+        s_prevOrg = org;
+        s_havePrev = haveOrg;
+    }
     if (m_VR)
         m_VR->ApplyWorldVguiTriggerClick(cmd);
     if (m_VR)
@@ -11409,6 +11564,8 @@ void __fastcall Hooks::dCalcViewModelView(void* ecx, void* edx, void* owner, con
             // lag/bob and $origin are in the same frame as the hard-lock.
             const Vector targetOrigin = m_VR->GetRecommendedViewmodelAbsPos(ladderEye);
             const QAngle targetAng = m_VR->GetRecommendedViewmodelAbsAngle();
+            m_VR->NoteViewmodelPoseForSync();
+            m_VR->SyncProbePlacement("cvmv", ladderEye, targetOrigin, targetAng);
             // Crowbar idle-force runs in SuppressViewmodelMovementAnims.
             // MP5 fire sequences must keep playing (never idle-force those).
             if (mp5)
@@ -11731,7 +11888,13 @@ void __fastcall Hooks::dDrawModelExecute(void* ecx, void* edx, void* state, cons
         if (AuxSceneRtBound())
             ++g_Cost.dmeShadow;
         if (isViewmodel)
+        {
             ++g_Cost.dmeVm;
+            if (g_Cost.eye == 1)
+                ++g_Cost.dmeVmL;
+            else if (g_Cost.eye == 2)
+                ++g_Cost.dmeVmR;
+        }
         if (entityIndex > 1)
         {
             ++g_Cost.dmeEnt;
