@@ -80,7 +80,7 @@ namespace bmvr
     float g_AimPitchOffset = 0.f;
     bool g_DisableRecoilAim = true;
     float g_IPDScale = 1.f;
-    float g_HeightOffset = 0.f;
+    float g_HeightOffsetCm = 0.f;
     bool g_AutoMatQueueMode = false;
     bool g_MulticoreMode = true;
     uint32_t g_Msaa = 0; // eye MSAA 0/2/4 (private eye targets only; FXAA stays on next to it)
@@ -132,11 +132,14 @@ namespace bmvr
     bool g_OffCenterEyes = true;
     bool g_FakeRuntime = false;
     bool g_MirrorBothEyes = false;
+    bool g_DesktopEyeRight = true;
     // Fixes: on by default, a config key can turn each off.
     bool g_VrShotOriginFix = true;
     bool g_VrShootFromMuzzle = true;
     bool g_TwoHandHoldWhileGrip = true;
     bool g_TwoHandGripToggle = false;
+    bool g_TwoHandToggleAutoRelease = true;
+    float g_TwoHandGripScale = 1.f;
     bool g_VrPistolSemiAuto = false;
     bool g_VrGlockRapidAlt = false;
     float g_FlashlightFrom = 0.f;
@@ -190,9 +193,8 @@ namespace bmvr
     bool g_AutoSwitchEmpty = false;
     bool g_DeltaSeqIdle = true;
     bool g_ScopeClipIdle = true;
-    bool g_TwoHandNoLower = true;
+    bool g_NoLowerAtFriendly = true;
     bool g_CrowbarHitDrawnBar = true;
-    bool g_TwoHandLoweredFollow = true;
     bool g_ThrowStroke = false;
     bool g_MuteFidgetSounds = true;
     // Optional features: off unless enabled in VR/config.txt.
@@ -355,6 +357,8 @@ namespace bmvr
     bool g_LoadingCard = true;
     bool g_TitleLevel = true;
     bool g_TitleGlow = true;
+    float g_BootHudInset = 125.f;
+    float g_BootHudScale = 1.3f;
     bool g_ParticlesLast = true;
     float g_GlowProxyScale = 1.0f;
     float g_VrRpgRingScale = 0.25f;
@@ -430,18 +434,25 @@ namespace bmvr
     bool g_VrClipHandRpgFlip = true;
     bool g_VrMagDiscard = true;
     float g_VrNearZ = 4.f;
+    float g_CaptionHeightDeg = 0.f;
+    float g_CaptionScale = 1.f;
     bool g_VrRecoil = false;
     bool g_PhysicalLadders = false;
+    bool g_PhysicalCrouch = false;
+    float g_PhysicalCrouchDropCm = 50.f; // user 2026-11-25 (was 35)
     float g_VmTunePitch = 0.f, g_VmTuneYaw = 0.f, g_VmTuneRoll = 0.f, g_VmTuneSupportCm = 0.f;
     float g_VmTuneSeatCm = 6.f, g_VmTuneSeatDeg = 45.f;
     bool g_PhysicalLadderSmooth = true;
     bool g_LadderBodyFollowsArms = true;
+    bool g_LadderCentreHead = true;
     float g_LadderGunHand = 1.f;
     bool g_LadderStickClimb = false;
     float g_LadderHandBack = 1.5f;   // user 2026-11-20 (was 3)
     bool g_LadderHandWrap = true;
     float g_LadderGripCurl = 0.7f;
     float g_LadderTuneOutCm = 0.f, g_LadderTuneUpCm = 0.f, g_LadderTuneCurl = 0.7f;
+    float g_AmmoHudForward = 0.f, g_AmmoHudSide = 0.f, g_AmmoHudUp = 0.f, g_AmmoHudTilt = 0.f, g_AmmoHudTurn = 0.f, g_AmmoHudRoll = 0.f, g_AmmoHudSize = 2.f;
+    bool g_TwoHandAmmoHudFollowsHand = false;
     float g_SatchelGripCurl = 0.75f;
     float g_SatchelBagDepth = 1.5f;
     // User's headset tuning 2026-11-20 (was curl 0.45, out 2, rest 0).
@@ -832,11 +843,11 @@ namespace bmvr
             else if (std::strcmp(n, "IPDScale") == 0)
             {
                 const float s = static_cast<float>(atof(val));
-                if (s >= 0.5f && s <= 2.f)
+                if (s >= 0.8f && s <= 1.2f)
                     g_IPDScale = s;
             }
             else if (std::strcmp(n, "HeightOffset") == 0)
-                g_HeightOffset = static_cast<float>(atof(val));
+                g_HeightOffsetCm = static_cast<float>(atof(val));
             else if (std::strcmp(n, "AutoMatQueueMode") == 0)
                 g_AutoMatQueueMode = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
             else if (std::strcmp(n, "MulticoreMode") == 0)
@@ -967,6 +978,14 @@ namespace bmvr
                 g_WeaponMenuTilt = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
             else if (std::strcmp(n, "TwoHandGripToggle") == 0)
                 g_TwoHandGripToggle = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "TwoHandToggleAutoRelease") == 0)
+                g_TwoHandToggleAutoRelease = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "TwoHandGripScale") == 0)
+            {
+                const float v = static_cast<float>(atof(val));
+                if (v >= 0.5f && v <= 2.f)
+                    g_TwoHandGripScale = v;
+            }
             else if (std::strcmp(n, "VrHolsterBack") == 0)
                 ;   // retired 2026-11-24: holstering in the weapon's own zone is always on
             else if (std::strcmp(n, "VrHolsterDynamic") == 0)
@@ -1099,10 +1118,8 @@ namespace bmvr
                 g_DeltaSeqIdle = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
             else if (std::strcmp(n, "CrowbarHitDrawnBar") == 0)
                 g_CrowbarHitDrawnBar = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
-            else if (std::strcmp(n, "TwoHandNoLower") == 0)
-                g_TwoHandNoLower = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
-            else if (std::strcmp(n, "TwoHandLoweredFollow") == 0)
-                g_TwoHandLoweredFollow = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "NoLowerAtFriendly") == 0)
+                g_NoLowerAtFriendly = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
             else if (std::strcmp(n, "ScopeClipIdle") == 0)
                 g_ScopeClipIdle = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
             else if (std::strcmp(n, "ThrowStroke") == 0)
@@ -1111,6 +1128,8 @@ namespace bmvr
                 g_MuteFidgetSounds = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
             else if (std::strcmp(n, "MirrorBothEyes") == 0)
                 g_MirrorBothEyes = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "DesktopEye") == 0)
+                g_DesktopEyeRight = _strnicmp(val, "left", 4) != 0;
             else if (std::strcmp(n, "VRRuntimeBackend") == 0)
                 g_FakeRuntime = (_strnicmp(val, "fake", 4) == 0
                     && (val[4] == 0 || val[4] == ' ' || val[4] == '\t'));
@@ -1328,8 +1347,18 @@ namespace bmvr
                 g_RpgRocketShown = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
             else if (std::strcmp(n, "PhysicalLadders") == 0)
                 g_PhysicalLadders = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "PhysicalCrouch") == 0)
+                g_PhysicalCrouch = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "PhysicalCrouchDropCm") == 0)
+            {
+                const float v = static_cast<float>(atof(val));
+                if (v >= 15.f && v <= 80.f)
+                    g_PhysicalCrouchDropCm = v;
+            }
             else if (std::strcmp(n, "LadderBodyFollowsArms") == 0)
                 g_LadderBodyFollowsArms = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "LadderCentreHead") == 0)
+                g_LadderCentreHead = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
             else if (std::strcmp(n, "PhysicalLadderSmooth") == 0)
                 g_PhysicalLadderSmooth = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
             else if (std::strcmp(n, "LadderStickClimb") == 0)
@@ -1370,6 +1399,10 @@ namespace bmvr
                 g_VrGrenadePin = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
             else if (std::strcmp(n, "VrNearZ") == 0)
                 g_VrNearZ = static_cast<float>(std::atof(val));
+            else if (std::strcmp(n, "CaptionHeight") == 0)
+                g_CaptionHeightDeg = std::clamp(static_cast<float>(std::atof(val)), -30.f, 30.f);
+            else if (std::strcmp(n, "CaptionScale") == 0)
+                g_CaptionScale = std::clamp(static_cast<float>(std::atof(val)), 0.5f, 2.f);
             else if (std::strcmp(n, "VrMagDiscard") == 0)
                 g_VrMagDiscard = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
             else if (std::strcmp(n, "VrReloadHints") == 0)

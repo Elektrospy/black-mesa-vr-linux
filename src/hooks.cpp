@@ -3554,14 +3554,15 @@ namespace
         // frame. On the glock, MP5 and 357 the two transition clips carry
         // swapped activities, so the raise plays the lowering clip and idle
         // fades in from a lowered gun: keep the beam off a little longer.
-        // Both hands on the gun: the hands place the gun, so Black Mesa's
-        // lowered clip (aimed at a friendly) is not shown and the laser stays
-        // on (user 2026-11-17: the clip swung the gun ~33 deg across, away
-        // from both real hands; lowering is up to the player's own arms).
+        // The hands place the gun, so Black Mesa's lowered clip (aimed at a
+        // friendly) is not shown and the laser stays on, one- or two-handed
+        // (user 2026-11-17: the clip swung the gun ~33 deg across, away from
+        // the real hands; 2026-11-25: one-handed too, the gun must not move
+        // without the player aiming).
         bool noLower = false;
         if (Hooks::m_Game && viewmodel == static_cast<void*>(Hooks::m_Game->GetViewModelEntity()))
         {
-            noLower = s_lc.lowered && bmvr::g_TwoHandNoLower && Hooks::m_VR->TwoHandGripActive();
+            noLower = s_lc.lowered && bmvr::g_NoLowerAtFriendly;
             const bool lowered = s_lc.lowered && !noLower;
             static ULONGLONG s_loweredUntil = 0;
             const ULONGLONG now = GetTickCount64();
@@ -3603,8 +3604,8 @@ namespace
             if (s_lc.equip || !s_cmpMatch)
                 s_switchUntil = now + 150;
             Hooks::m_VR->NoteViewmodelBeamHidden(beamHide || now < s_loweredUntil || now < s_switchUntil);
-            // Same 300 ms tail for the support glove: idle blends in from the
-            // lowered pose, and the glove follows the wrist back up.
+            // Same 300 ms tail for the clip state: idle blends in from the
+            // lowered pose.
             const int lowerState = (lowered || now < s_loweredUntil) ? VR::kVmLowerLowered
                 : (!beamHide && !s_lc.action ? VR::kVmLowerIdle : VR::kVmLowerOther);
             Hooks::m_VR->NoteViewmodelLowerState(lowerState, hdr);
@@ -3614,7 +3615,7 @@ namespace
             {
                 static int s_log;
                 if (s_log++ < 20)
-                    Game::logMsg("Two-hand: lowered clip '%s' skipped, gun stays in the hands", label ? label : "?");
+                    Game::logMsg("No lower: lowered clip '%s' skipped, gun stays in the hand", label ? label : "?");
             }
         }
         if (noLower)
@@ -4051,50 +4052,6 @@ namespace
     }
 
     int FindWeaponRootBone(unsigned char* hdr, float rest[3], char (&bestName)[64]);
-
-    // Weapon root bone in the gun frame of this draw (origin + unit axes; the
-    // bones may carry the viewmodel scale), for the two-hand glove while the
-    // lowered clip moves the gun. Matrix columns are the bone's axes.
-    void SampleViewmodelWeaponRoot(unsigned char* hdr, const float* bones12, int nBones,
-        const Vector& gunO, const Vector& gunF, const Vector& gunR, const Vector& gunU)
-    {
-        if (!hdr || !bones12 || nBones <= 0 || !Hooks::m_VR || !Hooks::m_VR->TwoHandGripActive())
-            return;
-        static unsigned char* s_hdr = nullptr;   // render thread only
-        static int s_idx = -1;
-        if (hdr != s_hdr)
-        {
-            s_hdr = hdr;
-            float rest[3]{};
-            char name[64]{};
-            s_idx = FindWeaponRootBone(hdr, rest, name);
-        }
-        if (s_idx < 0 || s_idx >= nBones)
-            return;
-        const float* m = bones12 + s_idx * 12;
-        Vector o, ax[3];
-        BMVR_TRY
-        {
-            o = Vector(m[3], m[7], m[11]);
-            for (int c = 0; c < 3; ++c)
-                ax[c] = Vector(m[c], m[4 + c], m[8 + c]);
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER)
-        {
-            return;
-        }
-        if (!std::isfinite(o.x) || !std::isfinite(o.y) || !std::isfinite(o.z))
-            return;
-        for (int c = 0; c < 3; ++c)
-        {
-            Vector w = ax[c];
-            if (!std::isfinite(w.x) || !std::isfinite(w.y) || !std::isfinite(w.z) || VectorNormalize(w) <= 0.01f)
-                return;
-            ax[c] = Vector(w.Dot(gunF), w.Dot(gunR), w.Dot(gunU));
-        }
-        const Vector d = o - gunO;
-        Hooks::m_VR->NoteDrawnWeaponRootLocal(hdr, Vector(d.Dot(gunF), d.Dot(gunR), d.Dot(gunU)), ax);
-    }
 
     // Frag grenade: the grenade is its own root bone (GrenadeSpawn, pins are
     // its children) and the pin-pull/throw animations swing it across the
@@ -5836,7 +5793,10 @@ namespace
             else
                 s_grabbing = false;
             MagReload::g_BoltPull.store(pull);
-            const float back = MagReload::g_SlideLocked.load() ? travel : (std::min)(handBack, travel);
+            // Held back: almost fully, and the hand pulls it the rest of the way.
+            const float back = MagReload::g_SlideLocked.load()
+                ? (std::min)(travel * MagReload::kSlideHeldBack + handBack, travel)
+                : (std::min)(handBack, travel);
             b[3] -= f.x * back;
             b[7] -= f.y * back;
             b[11] -= f.z * back;
@@ -9935,6 +9895,8 @@ void __fastcall Hooks::dRenderView(void* ecx, void* edx, CViewSetup& setup, int 
         const Vector shift = m_VR->PhysicalLadderViewShift(setup.origin);
         if (off != 0.f)
             setup.origin.z += off;
+        // Physical crouching: the view stays at the real head.
+        setup.origin.z += m_VR->PhysicalCrouchViewOffset(setup.origin.z - off);
         setup.origin.x += shift.x;
         setup.origin.y += shift.y;
     }
@@ -11280,6 +11242,8 @@ bool __fastcall Hooks::dCreateMove(void* ecx, void* edx, float flInputSampleTime
         ZeroPlayerViewRecoil(localPlayer);
     if (m_VR)
         m_VR->ApplyWorldVguiTriggerClick(cmd);
+    if (m_VR)
+        m_VR->UpdateFreeHandUseTarget();
     const bool vguiAteAttack = (buttonsBeforeOriginal & (IN_ATTACK | IN_ATTACK2)) != 0
         && (cmd->buttons & (IN_ATTACK | IN_ATTACK2)) == 0;
     if (m_VR && m_VR->EmptyHands() && !m_VR->OnMountedGun())
@@ -11306,6 +11270,10 @@ bool __fastcall Hooks::dCreateMove(void* ecx, void* edx, float flInputSampleTime
             ApplyPistolAltButton(m_Game, m_VR, cmd);
         }
     }
+    // Alt-fire while carrying a prop (VR input): the pickup controller's
+    // throw is a fire press; IN_ATTACK2 would drop it instead.
+    if (m_VR && m_VR->CarryThrowActive())
+        cmd->buttons = (cmd->buttons & ~IN_ATTACK2) | IN_ATTACK;
     // Hands-only physical ladders: a Use press near a ladder (left trigger,
     // or the empty right hand) made HL2's LadderMove mount it and pull the
     // player on (user 2026-11-20). Not on a ladder and not during a hand
@@ -11421,7 +11389,7 @@ void __fastcall Hooks::dCalcViewModelView(void* ecx, void* edx, void* owner, con
         // Hand climbing lifts the view (PhysicalLadderViewOffset, last
         // frame's value): the gun hand moves with it.
         Vector ladderEye = eyePosition;
-        ladderEye.z += m_VR->m_LadderView.offset;
+        ladderEye.z += m_VR->m_LadderView.offset + m_VR->m_CrouchView.offset;
         ladderEye.x += m_VR->m_LadderView.shift.x;
         ladderEye.y += m_VR->m_LadderView.shift.y;
         // Uncoupled viewmodel: same world pose both eyes (sd805 / Portal 2).
@@ -11963,7 +11931,6 @@ void __fastcall Hooks::dDrawModelExecute(void* ecx, void* edx, void* state, cons
                 }
                 SampleViewmodelOffhandGrip(hdr, &g_ScaledViewmodelBones[slot][0][0][0], nBones);
                 SampleStockOffhandFingers(hdr, &g_ScaledViewmodelBones[slot][0][0][0], nBones);
-                SampleViewmodelWeaponRoot(hdr, &g_ScaledViewmodelBones[slot][0][0][0], nBones, o, gf, gr, gu);
                 if (gunRightHand)
                 {
                 {
@@ -13920,6 +13887,26 @@ void Hooks::EnsureWeaponShootOriginHooks()
             hkGrabSetTarget.pTarget = p;
         }
     }
+    if (server && !hkPlayerUse.pTarget)
+    {
+        auto* p = reinterpret_cast<unsigned char*>(server) + Offsets::kCBasePlayer_PlayerUse_Server;
+        MEMORY_BASIC_INFORMATION mbi{};
+        // aligned-frame prologue, sub esp 0xC8, cookie, mov edi,ecx; mov eax,[edi+0xAD8]
+        if (VirtualQuery(p, &mbi, sizeof(mbi)) && (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY))
+            && CodeBytesMatch(p, "538BDC83EC0883E4F083C404558B6B04896C24048BEC81ECC8000000A1????????33C58945FC56578BF98B87D80A0000"))
+        {
+            if (hkPlayerUse.createHook(p, &dPlayerUse) == 0 && hkPlayerUse.enableHook() == 0)
+                Game::logMsg("Hook enabled: server PlayerUse rva=0x%X", Offsets::kCBasePlayer_PlayerUse_Server);
+            else
+                Game::logMsg("server PlayerUse hook failed");
+        }
+        else
+        {
+            Game::logMsg("server PlayerUse skipped (bytes/rva 0x%X)", Offsets::kCBasePlayer_PlayerUse_Server);
+            Game::noteMissingOffset("server PlayerUse");
+        }
+        hkPlayerUse.pTarget = p;
+    }
     if (server && !hkGetShootAngles.pTarget)
     {
         auto* p = reinterpret_cast<unsigned char*>(server) + Offsets::kBlackMesaPlayer_GetShootAngles_Server;
@@ -14037,7 +14024,7 @@ void Hooks::EnsureWeaponShootOriginHooks()
     s_done = vfxDone
         && hkClientWeaponShootPosition.pTarget && hkGetAttachmentVec.pTarget
         && hkGetAttachmentMatrix.pTarget && hkServerWeaponShootPosition.pTarget
-        && hkServerGrabHoldOrigin.pTarget && hkGrabSetTarget.pTarget
+        && hkServerGrabHoldOrigin.pTarget && hkGrabSetTarget.pTarget && hkPlayerUse.pTarget
         && hkGetShootAngles.pTarget && hkClientGetShootAngles.pTarget
         && hkGrenadeCreate.pTarget && hkGrenadeThrowPosition.pTarget;
 }
@@ -14146,6 +14133,70 @@ Vector* __fastcall Hooks::dServerBmShootSource(void* ecx, void* edx, Vector* out
     if (hkServerBmShootSource.fOriginal)
         return hkServerBmShootSource.fOriginal(ecx, out);
     return out;
+}
+
+// Free-hand Use (VR::UpdateUseGrab / UpdateFreeHandUseTarget), on the
+// server tick after the game's own Use: the same AcceptInput("Use") the
+// game's PlayerUse sends, to the entity the free hand points at. Continuous
+// entities (chargers) every tick while held, impulse ones (doors, buttons)
+// once per press, on/off ones on at the press and off at the release.
+void __fastcall Hooks::dPlayerUse(void* ecx, void* edx)
+{
+    (void)edx;
+    if (hkPlayerUse.fOriginal)
+        hkPlayerUse.fOriginal(ecx);
+    if (!m_VR || !m_Game || !ecx)
+        return;
+    struct Variant { uint32_t v[3]; uint32_t ehandle; int fieldType; };
+    using tObjectCaps = int(__thiscall*)(void*);
+    using tAcceptInput = bool(__thiscall*)(void*, const char*, void*, void*, Variant, int);
+    auto serverEntity = [](int index) { return m_Game->ServerEntityByIndex(index); };
+    auto vfn = [](void* ent, int off) { return *reinterpret_cast<void**>(*reinterpret_cast<char**>(ent) + off); };
+    auto use = [&](void* ent, int useType) {
+        const Variant empty{ { 0, 0, 0 }, 0xFFFFFFFFu, 0 };
+        reinterpret_cast<tAcceptInput>(vfn(ent, Offsets::kServerEntity_AcceptInputVtOff))(ent, "Use", ecx, ecx, empty, useType);
+    };
+    constexpr int kCapImpulse = 0x10, kCapContinuous = 0x20, kCapOnOff = 0x40;
+    static uint32_t s_doneSeq = 0;
+    static int s_onOffIndex = 0;
+    static int s_logs = 0;
+    const int index = m_VR->m_FreeUseHeld.load(std::memory_order_acquire)
+        ? m_VR->m_FreeUseEntIndex.load(std::memory_order_acquire) : 0;
+    const uint32_t seq = m_VR->m_FreeUsePressSeq.load(std::memory_order_acquire);
+    BMVR_TRY
+    {
+        if (s_onOffIndex && s_onOffIndex != index)
+        {
+            if (void* ent = serverEntity(s_onOffIndex))
+                use(ent, 0);
+            s_onOffIndex = 0;
+        }
+        void* ent = serverEntity(index);
+        if (ent && ent != ecx)
+        {
+            const int caps = reinterpret_cast<tObjectCaps>(vfn(ent, Offsets::kServerEntity_ObjectCapsVtOff))(ent);
+            if (caps & kCapContinuous)
+                use(ent, 3);
+            else if ((caps & (kCapImpulse | kCapOnOff)) && seq != s_doneSeq)
+            {
+                use(ent, (caps & kCapOnOff) ? 1 : 3);
+                if (caps & kCapOnOff)
+                    s_onOffIndex = index;
+            }
+            if ((caps & (kCapImpulse | kCapContinuous | kCapOnOff)) && seq != s_doneSeq)
+            {
+                s_doneSeq = seq;
+                if (s_logs++ < 30)
+                    Game::logMsg("Free-hand Use: entity %d caps 0x%X -> %s", index, caps,
+                        (caps & kCapContinuous) ? "continuous" : (caps & kCapOnOff) ? "on" : "toggle");
+            }
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        if (s_logs++ < 30)
+            Game::logMsg("Free-hand Use: exception (entity %d)", index);
+    }
 }
 
 void __fastcall Hooks::dGrabSetTarget(void* ecx, void* edx, Vector* pos, QAngle* ang)

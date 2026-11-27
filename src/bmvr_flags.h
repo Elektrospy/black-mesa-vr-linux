@@ -204,7 +204,7 @@ namespace bmvr
     // fire stops walking upward. The viewmodel still kicks.
     extern bool g_DisableRecoilAim;
     extern float g_IPDScale;
-    extern float g_HeightOffset;
+    extern float g_HeightOffsetCm;
     extern bool g_AutoMatQueueMode;
     // Default play path: 1x-eye stereo + SetThreadMode(2) after warmup.
     // Menu / load stay queue 0. Config MulticoreMode=false turns it off.
@@ -335,6 +335,9 @@ namespace bmvr
     // side, each whole eye texture stretched into one half (tests take
     // screenshots of it).
     extern bool g_MirrorBothEyes;
+    // DesktopEye=right (default) / left: which eye the desktop window shows
+    // (cover-cropped to the window aspect).
+    extern bool g_DesktopEyeRight;
     // VrShotOriginFix=true (default): bullets fired through server player
     // vtable +0x474 leave from the controller ray (TryGetVrShootOrigin), not
     // the head. false = old behaviour (tests compare both).
@@ -344,6 +347,8 @@ namespace bmvr
     // Fixes, default on (a config key can turn each off):
     extern bool g_TwoHandHoldWhileGrip;  // long guns stay two-handed while the grip is held
     extern bool g_TwoHandGripToggle;     // support grip latches: squeeze on the gun = on, squeeze again = off
+    extern bool g_TwoHandToggleAutoRelease; // latched grip also lets go when the support hand leaves the gun
+    extern float g_TwoHandGripScale;     // support-hand grip zone scale (1 = default; rear end fixed, 0.5..2)
     // Pistols (glock, .357): one shot per trigger pull; holding fires no more (off = hold repeats, game default).
     extern bool g_VrPistolSemiAuto;
     // Glock: a pull within VrGlockRapidWindow s of the last one fires Black Mesa's alt-fire (fast, wide spread).
@@ -450,8 +455,7 @@ namespace bmvr
     extern bool g_ThrowStroke;           // frag throw velocity from the throwing stroke (far point of the hold -> release)
     extern bool g_DeltaSeqIdle;          // a delta layer as the main viewmodel sequence shows idle (tau/crossbow)
     extern bool g_CrowbarHitDrawnBar;    // crowbar hit sweep along the drawn v_crowbar bar (not the old HL2VR grip frame)
-    extern bool g_TwoHandNoLower;        // both hands on the gun: no lowered clip at friendlies, laser stays on
-    extern bool g_TwoHandLoweredFollow;  // two-hand support glove follows the gun's lowered clip (aimed at a friendly)
+    extern bool g_NoLowerAtFriendly;     // no lowered clip at friendlies (one or two hands), laser stays on
     extern bool g_ScopeClipIdle;         // crossbow to/from-scope clips show idle (the clip moves the gun to the eye)
     extern bool g_MuteFidgetSounds;      // weapon fidget clips play no sound (the pose is frozen in VR)
     // Optional features, default off:
@@ -744,8 +748,15 @@ namespace bmvr
     extern bool g_TitleLevel;
     // TitleGlow (default on, panel DEBUG > FIXES: RENDERING, not saved): the
     // title layer gets flat Black Mesa's hud_post look (bloom + scanlines,
-    // client 0x267c40).
+    // client 0x267c40). Skipped while a boot-up panel shows (HEV / long jump).
     extern bool g_TitleGlow;
+    // HEV suit / long jump boot-up sequence on the head-locked title layer
+    // (panel DEBUG > FIXES: RENDERING, not saved). BootHudInset: the left and
+    // right parts moved this many pixels (of the 1920-wide screen) toward the
+    // centre for the paint, so the text sits inside the clear part of the
+    // lens. BootHudScale: the layer's width while a boot-up shows.
+    extern float g_BootHudInset;
+    extern float g_BootHudScale;
     // ParticlesLast (default true since 2026-11-17, panel DEBUG > FIXES: RENDERING): hold the main view's
     // particles to the end of the translucent pass also when "MSAA skips
     // particles" does not (MSAA 0 or that row off), as a pure draw-order change
@@ -900,6 +911,13 @@ namespace bmvr
     // scale). Lower = guns/hands held at the face clip later (sights), at
     // some depth precision far away. Only ever lowers the game's value.
     extern float g_VrNearZ;
+    // Subtitles / closed captions (panel GENERAL > VIEW, saved): CaptionHeight
+    // moves the head-locked caption layer up (+) / down (-) in degrees,
+    // CaptionScale sizes it around the caption text. Both relative to a
+    // built-in base (+4 deg, 1.1x; vr.cpp). Only while captions show without
+    // a title / logo / boot-up on the same layer.
+    extern float g_CaptionHeightDeg;
+    extern float g_CaptionScale;
     // VR recoil: each shot kicks the gun + aim up (per-weapon amount, back in
     // ~0.15 s); both hands on the gun cut it to 30 % (pistol grip 50 %).
     // Off by default (user A/B). Strength scales every weapon's kick.
@@ -907,6 +925,12 @@ namespace bmvr
     // Physical ladders: grip a ladder with either hand and pull/push to
     // climb (the stick still climbs too). On by default.
     extern bool g_PhysicalLadders;
+    // Physical crouching: the head this many cm below the recenter height
+    // crouches the player (back up 6 cm higher stands again). The view stays
+    // at the real head: the engine's lower crouch eye is added back while
+    // the duck is a physical one. Off by default.
+    extern bool g_PhysicalCrouch;
+    extern float g_PhysicalCrouchDropCm;
     // VR panel DEBUG "HELD WEAPON ANGLE": pitch/yaw/roll (degrees) of the held
     // weapon, on top of the built-in table; live, saved per weapon in
     // VR/viewmodel_offsets.txt (ax ay az), not in config.txt.
@@ -924,6 +948,7 @@ namespace bmvr
     // Physical ladders: the view follows the climb hand every frame instead
     // of LadderMove's per-tick bursts (render offset only). On by default.
     extern bool g_PhysicalLadderSmooth;
+    extern bool g_LadderCentreHead;      // hand climbing: head slid sideways onto the ladder's middle at the start of a climb
     extern bool g_LadderBodyFollowsArms; // hand climbing: view closer/further from the ladder with the arms
     // Physical ladders, the gun hand: 0 = grabbing holsters the weapon (back
     // when off the ladder), 1 = only an empty hand grabs a ladder (default),
@@ -942,6 +967,17 @@ namespace bmvr
     // VR panel DEBUG "LADDER GRIP TUNING": the last held ladder model's grip
     // (out toward the player / up, cm; curl), saved in VR/ladder_grip.txt.
     extern float g_LadderTuneOutCm, g_LadderTuneUpCm, g_LadderTuneCurl;
+    // VR panel DEBUG "AMMO HUD (SAVED PER WEAPON)": the ammo panel beside the gun
+    // hand, for the weapon in the hand. Forward / sideways (+ = away from the
+    // gun) / up in game units, tilt / turn / roll in degrees, size in game units
+    // (2 = the old fixed size). Live, saved per weapon in VR/ammo_hud.txt.
+    extern float g_AmmoHudForward, g_AmmoHudSide, g_AmmoHudUp, g_AmmoHudTilt, g_AmmoHudTurn, g_AmmoHudRoll, g_AmmoHudSize;
+    // Panel row `f` is one of the ammo HUD rows: `def` = its built-in value
+    // for the weapon in the hand (what "Reset tab" puts back).
+    bool AmmoHudRowDefault(const float* f, float& def);
+    // DEBUG row: two-handed long gun, ammo panel on the gun-hand controller
+    // (old) instead of the gun's two-hand aim (default, user 2026-11-25).
+    extern bool g_TwoHandAmmoHudFollowsHand;
     extern float g_SatchelBagDepth;
     extern float g_RpgFistCurl, g_RpgFistOutCm;
     extern float g_RpgHandTurn, g_RpgHandRoll, g_RpgHandSpin, g_RpgHandFwdCm, g_RpgHandUpCm, g_RpgHandSideCm; // RPG rocket in the left hand: finger curl, rocket out of the palm (cm)

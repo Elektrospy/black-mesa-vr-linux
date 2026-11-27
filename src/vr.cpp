@@ -2109,6 +2109,8 @@ namespace
         return hr;
     }
 
+    bool Rt0IsGrownReflection(VR* vr, UINT& w, UINT& h);
+
     HRESULT __stdcall HookedSetDepthStencil(IDirect3DDevice9* device, IDirect3DSurface9* depth)
     {
         VR* vr = (g_Game && g_Game->m_VR) ? g_Game->m_VR : nullptr;
@@ -2128,6 +2130,34 @@ namespace
             && SurfaceMatchesWindowOrBackbuffer(device, depth))
         {
             depth = eyeDepth;
+        }
+        // Mono pass (main menu background map) on a grown reflection RT: the
+        // engine binds the window depth (1920x1080), shorter than the RT
+        // (1728x1760), so the remapped full-RT viewport would still only draw
+        // where the depth exists. Lend it the left eye's depth (eye-sized, not
+        // in use outside a stereo pass; the reflection view clears it first).
+        // Shaderapi binds RT0 before the depth, so RT0 is already the new one.
+        UINT reflW = 0, reflH = 0;
+        if (vr && device && !eyeDepth && depth && vr->m_D9LeftEyeDepthSurface
+            && depth != vr->m_D9LeftEyeDepthSurface
+            && !vr->StereoWorldPassActive()
+            && Rt0IsGrownReflection(vr, reflW, reflH)
+            && SurfaceMatchesWindowOrBackbuffer(device, depth))
+        {
+            D3DSURFACE_DESC dd{}, ed{};
+            if (SUCCEEDED(depth->GetDesc(&dd)) && (dd.Width < reflW || dd.Height < reflH)
+                && SUCCEEDED(vr->m_D9LeftEyeDepthSurface->GetDesc(&ed))
+                && ed.Width >= reflW && ed.Height >= reflH)
+            {
+                static int s_monoReflDsLog;
+                if (s_monoReflDsLog < 4)
+                {
+                    Game::logMsg("D3D mono reflection RT %ux%u: depth %ux%u -> left eye depth %ux%u",
+                        reflW, reflH, dd.Width, dd.Height, ed.Width, ed.Height);
+                    ++s_monoReflDsLog;
+                }
+                depth = vr->m_D9LeftEyeDepthSurface;
+            }
         }
         if (!g_OrigSetDepthStencil)
             return D3DERR_INVALIDCALL;
@@ -2159,19 +2189,22 @@ namespace
     }
 
     // RT0 is one of the reflection RTs grown by ReflectionRtScale, in a
-    // stereo eye pass. The reflection/refraction views inherit the main
-    // view's window-sized CViewSetup (1920x1080), so their window-sized
-    // viewports, scissors, clears and texel-size constants must map to this
-    // RT, not to the eye. Left alone, the lobby mirror floor drew only into
-    // the top-left 1920x1080 of its 2000x2048 RTs: floor black below 52 % and
-    // past 96 % of the eye (2026-10-30). At ReflectionRtScale 1 the RT is
-    // eye-sized and the eye path below already handles it.
+    // stereo eye pass or a mono pass (main menu background map). The
+    // reflection/refraction views inherit the main view's window-sized
+    // CViewSetup (1920x1080), so their window-sized viewports, scissors,
+    // clears and texel-size constants must map to this RT, not to the eye.
+    // Left alone, the lobby mirror floor drew only into the top-left
+    // 1920x1080 of its 2000x2048 RTs: floor black below 52 % and past 96 % of
+    // the eye (2026-10-30). Mono too: the menu's lobby background (background02)
+    // filled only the top 1728x1080 of its 1728x1760 RT and the floor went
+    // black (2026-11-24). At ReflectionRtScale 1 the RT is eye-sized and the
+    // eye path below already handles it.
     bool Rt0IsGrownReflection(VR* vr, UINT& w, UINT& h)
     {
         if (!vr || (bmvr::g_ReflectionRtW <= 0 && bmvr::g_RefractCopyRtW <= 0)
             || !g_Rt0ActualKnown || !g_Rt0ActualPtr)
             return false;
-        if (vr->m_CaptureReentry || vr->HudPaintActive() || !vr->StereoWorldPassActive())
+        if (vr->m_CaptureReentry || vr->HudPaintActive())
             return false;
         // Exact size: +-16 px also matched the eye/2 bloom brightpass target
         // (2008x2048 next to 2000x2048) and remapped it every frame.
@@ -5830,8 +5863,8 @@ void VR::WriteCaptureState(const std::string& name, const L4D2VROpenXrPoseDesc* 
         FmtVec(t, "check_eye_left", GetViewOriginLeft(m_SetupOrigin));
         FmtVec(t, "check_eye_right", GetViewOriginRight(m_SetupOrigin));
         FmtVec(t, "check_right_hand", GetRightControllerAbsPos(m_SetupOrigin));
-        std::snprintf(b, sizeof(b), "eye_size %u %u\nheight_offset %.4f\neye_z %.4f\nvr_scale %.4f\nipd_scale %.4f\n",
-            m_RenderWidth, m_RenderHeight, bmvr::g_HeightOffset, m_EyeZ, m_VRScale, m_IpdScale);
+        std::snprintf(b, sizeof(b), "eye_size %u %u\nheight_offset_cm %.2f\neye_z %.4f\nvr_scale %.4f\nipd_scale %.4f\n",
+            m_RenderWidth, m_RenderHeight, bmvr::g_HeightOffsetCm, m_EyeZ, m_VRScale, m_IpdScale);
         t += b;
     }
     const std::string base = bmvr::VrFilePath(name.c_str());
@@ -6317,7 +6350,10 @@ bool VR::PublishOpenXrHudOverlay(uint32_t frameId)
     // Title texts stay in front of the eyes; the pause menu stays put in the room.
     // TitleLevel: titles take the pause-menu path too (the helper places the
     // layer level at the head's yaw once per epoch; UpdateTitleHud bumps it).
-    if (!WantPauseWorldOverlay() && WantTitleHudOverlay() && !bmvr::g_TitleLevel)
+    // Suit boot-up sequences are always head-locked (HUD inside the helmet).
+    // Captions too (head-locked at the bottom of the view, issue #18).
+    if (!WantPauseWorldOverlay() && WantTitleHudOverlay() &&
+        (!bmvr::g_TitleLevel || m_BootHudActive || m_CaptionHudActive))
         overlay.reserved1 |= L4D2VR_OPENXR_OVERLAY_FLAG_HEAD_LOCKED;
     // Title texts are published premultiplied (TitlePremultipliedShader).
     if (!WantPauseWorldOverlay() && WantTitleHudOverlay())
@@ -6327,11 +6363,28 @@ bool VR::PublishOpenXrHudOverlay(uint32_t frameId)
 
     float dist = 0.f, width = 0.f, yOff = 0.f;
     GetMenuOverlayMetrics(dist, width, yOff);
+    if (!WantPauseWorldOverlay() && m_BootHudActive)
+        width *= std::clamp(bmvr::g_BootHudScale, 0.5f, 2.f);
     overlay.widthMeters = (std::max)(0.10f, width);
     overlay.heightMeters = overlay.widthMeters *
         (static_cast<float>(hud.m_VulkanData.m_nHeight) /
             static_cast<float>((std::max)(1u, hud.m_VulkanData.m_nWidth)));
     overlay.distanceMeters = (std::max)(0.10f, dist);
+    // Subtitle height / size (GENERAL > VIEW): scale around the caption box
+    // (it sits below the layer centre), then move by the angle.
+    if (!WantPauseWorldOverlay() && m_CaptionOnly)
+    {
+        // The rows are relative to the user's headset-tested look (2026-11-25:
+        // height +4 deg, size 1.1x = row values 0 / 1.00).
+        constexpr float kBaseHeightDeg = 4.f, kBaseScale = 1.1f;
+        const float s = kBaseScale * std::clamp(bmvr::g_CaptionScale, 0.5f, 2.f);
+        const float deg = kBaseHeightDeg + std::clamp(bmvr::g_CaptionHeightDeg, -30.f, 30.f);
+        const float h0 = overlay.heightMeters;
+        overlay.widthMeters *= s;
+        overlay.heightMeters *= s;
+        yOff += (m_CaptionCentreY - 0.5f) * h0 * (s - 1.f);
+        yOff += overlay.distanceMeters * std::tan(deg * 0.01745329f);
+    }
     overlay.curvature = 0.0f;
     overlay.offsetMeters[0] = 0.0f;
     overlay.offsetMeters[1] = yOff;
@@ -6996,6 +7049,10 @@ void VR::UpdateButtonMap()
     }
     if (m_ButtonMapper.Pressed(BindAction::Recenter))
         Recenter("mapped button");
+    // Bare hands toggle: its own action since 2026-11-25 (the fixed layout
+    // still does it on a short stick click, UpdateWeaponMenu).
+    if (m_ButtonMapper.Pressed(BindAction::HandsToggle) && m_Game && !m_WeaponMenuOpen && !PauseUiActive())
+        ToggleEmptyHands();
     if (m_ButtonMapper.Pressed(BindAction::VrSettings) && (!paused || m_WelcomeActive) && !m_WeaponMenuOpen)
     {
         Game::logMsg("Button map: VR settings panel");
@@ -7262,12 +7319,32 @@ void VR::ProcessInput()
         }
         else
             s_detWas = false;
+        // Carried prop (flare, can, crate; user 2026-11-24): alt-fire sends
+        // the game's own flat throw, a fire press on the pickup controller
+        // (fixed strength, along the usercmd angles, which follow the grab
+        // hand while carrying). One short pulse per press, added to the final
+        // usercmd in Hooks::dCreateMove (past the empty-hands fire strip and
+        // the gun filters); never IN_ATTACK2 there, that drops the prop.
+        const bool carrying = m_GrabLatched && GrabControllerRecentlyActive()
+            && !m_OnGun && !m_OnTrainControls;
+        static bool s_carryAltWas = false;
+        const bool carryAlt = !menuOwnsButtons && carrying && PressedDigitalAction(m_ActionSecondaryAttack);
+        if (carryAlt && !s_carryAltWas)
+        {
+            m_CarryThrowUntilMs.store(GetTickCount64() + kCarryThrowPulseMs, std::memory_order_release);
+            static int s_carryThrowLogs;
+            if (s_carryThrowLogs++ < 30)
+                Game::logMsg("Carry throw: alt-fire while carrying (%s hand) -> fire pulse %u ms",
+                    m_GrabHandLeft ? "left" : "right", static_cast<unsigned>(kCarryThrowPulseMs));
+        }
+        // Held on after the throw: no alt-fire for the gun until released.
+        s_carryAltWas = carryAlt || (s_carryAltWas && PressedDigitalAction(m_ActionSecondaryAttack));
         if (!menuOwnsButtons && m_OnGun)
         {
             if (PressedDigitalAction(m_ActionSecondaryAttack))
                 buttons |= IN_ATTACK;
         }
-        else if (!menuOwnsButtons && !emptyHands && PressedDigitalAction(m_ActionSecondaryAttack))
+        else if (!menuOwnsButtons && !emptyHands && !s_carryAltWas && PressedDigitalAction(m_ActionSecondaryAttack))
             buttons |= IN_ATTACK2;
         if (UpdateScopeRaise(!menuOwnsButtons && !emptyHands && !m_OnGun && !paused))
             buttons |= IN_ATTACK2;
@@ -7384,6 +7461,7 @@ void VR::ProcessInput()
             s_crouchAxis = false;
         if (m_CrouchToggled)
             buttons |= IN_DUCK;
+        UpdatePhysicalCrouch(buttons);
         if (m_ButtonMapActive ? m_SprintMapToggle : bmvr::g_SprintToggle)
         {
             // Click latches; letting the move stick back to centre (or a
@@ -7404,7 +7482,9 @@ void VR::ProcessInput()
             if (m_SprintLatched && nx * nx + ny * ny < 0.5f * 0.5f
                 && GetTickCount() - s_sprintSinceMs > 600)
                 m_SprintLatched = false;
-            if (primaryHeld)
+            // Only as fire: the right trigger as Use (carrying with the right
+            // hand, empty hands) ended the sprint every frame (user 2026-11-24).
+            if (primaryHeld && !rightUse)
                 m_SprintLatched = false;
             if (m_SprintLatched)
                 buttons |= IN_SPEED;
@@ -8084,7 +8164,7 @@ Vector VR::GetViewOriginUnshifted(const Vector& setupOrigin) const
         PivotYaw(delta, yaw);
         center += delta;
     }
-    center.z += bmvr::g_HeightOffset;
+    center.z += bmvr::g_HeightOffsetCm * 0.01f * m_VRScale;   // cm -> game units
     return center;
 }
 
@@ -8160,7 +8240,7 @@ Vector VR::ControllerTrackingToWorld(const Vector& setupOrigin, const Vector& tr
         if (!std::isfinite(delta.x) || !std::isfinite(delta.y) || !std::isfinite(delta.z))
             return GetViewOrigin(setupOrigin);
         world += delta;
-        world.z += bmvr::g_HeightOffset;
+        world.z += bmvr::g_HeightOffsetCm * 0.01f * m_VRScale;
         return world;
     }
     return GetViewOrigin(setupOrigin) + arm;
@@ -8950,6 +9030,83 @@ bool VR::PhysicalLadderStep(PhysicalLadderCmd& out)
     return true;
 }
 
+void VR::UpdatePhysicalCrouch(uint32_t& buttons)
+{
+    CrouchViewState& c = m_CrouchView;
+    c.otherDuck = (buttons & IN_DUCK) != 0;
+    bool want = false;
+    float dropCm = 0.f;
+    if (bmvr::g_PhysicalCrouch && m_Game && m_VRScale > 0.f
+        && !m_LadderView.active && !m_LadderActive.load(std::memory_order_acquire)
+        && m_Game->LocalPlayerMoveType() != 9)
+    {
+        std::lock_guard<std::recursive_mutex> lock(m_ControllerMutex);
+        if (m_HmdOriginLatched && m_HmdPoseValid)
+        {
+            dropCm = (m_HmdPosAbsZero.z - m_HmdPosAbs.z) / m_VRScale * 100.f;
+            const float enter = bmvr::g_PhysicalCrouchDropCm;
+            want = c.active ? dropCm > enter - 6.f : dropCm >= enter;
+        }
+    }
+    if (want != c.active)
+        Game::logMsg("Physical crouch %s (head %.0f cm below the recenter height, threshold %.0f)",
+            want ? "on" : "off", dropCm, bmvr::g_PhysicalCrouchDropCm);
+    c.active = want;
+    if (want)
+    {
+        buttons |= IN_DUCK;
+        c.owned = true;
+    }
+}
+
+float VR::PhysicalCrouchViewOffset(float eyeZ)
+{
+    CrouchViewState& c = m_CrouchView;
+    const ULONGLONG now = GetTickCount64();
+    float dt = c.lastMs ? (now - c.lastMs) * 0.001f : 0.f;
+    c.lastMs = now;
+    if (dt > 0.1f)
+        dt = 0.1f;
+    Vector origin{};
+    if (!bmvr::g_PhysicalCrouch || !m_Game || !m_Game->LocalPlayerAbsOrigin(origin))
+    {
+        c.owned = false;
+        c.offset = 0.f;
+        return 0.f;
+    }
+    const int flags = m_Game->LocalPlayerFlags();
+    const bool onGround = flags < 0 || (flags & 1);   // FL_ONGROUND
+    const bool ducked = flags >= 0 && (flags & 2);    // FL_DUCKING
+    const float eye = eyeZ - origin.z;
+    // Standing eye height (BM: 64), learnt while nothing asks for a duck.
+    if (onGround && !ducked && !c.active && !c.otherDuck && eye > 40.f && eye < 80.f)
+        c.standEye = eye;
+    float target = 0.f;
+    if (c.owned)
+    {
+        target = c.standEye - eye;
+        target = target < 0.f ? 0.f : (target > 40.f ? 40.f : target);
+        // Stood up (or a stick/button crouch took over): not ours any more.
+        if (!c.active && (target < 0.5f || c.otherDuck))
+        {
+            c.owned = false;
+            target = 0.f;
+        }
+    }
+    // On the ground the engine lerps its eye down; follow it exactly (the
+    // limit is far above the duck speed). In the air the engine lifts the
+    // origin instead of lowering the eye: keep the offset, ease on landing.
+    if (onGround)
+    {
+        const float maxStep = 400.f * dt;
+        const float d = target - c.offset;
+        c.offset += d > maxStep ? maxStep : (d < -maxStep ? -maxStep : d);
+    }
+    else if (!c.owned)
+        c.offset = 0.f;
+    return c.offset;
+}
+
 float VR::PhysicalLadderViewOffset(float renderZ)
 {
     LadderViewState& v = m_LadderView;
@@ -9006,6 +9163,74 @@ float VR::PhysicalLadderViewOffset(float renderZ)
     return off;
 }
 
+void VR::PhysicalLadderCentreHead(const Vector& body, ULONGLONG now, float dt)
+{
+    // LadderMove keeps the body on the ladder's middle, but the head is
+    // wherever the player stands from their recenter spot (no room-scale
+    // body follow): 15 cm off made climbing feel lopsided (user 2026-11-24,
+    // capture-20261124-221718 bm_c3a2h: rungs held at y -2086 / -2074, body
+    // -2080, eyes -2085.7). At the start of a climb the tracking zero slides
+    // along the rung so the head sits over the middle, like a sideways-only
+    // recenter. Only in a short window: leaning later is not undone. It
+    // stays after the climb (the body is then simply under the head).
+    LadderViewState& v = m_LadderView;
+    if (!v.active)
+        return;
+    if (now - v.lastActiveMs > 1000)
+    {
+        v.centreStartMs = now;
+        v.centreFrom = 0.f;
+        v.centred = 0.f;
+    }
+    v.lastActiveMs = now;
+    if (!v.centreStartMs || !bmvr::g_PhysicalLadders || !bmvr::g_LadderCentreHead || body.LengthSqr() <= 1.f)
+        return;
+    constexpr ULONGLONG kWindowMs = 700;
+    const bool last = now - v.centreStartMs >= kWindowMs;
+    Vector axis{};
+    bool haveAxis = false;
+    for (int h = 0; h < 2 && !haveAxis; ++h)
+    {
+        if (!m_LadderPin[h].valid || !m_LadderPin[h].hasAxis)
+            continue;
+        axis = m_LadderPin[h].axis;
+        axis.z = 0.f;
+        haveAxis = VectorNormalize(axis) > 0.1f;
+    }
+    float lateral = 0.f;
+    if (haveAxis && !last)
+    {
+        std::lock_guard<std::recursive_mutex> lock(m_ControllerMutex);
+        const Vector eye = ControllerTrackingToWorld(body, m_StereoFramePoseActive ? m_StereoFrameHmdPosAbs : m_HmdPosAbs);
+        lateral = (eye - body).Dot(axis);
+        if (v.centred == 0.f)
+        {
+            v.centreFrom = lateral;
+            // Already near the middle: leave the view alone.
+            if (fabsf(lateral) < 2.f)
+            {
+                v.centreStartMs = 0;
+                return;
+            }
+        }
+        // ~120 ms ease; the eye moves by -d when the zero moves by R^-1(d).
+        const float a = dt > 0.f ? 1.f - expf(-dt / 0.12f) : 0.f;
+        const float step = lateral * a;
+        Vector d = axis * step;
+        PivotYaw(d, -m_RotationOffsetY.load(std::memory_order_acquire));
+        m_HmdPosAbsZero.x += d.x;
+        m_HmdPosAbsZero.y += d.y;
+        v.centred += step;
+    }
+    if (last)
+    {
+        if (v.centred != 0.f)
+            Game::logMsg("Ladder centre: head moved %.1f units sideways onto the ladder's middle (was %.1f off)",
+                v.centred, v.centreFrom);
+        v.centreStartMs = 0;
+    }
+}
+
 Vector VR::PhysicalLadderViewShift(const Vector& body)
 {
     // The body hangs at LadderMove's fixed distance from the ladder; the
@@ -9024,6 +9249,7 @@ Vector VR::PhysicalLadderViewShift(const Vector& body)
     s_lastMs = now;
     if (dt > 0.1f)
         dt = 0.1f;
+    PhysicalLadderCentreHead(body, now, dt);
     Vector want(0.f, 0.f, 0.f);
     int n = 0;
     // Cap: 8 units for the usual ladders (rungs ~24 units in front of the
@@ -9329,7 +9555,7 @@ void VR::NoteViewmodelLowerState(int state, const void* studioHdr)
 
 bool VR::StockOffhandFingersIdleSettled() const
 {
-    // Same settle as the gun-root reference: idle blends in over ~0.2 s and
+    // Idle blends in over ~0.2 s and
     // the render thread draws a frame behind.
     return m_VmLowerState.load(std::memory_order_relaxed) == kVmLowerIdle
         && GetTickCount64() - m_VmLowerIdleSinceMs.load(std::memory_order_relaxed) >= 250;
@@ -9353,83 +9579,6 @@ bool VR::GetStockOffhandFingers(float rel[15][12]) const
         return false;
     std::memcpy(rel, m_StockFingers, sizeof(m_StockFingers));
     return true;
-}
-
-void VR::NoteDrawnWeaponRootLocal(const void* studioHdr, const Vector& pos, const Vector axes[3])
-{
-    // Only the weapon's own viewmodel (Black Mesa draws a second one that idles).
-    if (!studioHdr || studioHdr != m_VmLowerHdr.load(std::memory_order_relaxed))
-        return;
-    const int state = m_VmLowerState.load(std::memory_order_relaxed);
-    std::lock_guard<std::recursive_mutex> lock(m_ControllerMutex);
-    if (studioHdr != m_GunRootSampleHdr)
-    {
-        m_GunRootSampleHdr = studioHdr;
-        m_GunRootRefValid = false;
-    }
-    m_GunRootLivePos = pos;
-    for (int i = 0; i < 3; ++i)
-        m_GunRootLiveAx[i] = axes[i];
-    m_GunRootLiveValid = true;
-    // Reference = idle pose, once idle has settled: the render thread draws a
-    // frame behind, and idle blends in from the clip before it over ~0.2 s.
-    if (state == kVmLowerIdle
-        && GetTickCount64() - m_VmLowerIdleSinceMs.load(std::memory_order_relaxed) >= 250)
-    {
-        m_GunRootRefPos = pos;
-        for (int i = 0; i < 3; ++i)
-            m_GunRootRefAx[i] = axes[i];
-        m_GunRootRefValid = true;
-    }
-}
-
-void VR::ApplyLoweredOffhand(Vector& gripLocal)
-{
-    const bool lowered = m_VmLowerState.load(std::memory_order_relaxed) == kVmLowerLowered;
-    if (!lowered)
-    {
-        // One line per lowered episode, with the largest wrist move applied.
-        if (m_TwoHandLoweredLogged)
-        {
-            m_TwoHandLoweredLogged = false;
-            static int s_log;
-            if (s_log < 20)
-            {
-                ++s_log;
-                Game::logMsg("Two-hand lowered: glove followed the gun (palm moved up to %.1f, gun turned up to %.0f deg)",
-                    m_TwoHandLoweredMaxMove, m_TwoHandLoweredMaxTurn);
-            }
-        }
-        m_TwoHandLoweredMaxMove = 0.f;
-        m_TwoHandLoweredMaxTurn = 0.f;
-        return;
-    }
-    if (!bmvr::g_TwoHandLoweredFollow || !m_GunRootRefValid || !m_GunRootLiveValid)
-        return;
-    const float scale = m_VRScale > 1.f ? m_VRScale : 39.37f;
-    const Vector moved = m_GunRootLivePos - m_GunRootRefPos;
-    if (moved.Length() > 0.5f * scale)   // implausible for one gun: leave the glove
-        return;
-    // Points on the gun body: v -> live * ref^-1 (v - refPos) + livePos.
-    auto turn = [&](const Vector& v) {
-        return m_GunRootLiveAx[0] * v.Dot(m_GunRootRefAx[0])
-            + m_GunRootLiveAx[1] * v.Dot(m_GunRootRefAx[1])
-            + m_GunRootLiveAx[2] * v.Dot(m_GunRootRefAx[2]);
-    };
-    // The glove keeps its own pose and tilt (user 2026-11-17): it only moves,
-    // by as much as the gun point under the palm moves. The glove's origin is
-    // at the wrist, ~9 cm behind the palm along the gun; moving the origin
-    // point instead leaves the palm above a gun that pitches down.
-    const Vector palm = gripLocal + Vector(0.09f * scale, 0.f, 0.f);
-    const Vector palmMove = turn(palm - m_GunRootRefPos) + m_GunRootLivePos - palm;
-    gripLocal = gripLocal + palmMove;
-    m_TwoHandLoweredLogged = true;
-    // Rotation angle from the trace of live * ref^-1.
-    const float tr = m_GunRootLiveAx[0].Dot(m_GunRootRefAx[0]) + m_GunRootLiveAx[1].Dot(m_GunRootRefAx[1])
-        + m_GunRootLiveAx[2].Dot(m_GunRootRefAx[2]);
-    const float c = (std::max)(-1.f, (std::min)(1.f, (tr - 1.f) * 0.5f));
-    m_TwoHandLoweredMaxMove = (std::max)(m_TwoHandLoweredMaxMove, palmMove.Length());
-    m_TwoHandLoweredMaxTurn = (std::max)(m_TwoHandLoweredMaxTurn, std::acos(c) * 57.29578f);
 }
 
 bool VR::TryGetRawMuzzleWorld(Vector& origin) const
@@ -9808,6 +9957,62 @@ static bool UseEntityIsHeldProp(Game* game)
     return !UseEntityIsWorldToggle(game);
 }
 
+// Free-hand Use target (CreateMove, client): a short thin sweep along the
+// free hand's aim from just behind the hand. Physics props are left out (their
+// Use is a pickup). Hooks::dPlayerUse reads the index on the server tick.
+void VR::UpdateFreeHandUseTarget()
+{
+    int index = 0;
+    const bool held = m_FreeUseHeld.load(std::memory_order_acquire);
+    const bool left = m_FreeUseLeft.load(std::memory_order_relaxed);
+    if (held && m_Game && m_Game->m_EngineTrace && m_Game->m_EngineClient && m_Game->m_ClientEntityList
+        && (left ? m_LeftControllerTrackingValid : m_RightControllerTrackingValid))
+    {
+        Vector body = m_HasStereoBodyOrigin ? m_StereoBodyOrigin : m_SetupOrigin;
+        const Vector hand = left ? GetLeftControllerAbsPos(body) : GetRightControllerAbsPos(body);
+        Vector fwd{};
+        QAngle::AngleVectors(left ? GetLeftControllerAbsAngle() : GetRightControllerAbsAngle(), &fwd, nullptr, nullptr);
+        if (hand.LengthSqr() > 1.f && VectorNormalize(fwd) > 0.01f)
+        {
+            constexpr float kBehind = 8.f, kReach = 64.f, kHull = 3.f;
+            C_BaseEntity* player = m_Game->GetClientEntity(m_Game->m_EngineClient->GetLocalPlayer());
+            CTraceFilterSkipSelf filter(player, 0);
+            CGameTrace tr{};
+            tr.fraction = 1.f;
+            tr.m_pEnt = nullptr;
+            Ray_t ray;
+            ray.Init(hand - fwd * kBehind, hand + fwd * kReach, Vector(-kHull, -kHull, -kHull), Vector(kHull, kHull, kHull));
+            m_Game->m_EngineTrace->TraceRay(ray, MASK_SHOT_HULL, &filter, &tr);
+            C_BaseEntity* hit = (tr.fraction < 1.f && tr.m_pEnt && tr.m_pEnt != player) ? static_cast<C_BaseEntity*>(tr.m_pEnt) : nullptr;
+            if (hit)
+            {
+                const int top = m_Game->m_ClientEntityList->GetHighestEntityIndex();
+                for (int i = 1; i <= top && !index; ++i)
+                {
+                    if (m_Game->GetClientEntity(i) == hit)
+                        index = i;
+                }
+                const char* cls = index ? m_Game->GetEntityClientClassName(hit) : nullptr;
+                char lower[96]{};
+                for (size_t k = 0; cls && cls[k] && k + 1 < sizeof(lower); ++k)
+                    lower[k] = static_cast<char>(tolower(static_cast<unsigned char>(cls[k])));
+                if (std::strstr(lower, "phys"))
+                    index = 0;
+                static int s_lastIndex = -1;
+                static int s_log;
+                if (index != s_lastIndex && s_log < 40)
+                {
+                    ++s_log;
+                    const char* mdl = m_Game->GetEntityModelName(hit);
+                    Game::logMsg("Free-hand Use target: %d %s model %s", index, cls ? cls : "?", mdl ? mdl : "-");
+                }
+                s_lastIndex = index;
+            }
+        }
+    }
+    m_FreeUseEntIndex.store(index, std::memory_order_release);
+}
+
 void VR::ClearUseGrab()
 {
     m_GrabLatched = false;
@@ -9827,6 +10032,37 @@ void VR::ClearUseGrab()
 
 void VR::UpdateUseGrab(uint32_t& buttons, bool leftUse, bool rightUse)
 {
+    // Free hand (user 2026-11-24): with Use latched on one hand, the other
+    // hand's Use no longer joins the game's (one) Use. It goes to what that
+    // hand points at through the server (Hooks::dPlayerUse): a door or button
+    // while the first hand carries a prop (a game Use press would drop it),
+    // a second charger next to the first. The hand stays out of the game's
+    // Use until it is let go, so it cannot latch a new Use mid-press.
+    {
+        static bool s_freeLock[2];   // [0] left, [1] right
+        if (!leftUse)
+            s_freeLock[0] = false;
+        if (!rightUse)
+            s_freeLock[1] = false;
+        if (m_GrabLatched && m_UseWasHeld && (m_GrabHandLeft ? rightUse : leftUse))
+            s_freeLock[m_GrabHandLeft ? 1 : 0] = true;
+        const bool freeLeft = s_freeLock[0] && leftUse, freeRight = s_freeLock[1] && rightUse;
+        const bool wasFree = m_FreeUseHeld.load(std::memory_order_relaxed);
+        if ((freeLeft || freeRight) && !wasFree)
+        {
+            m_FreeUseLeft.store(freeLeft, std::memory_order_relaxed);
+            m_FreeUsePressSeq.fetch_add(1, std::memory_order_acq_rel);
+            static int s_freeLog;
+            if (s_freeLog++ < 20)
+                Game::logMsg("Free-hand Use: %s hand pressed (Use latched on the %s hand)",
+                    freeLeft ? "left" : "right", m_GrabHandLeft ? "left" : "right");
+        }
+        m_FreeUseHeld.store(freeLeft || freeRight, std::memory_order_release);
+        if (s_freeLock[0])
+            leftUse = false;
+        if (s_freeLock[1])
+            rightUse = false;
+    }
     const bool useHeld = leftUse || rightUse;
     const double now = QpcNowMs();
     {
@@ -10572,7 +10808,12 @@ namespace
     // HudCredits = the "BL@CK MESA" intro logo, HudMessage = chapter titles,
     // CHudIntroCredits = the developer names (bottom left, env_introcredits
     // on the tram ride; BM's own HUD element, not the SDK's intro credits).
-    const char* const kTitleHudNames[kTitleHudCount] = { "HudCredits", "HudMessage", "CHudIntroCredits" };
+    // CHudBootUpSequence = the HEV suit boot-up (bm_c1a0a suit pickup: system
+    // text left, suit figure right); CLJHudBootUpSequence = the long jump one.
+    // HudCloseCaption = closed captions / subtitles (closecaption 1; cc_subtitles 1 = dialogue only);
+    // the panel hides itself when nothing is said.
+    const char* const kTitleHudNames[kTitleHudCount] = { "HudCredits", "HudMessage", "CHudIntroCredits",
+        "CHudBootUpSequence", "CLJHudBootUpSequence", "HudCloseCaption" };
 
     // Depth-first from the vgui root; fills found[i] for kTitleHudNames[i].
     bool SehFindTitleHudPanels(void* ipanel, unsigned int root, unsigned int* found)
@@ -10596,7 +10837,10 @@ namespace
                             found[i] = p;
                     }
                 }
-                if (found[0] && found[1] && found[2])
+                bool all = true;
+                for (int i = 0; i < kTitleHudCount && all; ++i)
+                    all = found[i] != 0;
+                if (all)
                     return true;
                 const int n = PanelCall<int>(ipanel, kPanelGetChildCount, p);
                 for (int c = 0; c < n && sp < 64; ++c)
@@ -10611,45 +10855,6 @@ namespace
         __except (EXCEPTION_EXECUTE_HANDLER)
         {
             return false;
-        }
-    }
-
-    // Subtitle study (issue #18, 2026-11-23): first panel whose name has
-    // "aption" or "ubtitle" (closed captions). Logs every match once.
-    unsigned int SehFindCaptionPanel(void* ipanel, unsigned int root)
-    {
-        BMVR_TRY
-        {
-            unsigned int stack[64];
-            int sp = 0;
-            int visited = 0;
-            unsigned int found = 0;
-            stack[sp++] = root;
-            while (sp > 0 && visited < 4096)
-            {
-                const unsigned int p = stack[--sp];
-                ++visited;
-                const char* name = PanelCall<const char*>(ipanel, kPanelGetName, p);
-                if (name && std::strcmp(name, "HudCloseCaption") == 0)
-                {
-                    Game::logMsg("Caption panel '%s' = %08X visible=%d", name, p,
-                        PanelCall<bool>(ipanel, kPanelIsVisible, p) ? 1 : 0);
-                    found = p;
-                    break;
-                }
-                const int n = PanelCall<int>(ipanel, kPanelGetChildCount, p);
-                for (int c = 0; c < n && sp < 64; ++c)
-                {
-                    const unsigned int child = PanelCall<unsigned int>(ipanel, kPanelGetChild, p, c);
-                    if (child)
-                        stack[sp++] = child;
-                }
-            }
-            return found;
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER)
-        {
-            return 0;
         }
     }
 
@@ -10813,6 +11018,44 @@ namespace
                     PanelCall<void, unsigned int, int, int>(ipanel, kPanelSetSize, p, w, h);
                 }
                 p = PanelCall<unsigned int>(ipanel, kPanelGetParent, p);
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+        }
+        return count;
+    }
+
+    // Boot-up sequence: the visible children's rects (x, y, w, h, dx) on the
+    // full-screen boot panel. Children left of the centre band get dx = inset,
+    // right of it -inset, the centred title/standby lines 0. Setting the
+    // children's positions for the paint did not move them (they place
+    // themselves while painting, 2026-11-24), so the layer texture is moved
+    // per rect instead (TitleLayerPremultiplied).
+    int SehBootChildRects(void* ipanel, unsigned int p, int screenW, int inset, int (*rects)[5], int cap)
+    {
+        int count = 0;
+        BMVR_TRY
+        {
+            const int n = PanelCall<int>(ipanel, kPanelGetChildCount, p);
+            const int mid = screenW / 2, band = screenW / 20;
+            for (int c = 0; c < n && count < cap; ++c)
+            {
+                const unsigned int child = PanelCall<unsigned int>(ipanel, kPanelGetChild, p, c);
+                if (!child || !PanelCall<bool>(ipanel, kPanelIsVisible, child))
+                    continue;
+                int x = 0, y = 0, w = 0, h = 0;
+                PanelCall<void, unsigned int, int*, int*>(ipanel, kPanelGetPos, child, &x, &y);
+                PanelCall<void, unsigned int, int*, int*>(ipanel, kPanelGetSize, child, &w, &h);
+                if (w <= 0 || h <= 0)
+                    continue;
+                const int cx = x + w / 2;
+                rects[count][0] = x;
+                rects[count][1] = y;
+                rects[count][2] = w;
+                rects[count][3] = h;
+                rects[count][4] = cx < mid - band ? inset : (cx > mid + band ? -inset : 0);
+                ++count;
             }
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
@@ -11221,7 +11464,10 @@ void VR::UpdateTitleHud()
         m_VguiPanel = m_Game->GetInterface("vgui2.dll", "VGUI_Panel009");
     if (!m_VguiPanel || !m_Game->m_EngineVGui)
         return;
-    if (!m_TitleHudPanels[0] || !m_TitleHudPanels[1] || (!m_TitleHudPanels[2] && m_TitleHudSearches < 30))
+    bool lateMissing = false;
+    for (int i = 2; i < kTitleHudCount; ++i)
+        lateMissing = lateMissing || !m_TitleHudPanels[i];
+    if (!m_TitleHudPanels[0] || !m_TitleHudPanels[1] || (lateMissing && m_TitleHudSearches < 30))
     {
         const unsigned long long now = GetTickCount64();
         if (now >= m_TitleHudNextSearchMs)
@@ -11233,54 +11479,62 @@ void VR::UpdateTitleHud()
                 reinterpret_cast<uintptr_t>(m_Game->m_EngineVGui->GetPanel(0)));
             if (root && SehFindTitleHudPanels(m_VguiPanel, root, m_TitleHudPanels))
             {
-                Game::logMsg("Title HUD panels: HudCredits=%08X HudMessage=%08X CHudIntroCredits=%08X",
-                    m_TitleHudPanels[0], m_TitleHudPanels[1], m_TitleHudPanels[2]);
+                Game::logMsg("Title HUD panels: HudCredits=%08X HudMessage=%08X CHudIntroCredits=%08X"
+                    " CHudBootUpSequence=%08X CLJHudBootUpSequence=%08X HudCloseCaption=%08X",
+                    m_TitleHudPanels[0], m_TitleHudPanels[1], m_TitleHudPanels[2], m_TitleHudPanels[3],
+                    m_TitleHudPanels[4], m_TitleHudPanels[5]);
             }
         }
     }
+    const bool bootWas = m_BootHudActive;
+    const bool captionWas = m_CaptionHudActive;
+    m_BootHudActive = false;
+    m_CaptionHudActive = false;
     for (int i = 0; i < kTitleHudCount; ++i)
     {
         if (TitleHudPanelShowing(i))
+        {
             m_TitleHudActive = true;
+            if (i >= kBootHudFirst && i < kBootHudEnd)
+                m_BootHudActive = true;
+            if (i == kCaptionHud)
+                m_CaptionHudActive = true;
+        }
     }
-    // Subtitle study probe (issue #18): find the caption panel, log its
-    // visibility changes and size.
+    m_CaptionOnly = m_CaptionHudActive;
+    for (int i = 0; i < kTitleHudCount && m_CaptionOnly; ++i)
+        if (i != kCaptionHud && TitleHudPanelShowing(i))
+            m_CaptionOnly = false;
+    if (m_CaptionHudActive && !captionWas)
     {
-        static unsigned int s_cc;
-        static unsigned long long s_ccNext;
-        static int s_ccVis = -1, s_ccLogs;
-        const unsigned long long now = GetTickCount64();
-        if (!s_cc && now >= s_ccNext)
+        int b[4] = {};
+        if (SehPanelBounds(m_VguiPanel, m_TitleHudPanels[kCaptionHud], b) && b[3] > 0 && b[1] + b[3] <= 1080)
+            m_CaptionCentreY = (b[1] + b[3] * 0.5f) / 1080.f;
+    }
+    if (m_CaptionHudActive != captionWas)
+    {
+        static int s_capLogs;
+        if (s_capLogs < 60)
         {
-            s_ccNext = now + 5000;
-            const unsigned int root = static_cast<unsigned int>(
-                reinterpret_cast<uintptr_t>(m_Game->m_EngineVGui->GetPanel(0)));
-            if (root)
-                s_cc = SehFindCaptionPanel(m_VguiPanel, root);
-        }
-        if (s_cc)
-        {
-            const int vis = SehPanelVisible(m_VguiPanel, s_cc) ? 1 : 0;
+            ++s_capLogs;
             int b[4] = {};
-            const bool haveB = SehPanelBounds(m_VguiPanel, s_cc, b);
-            static int s_lastH = -1;
-            if ((vis != s_ccVis || (haveB && b[3] != s_lastH)) && s_ccLogs < 40)
-            {
-                ++s_ccLogs;
-                Game::logMsg("Caption panel visible=%d bounds %d,%d %dx%d", vis, b[0], b[1], b[2], b[3]);
-            }
-            s_ccVis = vis;
-            s_lastH = haveB ? b[3] : -1;
+            SehPanelBounds(m_VguiPanel, m_TitleHudPanels[kCaptionHud], b);
+            Game::logMsg("Caption HUD %s bounds %d,%d %dx%d", m_CaptionHudActive ? "shown (head-locked title layer)" :
+                "hidden", b[0], b[1], b[2], b[3]);
         }
     }
+    LogBootHudChildren();
+    if (m_BootHudActive != bootWas)
+        Game::logMsg("Boot-up HUD %s", m_BootHudActive ? "shown (head-locked title layer)" : "hidden");
     if (m_TitleHudActive != was)
     {
         // New epoch: with TitleLevel the helper places the HUD layer level at
         // the head's yaw once per epoch (otherwise the layer is head-locked).
         if (m_TitleHudActive && ++m_MenuOverlayEpoch == 0)
             m_MenuOverlayEpoch = 1;
-        Game::logMsg("Title HUD %s (credits=%d message=%d names=%d)", m_TitleHudActive ? "shown" : "hidden",
-            TitleHudPanelShowing(0) ? 1 : 0, TitleHudPanelShowing(1) ? 1 : 0, TitleHudPanelShowing(2) ? 1 : 0);
+        Game::logMsg("Title HUD %s (credits=%d message=%d names=%d boot=%d ljboot=%d)",
+            m_TitleHudActive ? "shown" : "hidden", TitleHudPanelShowing(0) ? 1 : 0, TitleHudPanelShowing(1) ? 1 : 0,
+            TitleHudPanelShowing(2) ? 1 : 0, TitleHudPanelShowing(3) ? 1 : 0, TitleHudPanelShowing(4) ? 1 : 0);
         for (int i = 0; m_TitleHudActive && i < kTitleHudCount; ++i)
         {
             int b[4] = {};
@@ -11298,7 +11552,7 @@ bool VR::TitleHudPanelShowing(int i) const
     const unsigned int p = (i >= 0 && i < kTitleHudCount) ? m_TitleHudPanels[i] : 0;
     if (!p || !m_VguiPanel || !SehPanelVisible(m_VguiPanel, p))
         return false;
-    if (i != 2)
+    if ((i != 2 && i < kBootHudFirst) || i == kCaptionHud)
         return true;
     int total = 0;
     return SehVisibleChildren(m_VguiPanel, p, &total, nullptr, 0) > 0;
@@ -11347,7 +11601,95 @@ int VR::IsolateTitleHudPanels(unsigned int* hidden, int cap)
             ++s_fitLog;
         }
     }
+    // Boot-up: the parts' rects for the texture-space move toward the centre.
+    {
+        BootHudRects r{};
+        const int inset = static_cast<int>(bmvr::g_BootHudInset + 0.5f);
+        for (int i = kBootHudFirst; i < kBootHudEnd && !r.boot; ++i)
+            r.boot = TitleHudPanelShowing(i);
+        // Captions read better without the glow too (user 2026-11-25), but the
+        // intro logo / names / messages keep it when they share the layer.
+        r.noGlow = r.boot || (TitleHudPanelShowing(kCaptionHud) && !TitleHudPanelShowing(0)
+            && !TitleHudPanelShowing(1) && !TitleHudPanelShowing(2));
+        // Captions sharing the layer with a chapter title / logo / names:
+        // keep the glow for those, but not over the caption box (user
+        // 2026-11-25: chapter title glow also hit the subtitles).
+        if (!r.noGlow && TitleHudPanelShowing(kCaptionHud) && tw && th)
+        {
+            int b[4] = {};
+            if (SehPanelBounds(m_VguiPanel, m_TitleHudPanels[kCaptionHud], b) && b[2] > 0 && b[3] > 0)
+            {
+                const float pad = 8.f;
+                r.capMask = true;
+                r.capRect[0] = (b[0] - pad) / tw;
+                r.capRect[1] = (b[1] - pad) / th;
+                r.capRect[2] = (b[0] + b[2] + pad) / tw;
+                r.capRect[3] = (b[1] + b[3] + pad) / th;
+            }
+        }
+        for (int i = kBootHudFirst; i < kBootHudEnd && inset > 0 && !r.count; ++i)
+        {
+            int b[4] = {};
+            if (!TitleHudPanelShowing(i) || !SehPanelBounds(m_VguiPanel, m_TitleHudPanels[i], b) || b[2] < 640)
+                continue;
+            r.panelW = b[2];
+            r.panelH = b[3];
+            r.count = SehBootChildRects(m_VguiPanel, m_TitleHudPanels[i], b[2], inset * b[2] / 1920, r.rects,
+                kBootHudMaxRects);
+        }
+        PublishBootHudRects(r);
+    }
     return n ? SehIsolatePanels(m_VguiPanel, targets, n, hidden, cap) : 0;
+}
+
+// Boot-up sequences: log the panel and its children (name, visible, bounds)
+// whenever the visible set changes, to place the parts in VR (left text,
+// suit figure, centre notices). Bounded output.
+void VR::LogBootHudChildren()
+{
+    static unsigned int s_sig[kTitleHudCount];
+    static int s_logs;
+    if (!m_VguiPanel || s_logs >= 80)
+        return;
+    for (int i = kBootHudFirst; i < kBootHudEnd; ++i)
+    {
+        const unsigned int p = m_TitleHudPanels[i];
+        if (!p)
+            continue;
+        const bool vis = SehPanelVisible(m_VguiPanel, p);
+        int total = 0;
+        char names[400];
+        const int visKids = vis ? SehVisibleChildren(m_VguiPanel, p, &total, names, sizeof(names)) : 0;
+        unsigned int sig = (vis ? 1u : 0u) | (static_cast<unsigned int>(visKids) << 1) |
+            (static_cast<unsigned int>(total) << 12);
+        if (sig == s_sig[i])
+            continue;
+        s_sig[i] = sig;
+        ++s_logs;
+        int b[4] = {};
+        SehPanelBounds(m_VguiPanel, p, b);
+        Game::logMsg("Boot HUD %s vis=%d bounds %d,%d %dx%d children %d/%d: %s", kTitleHudNames[i], vis ? 1 : 0,
+            b[0], b[1], b[2], b[3], visKids, total, vis ? names : "");
+        if (!vis)
+            continue;
+        BMVR_TRY
+        {
+            for (int c = 0; c < total && c < 24; ++c)
+            {
+                const unsigned int child = PanelCall<unsigned int>(m_VguiPanel, kPanelGetChild, p, c);
+                if (!child)
+                    continue;
+                int cb[4] = {};
+                SehPanelBounds(m_VguiPanel, child, cb);
+                const char* name = PanelCall<const char*>(m_VguiPanel, kPanelGetName, child);
+                Game::logMsg("Boot HUD   child %d %s vis=%d bounds %d,%d %dx%d", c, name ? name : "?",
+                    SehPanelVisible(m_VguiPanel, child) ? 1 : 0, cb[0], cb[1], cb[2], cb[3]);
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+        }
+    }
 }
 
 void VR::RestoreTitleHudPanels(const unsigned int* hidden, int count)
@@ -13332,6 +13674,8 @@ void VR::CaptureHandDrawSnap(HandDrawSnap& s)
         }
         TryGetLadderPinDrawPos(true, s.body, s.leftPos);
         TryGetLadderPinDrawPos(false, s.body, s.rightPos);
+        s.gunHudTwoHand = TwoHandGunHudAngles(
+            bmvr::g_LeftHanded ? s.leftAng : s.rightAng, s.gunHudAng, s.gunHudShift);
     }
     if (m_Game)
         s.hudOk = m_Game->ReadWristHudValues(s.hud[0], s.hud[1], s.hud[2], s.hud[3], s.hud[4], s.hud[5]);
@@ -14321,8 +14665,6 @@ namespace
         bool valid = false;
     };
 
-    constexpr float kAmmoHudSize = 2.0f;
-
     void HudMakePanel(const Vector& lowerLeft, const Vector& xaxis, const Vector& left,
         const Vector& face, float size, HudPanel& out)
     {
@@ -14403,8 +14745,13 @@ namespace
         constexpr float kBeside = 1.35f;
         constexpr float kBack = 0.2f;
         constexpr float kUp = 1.15f;
-        const Vector center = ctrlPos + right * (inward * kBeside) - fwd * kBack + up * kUp;
-        const Vector face = right * inward;
+        // Per-weapon placement on top (VR panel DEBUG "AMMO HUD", VR/ammo_hud.txt;
+        // VR::SyncAmmoHudRows keeps the globals on the held weapon's values).
+        // Sideways + = away from the gun.
+        const float size = (std::max)(0.25f, bmvr::g_AmmoHudSize);
+        const Vector center = ctrlPos + right * (inward * (kBeside + bmvr::g_AmmoHudSide))
+            + fwd * (bmvr::g_AmmoHudForward - kBack) + up * (kUp + bmvr::g_AmmoHudUp);
+        Vector face = right * inward;
         Vector left = up - face * up.Dot(face);
         if (left.LengthSqr() < 0.01f)
             left = fwd - face * fwd.Dot(face);
@@ -14415,8 +14762,31 @@ namespace
         VectorNormalize(xaxis);
         left = CrossProduct(face, xaxis);
         VectorNormalize(left);
-        const Vector origin = center - xaxis * (kAmmoHudSize * 0.5f) - left * (kAmmoHudSize * 0.5f);
-        HudMakePanel(origin, xaxis, left, face, kAmmoHudSize, out);
+        // Turn: about the panel's vertical axis (+ = the gun-front edge toward the
+        // viewer, who sits on the face side). Tilt: then about the turned panel's
+        // horizontal axis (+ = top toward the viewer). Roll: last, in the panel
+        // plane. Each step uses the axes the previous one left, so tilt stays a
+        // tilt at any turn (tilt first locked tilt onto roll at turn 90, RPG
+        // screen, user 2026-11-25). Turn and roll are mirrored for the left gun
+        // hand so one file value looks the same.
+        const float mirror = rightHand ? 1.f : -1.f;
+        if (bmvr::g_AmmoHudTurn != 0.f)
+        {
+            face = HudRotate(face, left, bmvr::g_AmmoHudTurn * mirror);
+            xaxis = HudRotate(xaxis, left, bmvr::g_AmmoHudTurn * mirror);
+        }
+        if (bmvr::g_AmmoHudTilt != 0.f)
+        {
+            face = HudRotate(face, xaxis, -bmvr::g_AmmoHudTilt);
+            left = HudRotate(left, xaxis, -bmvr::g_AmmoHudTilt);
+        }
+        if (bmvr::g_AmmoHudRoll != 0.f)
+        {
+            xaxis = HudRotate(xaxis, face, bmvr::g_AmmoHudRoll * mirror);
+            left = HudRotate(left, face, bmvr::g_AmmoHudRoll * mirror);
+        }
+        const Vector origin = center - xaxis * (size * 0.5f) - left * (size * 0.5f);
+        HudMakePanel(origin, xaxis, left, face, size, out);
     }
 
     int HudGlyphIndex(char c)
@@ -14795,6 +15165,27 @@ void VR::DrawHandHud(IDirect3DDevice9* device, int stereoEye, UINT w, UINT h,
     const D3DCOLOR redBack = D3DCOLOR_RGBA(255, 48, 32, 60);
     constexpr int kLowHealth = 25;
     const bool rightDominant = !bmvr::g_LeftHanded;
+    // Ammo panel orientation: the gun hand, or the two-hand aim (long guns).
+    QAngle gunHudAng = rightDominant ? rightAng : leftAng;
+    Vector gunHudPos = rightDominant ? rightOrigin : leftOrigin;
+    if (t_HandSnap)
+    {
+        if (t_HandSnap->gunHudTwoHand)
+        {
+            gunHudAng = t_HandSnap->gunHudAng;
+            gunHudPos += t_HandSnap->gunHudShift;
+        }
+    }
+    else
+    {
+        QAngle twoHandAng{};
+        Vector shift{};
+        if (TwoHandGunHudAngles(gunHudAng, twoHandAng, shift))
+        {
+            gunHudAng = twoHandAng;
+            gunHudPos += shift;
+        }
+    }
 
     auto drawValueIcon = [&](const HudPanel& p, float x0, float yTop, float valueCell,
         float fieldWidth, float rowH, float iconSize, int value, D3DCOLOR color, D3DCOLOR backing,
@@ -14832,8 +15223,7 @@ void VR::DrawHandHud(IDirect3DDevice9* device, int stereoEye, UINT w, UINT h,
                 // it, so both read at once while aiming (on the support
                 // wrist it turned away from the eye).
                 HudPanel gunPanel{};
-                BuildAmmoHudPanel(rightDominant ? rightOrigin : leftOrigin,
-                    rightDominant ? rightAng : leftAng, rightDominant, gunPanel);
+                BuildAmmoHudPanel(gunHudPos, gunHudAng, rightDominant, gunPanel);
                 if (gunPanel.valid)
                 {
                     handPanel = gunPanel;
@@ -14890,10 +15280,7 @@ void VR::DrawHandHud(IDirect3DDevice9* device, int stereoEye, UINT w, UINT h,
     if (hasAmmoHud && gunOk)
     {
         HudPanel weaponPanel{};
-        BuildAmmoHudPanel(
-            rightDominant ? rightOrigin : leftOrigin,
-            rightDominant ? rightAng : leftAng,
-            rightDominant, weaponPanel);
+        BuildAmmoHudPanel(gunHudPos, gunHudAng, rightDominant, weaponPanel);
         if (weaponPanel.valid && !HudIsBackfacing(weaponPanel, eyeOrig))
         {
             std::string weaponModel;
@@ -15337,13 +15724,33 @@ void VR::RefreshActiveWeaponModel()
 void VR::RefreshHeldWeaponState()
 {
     bool held = false;
+    const char* why = "";
     if (!m_EmptyHands && m_Game)
     {
         Game::InventoryWeapon first{};
         held = m_Game->CollectInventoryWeapons(&first, 1) > 0;
+        // Weapons in the inventory but none in hand: after the intro tram
+        // (bm_c1a2a, save loads) the game shows its own HEV hands viewmodel
+        // (models/weapons/v_hands.mdl, 'admire1') until a weapon is picked.
+        // Counted as held, the mod hid those arms as gun arms and drew no
+        // glove: no right hand until R3 (capture-20261125-232648).
+        if (held && !m_Game->GetActiveWeaponEntity())
+        {
+            held = false;
+            why = " (no active weapon)";
+        }
+        if (held)
+        {
+            const char* vm = m_Game->GetEntityModelName(m_Game->GetViewModelEntity());
+            if (vm && std::strstr(vm, "weapons/v_hands.mdl"))
+            {
+                held = false;
+                why = " (hands viewmodel)";
+            }
+        }
     }
     if (held != m_HasHeldWeapon)
-        Game::logMsg("VR held weapon %s", held ? "yes" : "no");
+        Game::logMsg("VR held weapon %s%s", held ? "yes" : "no", why);
     m_HasHeldWeapon = held;
 }
 
@@ -15381,6 +15788,7 @@ void VR::ApplyTwoHandWeaponAim()
         m_TwoHandActive = false;
         m_TwoHandDrawValid = false;
         m_TwoHandSmoothValid = false;
+        m_TwoHandHudValid = false;
     };
 
     // Support-grip press edge for TwoHandGripToggle (down at 0.35, re-armed
@@ -15448,12 +15856,18 @@ void VR::ApplyTwoHandWeaponAim()
     const float lat = std::sqrt(latR * latR + latU * latU);
     const float scale = m_VRScale > 1.f ? m_VRScale : 39.37f;
     const bool pistol = m_VmClass.offhandPistol;
-    const float enterR = (pistol ? 0.07f : m_VmClass.offhandEnterMeters) * scale;
-    const float stayR = (pistol ? 0.14f : 0.12f) * scale;
+    // TwoHandGripScale (panel "Grip area scale"): wider and longer toward the
+    // muzzle; the rear end (alongMin, toward the gun hand) stays where it is,
+    // so a bigger zone does not reach back over the magwell / gun hand.
+    const float gripScale = std::clamp(bmvr::g_TwoHandGripScale, 0.5f, 2.f);
+    const float enterR = (pistol ? 0.07f : m_VmClass.offhandEnterMeters) * gripScale * scale;
+    // Hold zone stays a bit larger than the grab zone, or a big grab zone
+    // would let go right after the squeeze.
+    const float stayR = (std::max)((pistol ? 0.14f : 0.12f) * scale, enterR + 0.03f * scale);
     const float slop = 0.04f * scale;
     const float railHu = m_VmClass.offhandRailMeters * scale;
     const float alongMin = gx - slop;
-    const float alongMax = gx + (std::max)(railHu, 0.04f * scale);
+    const float alongMax = gx + (std::max)(railHu, 0.04f * scale) * gripScale;
     // Support hand at the gun (a little wider than the grab zone): its grip
     // takes the gun, not a ladder rung behind it.
     m_SupportNearGun.store(m_TwoHandActive || distToGrip < stayR + slop
@@ -15468,7 +15882,7 @@ void VR::ApplyTwoHandWeaponAim()
     const float underY = -0.01f * scale, underZ = -0.127f * scale;
     const float distUnder = pistol
         ? (d - (F0 * underX + R0 * underY + U0 * underZ)).Length() : 1e9f;
-    const float underR = 0.08f * scale;
+    const float underR = 0.08f * gripScale * scale;
 
     // One light buzz in the support hand when it reaches the spot where a
     // squeeze takes the gun (user 2026-11-22; like the MP5 bolt buzz).
@@ -15487,7 +15901,8 @@ void VR::ApplyTwoHandWeaponAim()
     if (m_TwoHandActive && bmvr::g_TwoHandGripToggle)
     {
         // Latched: a new squeeze lets go, and so does a support hand taken
-        // well off the gun (else the aim would follow a hand that left it).
+        // well off the gun (else the aim would follow a hand that left it;
+        // TwoHandToggleAutoRelease off = squeeze only, developer row).
         // Distance from the grip point held for 0.25 s: the old lateral test
         // against the posed model axis drifted to its 0.30 m limit while the
         // hand still held the shotgun's pump (2026-10-26 log: lat 11.8-12.9).
@@ -15498,7 +15913,7 @@ void VR::ApplyTwoHandWeaponAim()
             m_TwoHandActive = false;
             s_leaveSinceMs = 0;
         }
-        else if (distToGrip > leaveR)
+        else if (bmvr::g_TwoHandToggleAutoRelease && distToGrip > leaveR)
         {
             const DWORD now = GetTickCount();
             if (s_leaveSinceMs == 0)
@@ -15590,6 +16005,7 @@ void VR::ApplyTwoHandWeaponAim()
     {
         m_TwoHandDrawValid = false;
         m_TwoHandSmoothValid = false;
+        m_TwoHandHudValid = false;
         return;
     }
 
@@ -15600,7 +16016,6 @@ void VR::ApplyTwoHandWeaponAim()
     auto finishDraw = [&](const Vector& f, const Vector& r, const Vector& u, float gxSlide) {
         const float rotYaw = m_RotationOffsetY.load(std::memory_order_acquire);
         Vector local(gxSlide, gy, gz);
-        ApplyLoweredOffhand(local);
         Vector gripYawed = f * local.x + r * local.y + u * local.z;
         PivotYaw(gripYawed, -rotYaw);
         m_TwoHandDrawPos = gunTracking + gripYawed;
@@ -15611,6 +16026,8 @@ void VR::ApplyTwoHandWeaponAim()
 
     if (pistol)
     {
+        // Pistols keep the gun-hand aim: the ammo panel follows that hand.
+        m_TwoHandHudValid = false;
         finishDraw(F0, R0, U0, gx);
         return;
     }
@@ -15663,6 +16080,25 @@ void VR::ApplyTwoHandWeaponAim()
     m_ViewmodelForward = F;
     m_ViewmodelRight = R;
     m_ViewmodelUp = U;
+    m_TwoHandHudFrom[0] = F0;
+    m_TwoHandHudFrom[1] = R0;
+    m_TwoHandHudFrom[2] = U0;
+    m_TwoHandHudTo[0] = F;
+    m_TwoHandHudTo[1] = R;
+    m_TwoHandHudTo[2] = U;
+    {
+        // The gun turns about its aim-pose point (gunTracking); the ammo
+        // panel is placed from the gun hand's grip pose. Carry that lever
+        // with the turn too, or the panel slid along the gun as the
+        // two-hand aim swung left/right (user 2026-11-25). World = tracking
+        // turned by the turn yaw, as `d` above.
+        const Vector gunGrip = leftHanded ? m_LeftControllerPosAbs : m_PhysicalRightPosAbs;
+        Vector lever = gunTracking - gunGrip;
+        PivotYaw(lever, m_RotationOffsetY.load(std::memory_order_acquire));
+        const Vector turned = F * lever.Dot(F0) + R * lever.Dot(R0) + U * lever.Dot(U0);
+        m_TwoHandHudShift = lever - turned;
+    }
+    m_TwoHandHudValid = true;
 
     finishDraw(F, R, U, gxSlide);
 }
@@ -16027,7 +16463,13 @@ bool VR::UpdateShoulderGestures(bool paused)
     for (int z = 0; z < bmvr::kGestureZoneCount; ++z)
     {
         const int a = leftAction(z);
-        const bool in = leftOn(z) && m_LeftControllerTrackingValid && !m_TwoHandActive && LeftHandInSlotZone(z);
+        // Forehead: not on / at a ladder. Hand over hand, the left hand
+        // passes the forehead on every reach (user 2026-11-24: screenshots
+        // while climbing), and its grip there is a rung grab.
+        const bool ladderBlocked = z == bmvr::kGestureHead
+            && (m_LadderActive.load(std::memory_order_relaxed) || m_LadderView.active
+                || m_LadderPin[0].valid || m_LadderPin[1].valid);
+        const bool in = leftOn(z) && m_LeftControllerTrackingValid && !m_TwoHandActive && !ladderBlocked && LeftHandInSlotZone(z);
         leftAny = leftAny || in;
         // Ammo: no gesture, the manual-reload grab takes ammo there
         // (LeftHandInAmmoZone); the zone keeps the grip out of its mapped
@@ -16332,6 +16774,32 @@ bool VR::TryGetTwoHandOffhandDrawPose(bool physicalLeft, Vector& trackingPos, QA
     return true;
 }
 
+bool VR::TwoHandGunHudAngles(const QAngle& gunCtrlAng, QAngle& out, Vector& shift) const
+{
+    // Ammo panel while a long gun is held with both hands (user 2026-11-25):
+    // locked to the gun's aim, not the gun-hand controller. The controller
+    // axes are expressed in the one-hand gun basis and rebuilt in the
+    // two-hand one, so the per-weapon placement (VR/ammo_hud.txt) keeps its
+    // meaning and nothing moves at the moment the support hand grabs.
+    std::lock_guard<std::recursive_mutex> lock(m_ControllerMutex);
+    if (!m_TwoHandActive || !m_TwoHandHudValid || bmvr::g_TwoHandAmmoHudFollowsHand)
+        return false;
+    Vector f, r, u;
+    QAngle::AngleVectors(gunCtrlAng, &f, &r, &u);
+    auto remap = [&](const Vector& v) {
+        return m_TwoHandHudTo[0] * v.Dot(m_TwoHandHudFrom[0])
+            + m_TwoHandHudTo[1] * v.Dot(m_TwoHandHudFrom[1])
+            + m_TwoHandHudTo[2] * v.Dot(m_TwoHandHudFrom[2]);
+    };
+    Vector nf = remap(f), nu = remap(u);
+    if (VectorNormalize(nf) <= 0.01f || VectorNormalize(nu) <= 0.01f)
+        return false;
+    QAngle::VectorAngles(nf, nu, out);
+    out.y = WrapYaw(out.y);
+    shift = m_TwoHandHudShift;
+    return std::isfinite(out.x) && std::isfinite(out.y) && std::isfinite(out.z);
+}
+
 bool VR::TryGetLadderPinDrawPos(bool physicalLeft, const Vector& body, Vector& trackingPos) const
 {
     // Hand on a rung: draw the glove there. The world shift from the
@@ -16460,6 +16928,168 @@ void VR::SyncLadderGripRows()
         ladder_tune::Save();
         Game::logMsg("Ladder grip tune %s: out %+.1f cm up %+.1f cm curl %.2f", name, s_o, s_u, s_c);
     }
+}
+
+namespace ammo_hud
+{
+    // Per weapon (ViewmodelClass::numpadKey): the ammo panel's placement on top
+    // of BuildAmmoHudPanel's base spot. VR/ammo_hud.txt
+    // ("key forward side up tilt turn roll size"); the file overrides Builtin().
+    struct Place
+    {
+        float fwd = 0.f, side = 0.f, up = 0.f, tilt = 0.f, turn = 0.f, roll = 0.f, size = 2.f;
+    };
+    std::map<std::string, Place> g_Place;
+    std::string g_HeldKey;   // weapon the panel rows show (render thread)
+    bool g_Loaded = false;
+
+    std::string Path() { return bmvr::VrFilePath("ammo_hud.txt"); }
+
+    // Built-in per-weapon values = the user's headset tuning (2026-11-25,
+    // VR/ammo_hud.txt then); the file still overrides per weapon.
+    Place Builtin(const std::string& key)
+    {
+        struct Row { const char* key; Place p; };
+        static const Row kRows[] = {
+            { "357", { 0.f, 0.25f, 0.f, 0.f, 0.f, 0.f, 2.f } },
+            { "crossbow", { 3.25f, 0.75f, 2.5f, 0.f, 0.f, 0.f, 1.5f } },
+            { "gauss", { 6.f, 1.75f, 6.5f, 0.f, 90.f, 60.f, 1.25f } },
+            { "glock", { 0.f, 0.25f, 0.f, 0.f, 0.f, 0.f, 2.f } },
+            { "gluon", { 2.5f, -4.5f, -4.5f, 55.f, 90.f, 0.f, 2.f } },
+            { "grenade", { -1.25f, -0.5f, 0.f, -5.f, 5.f, 0.f, 1.5f } },
+            { "hgun", { 0.25f, 2.25f, 3.f, 10.f, 35.f, 20.f, 2.f } },
+            { "mp5", { 0.f, 0.f, 1.f, 0.f, 0.f, 0.f, 2.f } },
+            { "rpg", { 4.75f, 0.75f, 0.25f, 15.f, 90.f, 0.f, 2.f } },
+            { "satchel", { -2.f, -0.25f, -0.25f, 0.f, 30.f, 0.f, 1.75f } },
+            { "shotgun", { 0.f, 0.5f, 0.f, 0.f, 0.f, 0.f, 2.f } },
+            { "snark", { 1.25f, -0.75f, 1.25f, 0.f, 60.f, 0.f, 2.f } },
+            { "tripmine", { 1.f, -0.75f, 2.25f, 0.f, 65.f, -10.f, 2.f } },
+        };
+        for (const Row& r : kRows)
+            if (key == r.key)
+                return r.p;
+        return Place{};
+    }
+
+    void Load()
+    {
+        if (g_Loaded)
+            return;
+        g_Loaded = true;
+        std::ifstream in(Path());
+        std::string line;
+        int n = 0;
+        while (in && std::getline(in, line))
+        {
+            if (line.empty() || line[0] == '#')
+                continue;
+            char key[32]{};
+            Place p;
+            if (sscanf_s(line.c_str(), "%31s %f %f %f %f %f %f %f", key, static_cast<unsigned>(sizeof(key)),
+                    &p.fwd, &p.side, &p.up, &p.tilt, &p.turn, &p.roll, &p.size) >= 8)
+            {
+                g_Place[key] = p;
+                ++n;
+            }
+        }
+        Game::logMsg("Ammo HUD tuning: %d weapons from %s", n, Path().c_str());
+    }
+
+    void Save()
+    {
+        std::ofstream out(Path(), std::ios::trunc);
+        if (!out)
+        {
+            Game::logMsg("Ammo HUD tuning: save failed %s", Path().c_str());
+            return;
+        }
+        out << "# Ammo HUD placement per weapon (VR panel DEBUG rows \"AMMO HUD\"), on top of the built-in spot.\n";
+        out << "# key forward side(+ = away from the gun) up tilt turn roll size   (units; degrees; size 2 = default)\n";
+        for (const auto& kv : g_Place)
+        {
+            const Place& p = kv.second;
+            out << kv.first << " " << p.fwd << " " << p.side << " " << p.up << " " << p.tilt << " "
+                << p.turn << " " << p.roll << " " << p.size << "\n";
+        }
+    }
+
+    Place For(const std::string& key)
+    {
+        Load();
+        auto it = g_Place.find(key);
+        return it != g_Place.end() ? it->second : Builtin(key);
+    }
+
+    void ToGlobals(const Place& p)
+    {
+        bmvr::g_AmmoHudForward = p.fwd;
+        bmvr::g_AmmoHudSide = p.side;
+        bmvr::g_AmmoHudUp = p.up;
+        bmvr::g_AmmoHudTilt = p.tilt;
+        bmvr::g_AmmoHudTurn = p.turn;
+        bmvr::g_AmmoHudRoll = p.roll;
+        bmvr::g_AmmoHudSize = p.size;
+    }
+
+    Place FromGlobals()
+    {
+        return Place{ bmvr::g_AmmoHudForward, bmvr::g_AmmoHudSide, bmvr::g_AmmoHudUp, bmvr::g_AmmoHudTilt,
+            bmvr::g_AmmoHudTurn, bmvr::g_AmmoHudRoll, bmvr::g_AmmoHudSize };
+    }
+
+    bool Same(const Place& a, const Place& b)
+    {
+        return a.fwd == b.fwd && a.side == b.side && a.up == b.up && a.tilt == b.tilt
+            && a.turn == b.turn && a.roll == b.roll && a.size == b.size;
+    }
+}
+
+bool bmvr::AmmoHudRowDefault(const float* f, float& def)
+{
+    if (!f)
+        return false;
+    const ammo_hud::Place b = ammo_hud::Builtin(ammo_hud::g_HeldKey);
+    if (f == &g_AmmoHudForward) def = b.fwd;
+    else if (f == &g_AmmoHudSide) def = b.side;
+    else if (f == &g_AmmoHudUp) def = b.up;
+    else if (f == &g_AmmoHudTilt) def = b.tilt;
+    else if (f == &g_AmmoHudTurn) def = b.turn;
+    else if (f == &g_AmmoHudRoll) def = b.roll;
+    else if (f == &g_AmmoHudSize) def = b.size;
+    else return false;
+    return true;
+}
+
+// VR panel DEBUG rows "AMMO HUD": the rows (and the panel placement) follow the
+// weapon in the hand; a row change is saved for that weapon right away.
+void VR::SyncAmmoHudRows()
+{
+    std::string key;
+    {
+        std::lock_guard<std::recursive_mutex> lock(m_ControllerMutex);
+        key = m_VmClass.numpadKey;
+    }
+    static ammo_hud::Place s_last;
+    static bool s_init = false;
+    if (!s_init || key != ammo_hud::g_HeldKey)
+    {
+        s_init = true;
+        ammo_hud::g_HeldKey = key;
+        s_last = key.empty() ? ammo_hud::Place{} : ammo_hud::For(key);
+        ammo_hud::ToGlobals(s_last);
+        return;
+    }
+    const ammo_hud::Place now = ammo_hud::FromGlobals();
+    if (key.empty() || ammo_hud::Same(now, s_last))
+        return;
+    s_last = now;
+    if (ammo_hud::Same(now, ammo_hud::Builtin(key)))
+        ammo_hud::g_Place.erase(key);   // back at the built-in values: drop the line
+    else
+        ammo_hud::g_Place[key] = now;
+    ammo_hud::Save();
+    Game::logMsg("Ammo HUD tune %s: fwd %+.2f side %+.2f up %+.2f tilt %+.0f turn %+.0f roll %+.0f size %.2f",
+        key.c_str(), now.fwd, now.side, now.up, now.tilt, now.turn, now.roll, now.size);
 }
 
 void VR::GetRightGlovePalmOffsetMeters(Vector& meters) const
@@ -16744,6 +17374,7 @@ void VR::UpdateViewmodelNumpadAdjust(bool paused)
     vm_numpad::Load();
     SyncHeldWeaponAngleRows();
     SyncLadderGripRows();
+    SyncAmmoHudRows();
     if (paused || !m_GameplayEligible)
         return;
 
@@ -19600,9 +20231,13 @@ void VR::MirrorStereoToDesktopWindow()
         return;
     }
 
+    // DesktopEye (config, default right): the eye the window shows. Left
+    // eye if the right surface is missing.
+    IDirect3DSurface9* const mirrorEye = bmvr::g_DesktopEyeRight && m_D9RightEyeSurface
+        ? m_D9RightEyeSurface : m_D9LeftEyeSurface;
     D3DSURFACE_DESC bbDesc{};
     UINT eyeW = 0, eyeH = 0;
-    if (FAILED(bb->GetDesc(&bbDesc)) || !ResolveSurfaceSize(m_D9LeftEyeSurface, eyeW, eyeH)
+    if (FAILED(bb->GetDesc(&bbDesc)) || !ResolveSurfaceSize(mirrorEye, eyeW, eyeH)
         || bbDesc.Width < 640 || bbDesc.Height < 360 || eyeW < 640 || eyeH < 360)
     {
         bb->Release();
@@ -19690,10 +20325,10 @@ void VR::MirrorStereoToDesktopWindow()
 
     m_CaptureReentry = true;
     HRESULT hr = StretchRectKeepDeviceState(
-        device, m_D9LeftEyeSurface, srcPtr, dest, nullptr, D3DTEXF_LINEAR);
+        device, mirrorEye, srcPtr, dest, nullptr, D3DTEXF_LINEAR);
     if (FAILED(hr))
         hr = StretchRectKeepDeviceState(
-            device, m_D9LeftEyeSurface, srcPtr, dest, nullptr, D3DTEXF_NONE);
+            device, mirrorEye, srcPtr, dest, nullptr, D3DTEXF_NONE);
     m_CaptureReentry = false;
     if (SUCCEEDED(hr) && dest == m_D9DesktopMirrorSurface)
         m_DesktopMirrorHasImage.store(true, std::memory_order_release);
@@ -19701,7 +20336,8 @@ void VR::MirrorStereoToDesktopWindow()
     static int s_mirrorLog;
     if (s_mirrorLog < 4 || FAILED(hr))
     {
-        Game::logMsg("Desktop cover-crop left eye %ux%u src=%d,%d %ux%u -> %s %ux%u hr=0x%08X",
+        Game::logMsg("Desktop cover-crop %s eye %ux%u src=%d,%d %ux%u -> %s %ux%u hr=0x%08X",
+            mirrorEye == m_D9LeftEyeSurface ? "left" : "right",
             eyeW, eyeH, src.left, src.top, cropW, cropH,
             dest == bb ? "BB" : "offscreen", bbDesc.Width, bbDesc.Height, (unsigned)hr);
         ++s_mirrorLog;
@@ -20106,10 +20742,12 @@ static IDirect3DPixelShader9* TitleBloomDownsampleShader(IDirect3DDevice9* devic
     static const char kSrc[] =
         "sampler2D s : register(s0);\n"
         "float4 k : register(c0);\n"
+        "float4 m : register(c2);\n"
         "float3 f(float3 c) { return pow(max(c, 1e-5), 6.0) * dot(c, float3(0.3, 0.59, 0.11)); }\n"
         "float4 main(float2 uv : TEXCOORD0) : COLOR {\n"
         "  float3 r = f(tex2D(s, uv + float2(-k.x, -k.y)).rgb) + f(tex2D(s, uv + float2(k.x, -k.y)).rgb)\n"
         "    + f(tex2D(s, uv + float2(-k.x, k.y)).rgb) + f(tex2D(s, uv + float2(k.x, k.y)).rgb);\n"
+        "  if (uv.x >= m.x && uv.x <= m.z && uv.y >= m.y && uv.y <= m.w) r = 0;\n"
         "  return float4(r * 0.25, 1);\n"
         "}\n";
     return CompileLayerShader(device, s_cache, kSrc, sizeof(kSrc) - 1, "title_bloom_down.hlsl");
@@ -20137,7 +20775,8 @@ static IDirect3DPixelShader9* TitleBloomBlurShader(IDirect3DDevice9* device)
 }
 
 // c0 = (layer height / 2, glow on, 0, 0); c1 = (scanline influence,
-// bloom influence, scanline value, 0). Colour stays premultiplied; alpha =
+// bloom influence, scanline value, 0); c2 = uv rect without glow (the
+// caption box; empty = none): there the output equals the no-glow shader. Colour stays premultiplied; alpha =
 // max(text alpha, brightest channel) so the glow (no alpha of its own) is
 // kept. Flat is additive (alpha 0 here), but SteamVR showed nothing at all
 // for an alpha-0 premultiplied quad (user, 2026-11-23: logo and names gone).
@@ -20149,13 +20788,15 @@ static IDirect3DPixelShader9* TitleCombineShader(IDirect3DDevice9* device)
         "sampler2D b : register(s1);\n"
         "float4 k : register(c0);\n"
         "float4 g : register(c1);\n"
+        "float4 m : register(c2);\n"
         "float4 main(float2 uv : TEXCOORD0) : COLOR {\n"
         "  float4 c = tex2D(s, uv);\n"
+        "  float on = (uv.x >= m.x && uv.x <= m.z && uv.y >= m.y && uv.y <= m.w) ? 0.0 : k.y;\n"
         "  float scan = frac(uv.y * k.x) >= 0.5 ? g.z : 0.0;\n"
         "  float3 bl = tex2D(b, uv).rgb;\n"
-        "  float3 rgb = c.rgb + k.y * scan * (c.rgb * g.x + bl * g.y);\n"
+        "  float3 rgb = c.rgb + on * scan * (c.rgb * g.x + bl * g.y);\n"
         "  rgb = saturate(rgb);\n"
-        "  float a = max(sqrt(c.a), max(rgb.r, max(rgb.g, rgb.b)));\n"
+        "  float a = max(sqrt(c.a), on * max(rgb.r, max(rgb.g, rgb.b)));\n"
         "  return float4(rgb, a);\n"
         "}\n";
     return CompileLayerShader(device, s_cache, kSrc, sizeof(kSrc) - 1, "title_combine.hlsl");
@@ -20358,6 +20999,80 @@ static void FixPauseLayerAlpha(IDirect3DDevice9* device, IDirect3DSurface9* surf
 }
 
 // One full-target quad with the bound pixel shader (state saved by the caller).
+// Boot-up part rects, written on the game thread (title paint), read where the
+// layer is finished (material thread with multicore): two slots + index.
+static BootHudRects g_BootHudRects[2];
+static std::atomic<int> g_BootHudRectsSlot{ 0 };
+
+void PublishBootHudRects(const BootHudRects& r)
+{
+    const int next = 1 - g_BootHudRectsSlot.load(std::memory_order_relaxed);
+    g_BootHudRects[next] = r;
+    g_BootHudRectsSlot.store(next, std::memory_order_release);
+}
+
+// Copies the finished layer (surf) into copySurf with the boot-up sides moved
+// toward the centre: the full-height strip left of the centred parts moves
+// right, the strip right of them moves left. Strips, not part rects, because
+// the boot panel draws the suit figure itself (not a child; part rects alone
+// lost it, 2026-11-24). Order: centre band, side strips, then the centred
+// parts again (a moved strip reaches into the band). False = nothing to move.
+static bool BootHudMoveParts(IDirect3DDevice9* device, IDirect3DSurface9* surf, IDirect3DSurface9* copySurf,
+    const D3DSURFACE_DESC& desc)
+{
+    const BootHudRects& r = g_BootHudRects[g_BootHudRectsSlot.load(std::memory_order_acquire)];
+    if (r.count <= 0 || r.panelW <= 0 || r.panelH <= 0)
+        return false;
+    int leftEnd = -1, rightStart = r.panelW + 1, inset = 0;
+    for (int i = 0; i < r.count; ++i)
+    {
+        const int* q = r.rects[i];
+        if (q[4] > 0)
+            leftEnd = (std::max)(leftEnd, q[0] + q[2]);
+        else if (q[4] < 0)
+            rightStart = (std::min)(rightStart, q[0]);
+        if (q[4] != 0)
+            inset = q[4] > 0 ? q[4] : -q[4];
+    }
+    if (!inset || FAILED(device->ColorFill(copySurf, nullptr, D3DCOLOR_ARGB(0, 0, 0, 0))))
+        return false;
+    const float sx = static_cast<float>(desc.Width) / r.panelW, sy = static_cast<float>(desc.Height) / r.panelH;
+    const LONG W = static_cast<LONG>(desc.Width), H = static_cast<LONG>(desc.Height);
+    const LONG d = static_cast<LONG>(inset * sx);
+    const LONG l1 = leftEnd >= 0 ? (std::min)(W - d, static_cast<LONG>(leftEnd * sx)) : 0;
+    const LONG r0 = rightStart <= r.panelW ? (std::max)(d, static_cast<LONG>(rightStart * sx)) : W;
+    int copies = 0;
+    auto blit = [&](RECT src, LONG dx) {
+        if (src.right <= src.left || src.bottom <= src.top)
+            return;
+        RECT dst{ src.left + dx, src.top, src.right + dx, src.bottom };
+        if (SUCCEEDED(device->StretchRect(surf, &src, copySurf, &dst, D3DTEXF_POINT)))
+            ++copies;
+    };
+    blit(RECT{ l1, 0, r0, H }, 0);
+    if (l1 > 0)
+        blit(RECT{ 0, 0, l1, H }, d);
+    if (r0 < W)
+        blit(RECT{ r0, 0, W, H }, -d);
+    for (int i = 0; i < r.count; ++i)
+    {
+        const int* q = r.rects[i];
+        if (q[4] != 0)
+            continue;
+        RECT src{ (std::max)(0L, static_cast<LONG>(q[0] * sx)), (std::max)(0L, static_cast<LONG>(q[1] * sy)),
+            (std::min)(W, static_cast<LONG>((q[0] + q[2]) * sx)), (std::min)(H, static_cast<LONG>((q[1] + q[3]) * sy)) };
+        blit(src, 0);
+    }
+    static int s_log;
+    if (s_log < 3)
+    {
+        Game::logMsg("Boot HUD: layer sides moved %ld px (left strip 0-%ld, right strip %ld-%ld), %d copies",
+            static_cast<long>(d), static_cast<long>(l1), static_cast<long>(r0), static_cast<long>(W), copies);
+        ++s_log;
+    }
+    return true;
+}
+
 static void TitleLayerQuad(IDirect3DDevice9* device, IDirect3DSurface9* target, UINT w, UINT h)
 {
     if (FAILED(device->SetRenderTarget(0, target)))
@@ -20389,7 +21104,11 @@ static void TitleLayerPremultiplied(IDirect3DDevice9* device, IDirect3DSurface9*
     D3DSURFACE_DESC desc{};
     if (!device || !surf || FAILED(surf->GetDesc(&desc)))
         return;
-    const bool glow = bmvr::g_TitleGlow;
+    // No glow on the HEV / long jump boot-up text: brighter and harder to read
+    // than flat with it (user headset test 2026-11-24); same for captions on
+    // their own (2026-11-25). The intro logo keeps it.
+    const bool glow = bmvr::g_TitleGlow
+        && !g_BootHudRects[g_BootHudRectsSlot.load(std::memory_order_acquire)].noGlow;
     IDirect3DPixelShader9* ps = glow ? TitleCombineShader(device) : TitlePremultipliedShader(device);
     IDirect3DPixelShader9* psDown = glow ? TitleBloomDownsampleShader(device) : nullptr;
     IDirect3DPixelShader9* psBlur = glow ? TitleBloomBlurShader(device) : nullptr;
@@ -20397,7 +21116,8 @@ static void TitleLayerPremultiplied(IDirect3DDevice9* device, IDirect3DSurface9*
     IDirect3DSurface9* copySurf = nullptr;
     if (!copy || FAILED(copy->GetSurfaceLevel(0, &copySurf)) || !copySurf)
         return;
-    if (FAILED(device->StretchRect(surf, nullptr, copySurf, nullptr, D3DTEXF_POINT)))
+    if (!BootHudMoveParts(device, surf, copySurf, desc)
+        && FAILED(device->StretchRect(surf, nullptr, copySurf, nullptr, D3DTEXF_POINT)))
     {
         copySurf->Release();
         return;
@@ -20411,6 +21131,11 @@ static void TitleLayerPremultiplied(IDirect3DDevice9* device, IDirect3DSurface9*
     if (bloom1 && (FAILED(bloom0->GetSurfaceLevel(0, &b0)) || FAILED(bloom1->GetSurfaceLevel(0, &b1))))
         bloom1 = nullptr;
     const bool doGlow = glow && bloom1 && b0 && b1;
+    // Caption box sharing the layer with a glowing title: uv rect kept out of
+    // the bloom source and the combine (empty rect = none).
+    const BootHudRects& capRects = g_BootHudRects[g_BootHudRectsSlot.load(std::memory_order_acquire)];
+    const float noRect[4] = { 2.f, 2.f, -1.f, -1.f };
+    const float* capMask = capRects.capMask ? capRects.capRect : noRect;
     IDirect3DStateBlock9* saved = nullptr;
     if (FAILED(device->CreateStateBlock(D3DSBT_ALL, &saved)) || !saved)
     {
@@ -20440,6 +21165,7 @@ static void TitleLayerPremultiplied(IDirect3DDevice9* device, IDirect3DSurface9*
         const float down[4] = { 1.f / desc.Width, 1.f / desc.Height, 0.f, 0.f };
         device->SetPixelShader(psDown);
         device->SetPixelShaderConstantF(0, down, 1);
+        device->SetPixelShaderConstantF(2, capMask, 1);   // caption box: no bloom source
         TitleLayerSampler(device, 0, copy, true);
         TitleLayerQuad(device, b0, bw, bh);
         // Blur radius: BM's offsets are 1/4-screen texels at 1080 rows.
@@ -20461,6 +21187,7 @@ static void TitleLayerPremultiplied(IDirect3DDevice9* device, IDirect3DSurface9*
         const float g[4] = { 0.5f, 8.f, 202.f / 255.f, 0.f };
         device->SetPixelShaderConstantF(0, k, 1);
         device->SetPixelShaderConstantF(1, g, 1);
+        device->SetPixelShaderConstantF(2, capMask, 1);
     }
     TitleLayerSampler(device, 0, copy, false);
     TitleLayerSampler(device, 1, doGlow ? static_cast<IDirect3DBaseTexture9*>(bloom0) : copy, true);
@@ -22294,9 +23021,10 @@ const MagReload::WeaponDef& MagReload::Def(int weapon)
         { "mp5", "Clip_New", "Bolt_New", 30, 4.0f, false,
           "weapons/mp5/empty.wav", "weapons/smg1/switch_single.wav",
           { 0.00f, -8.93f, -8.32f }, { 1.04f, -14.23f, 1.49f }, false, nullptr, { 0, 0, 0 }, nullptr },
-        // Slide forward when empty (user, 2026-11-18: rack it to chamber,
-        // not a slide already back that a touch closes).
-        { "glock", "bone_clip", "Bone01", 17, 1.8f, false,
+        // Slide locks back when fired dry (user 2026-11-24: realistic, and
+        // shows the gun is empty); a short rack with the new magazine seated
+        // lets it forward.
+        { "glock", "bone_clip", "Bone01", 17, 1.8f, true,
           "weapons/pistol/pistol_empty.wav", "weapons/glock/reload_roundchambered.wav",
           { 3.90f, -0.12f, 0.04f }, { 2.56f, -0.09f, 0.04f }, false, nullptr, { 0, 0, 0 }, nullptr },
         { "shotgun", "bone_shell", "bone_pump", 8, 4.5f, false,
@@ -22523,6 +23251,10 @@ void VR::UpdateMagReload(uint32_t& buttons)
     }
     const WeaponDef& def = Def(weapon);
     WeaponState& w = s_w[weapon];
+    // A locked-back slide can only be worked once the new magazine is in
+    // (user 2026-11-24: arcade, no racking it before the swap). No grab, no
+    // haptic buzz, no hand pose until then.
+    const auto slideReadyNow = [&]() { return !def.slideLocksBack || w.mag == kLoaded; };
     // The reload button only ejects; the game's reload runs when a magazine
     // is seated (it keeps the ammo count and the reserve the game's own).
     buttons &= ~IN_RELOAD;
@@ -22593,7 +23325,13 @@ void VR::UpdateMagReload(uint32_t& buttons)
         w.mag = kDry;
         w.chambered = def.boltBone == nullptr; // no bolt/slide to work: nothing to rack
         w.dryRefill = true;
-        Game::logMsg("Mag reload: %s fired dry, swap the magazine", def.name);
+        // Locking slide (glock): goes back on its own with the slide's
+        // pull-back sound and stays (almost fully) back; a short rack then
+        // lets it go forward (user 2026-11-24: racking a closed slide on an
+        // empty gun was not realistic).
+        if (def.slideLocksBack)
+            sound(bmvr::soundcuts::Sample(bmvr::soundcuts::kGlockSlideBack, nullptr));
+        Game::logMsg("Mag reload: %s fired dry, swap the magazine%s", def.name, def.slideLocksBack ? " (slide held back)" : "");
     }
     const float grip = LeftSupportGripValue();
     const bool gripDown = grip > 0.6f;
@@ -23186,7 +23924,7 @@ void VR::UpdateMagReload(uint32_t& buttons)
     // lets go of the handle (also with the two-hand grip toggle: user
     // 2026-11-19, the toggle kept the MP5 handle held after the grip was
     // released and the hand moving back still finished the pull).
-    else if (!boltGrab && gripEdge && w.mag != kInHand && !w.chambered && g_NearBolt.load())
+    else if (!boltGrab && gripEdge && w.mag != kInHand && !w.chambered && slideReadyNow() && g_NearBolt.load())
     {
         boltGrab = true;
         s_boltFull = false;
@@ -23233,12 +23971,38 @@ void VR::UpdateMagReload(uint32_t& buttons)
     // (was every 150 ms while there: user 2026-11-19, kept vibrating).
     {
         static bool s_wasNear = false;
-        const bool atBolt = !boltGrab && !w.chambered && w.mag != kInHand && g_NearBolt.load();
+        const bool atBolt = !boltGrab && !w.chambered && w.mag != kInHand && slideReadyNow() && g_NearBolt.load();
         if (atBolt && !s_wasNear)
             PulseHandHaptic(vr::TrackedControllerRole_LeftHand, 600, 0.3f);
         s_wasNear = atBolt;
     }
-    if (boltGrab)
+    if (boltGrab && def.slideLocksBack)
+    {
+        // Slide held back (fired dry): pulled a little further
+        // (~1 cm of hand travel) and let go, or pulled fully back, it snaps
+        // forward with the second half of the slide sound.
+        static bool s_slideArmed = false;
+        const float pull = g_BoltPull.load();
+        if (pull >= 0.2f)
+            s_slideArmed = true;
+        if (pull >= 0.85f || (released && s_slideArmed))
+        {
+            boltGrab = false;
+            s_boltFull = false;
+            s_slideArmed = false;
+            w.chambered = (w.mag == kLoaded) && clip > 0;
+            sound(bmvr::soundcuts::Sample(bmvr::soundcuts::kGlockSlideForward, def.boltSound));
+            ReloadHaptic(ReloadFeel::Chamber);
+            Game::logMsg("Mag reload: %s slide released (pull %.2f), chambered %d", def.name, pull, w.chambered ? 1 : 0);
+        }
+        else if (released)
+        {
+            boltGrab = false;
+            s_slideArmed = false;
+            Game::logMsg("Mag reload: %s slide let go without a rack (pull %.2f), stays back", def.name, pull);
+        }
+    }
+    else if (boltGrab)
     {
         const float pull = g_BoltPull.load();
         if (pull >= 0.85f)
@@ -23249,13 +24013,9 @@ void VR::UpdateMagReload(uint32_t& buttons)
             boltGrab = false;
             s_boltFull = false;
             w.chambered = (w.mag == kLoaded) && clip > 0;
-            // Glock: the slide part of its reload.wav (user 2026-11-20:
-            // reload_roundchambered went on 1.6 s past the hand).
             // MP5: Black Mesa's own charging handle (HL2's smg1 switch was
             // louder on the left).
-            if (weapon == kWeaponGlock)
-                sound(bmvr::soundcuts::Sample(bmvr::soundcuts::kGlockSlide, def.boltSound));
-            else if (weapon == kWeaponMp5)
+            if (weapon == kWeaponMp5)
                 sound(bmvr::soundcuts::Sample(bmvr::soundcuts::kMp5Bolt, def.boltSound));
             else
                 sound(def.boltSound);
@@ -23302,7 +24062,7 @@ void VR::UpdateMagReload(uint32_t& buttons)
     }
     // Open (locked back) slide: glock with an empty chamber.
     g_SlideLocked.store(def.slideLocksBack && !w.chambered);
-    g_NeedRack.store(!w.chambered);
+    g_NeedRack.store(!w.chambered && slideReadyNow());
     g_DisplayClip.store((w.mag == kLoaded) ? clip : 0);
     // After a dry fire the game's own reload already moved a magazine from
     // the reserve into its count; until the new magazine is seated the HUD

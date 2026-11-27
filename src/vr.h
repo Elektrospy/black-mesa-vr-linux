@@ -64,8 +64,26 @@ struct D3DAimLineOverlayEyeState
     uint32_t outlineColor = 0;
 };
 
-// Title HUD panels: HudCredits, HudMessage, CHudIntroCredits.
-constexpr int kTitleHudCount = 3;
+// Title HUD panels: HudCredits, HudMessage, CHudIntroCredits, then the HEV
+// suit and long jump boot-up sequences (kBootHudFirst..kBootHudEnd-1), then
+// the closed caption / subtitle panel (kCaptionHud, issue #18).
+constexpr int kTitleHudCount = 6;
+constexpr int kBootHudFirst = 3;
+constexpr int kBootHudEnd = 5;
+constexpr int kCaptionHud = 5;
+
+// Boot-up parts for the layer move: x, y, w, h on the boot panel, dx.
+constexpr int kBootHudMaxRects = 32;
+struct BootHudRects
+{
+    int panelW = 0, panelH = 0, count = 0;
+    bool boot = false;   // a boot-up panel (HEV suit / long jump) is showing
+    bool noGlow = false; // boot-up, or captions without logo/message/names
+    bool capMask = false; // glow on, but not over the caption box (uv rect)
+    float capRect[4] = {}; // u0, v0, u1, v1
+    int rects[kBootHudMaxRects][5] = {};
+};
+void PublishBootHudRects(const BootHudRects& r);
 
 class VR
 {
@@ -403,17 +421,11 @@ public:
     void NoteViewmodelBeamHidden(bool hide) { m_ViewmodelBeamHidden.store(hide, std::memory_order_relaxed); }
     // Muzzle in the gun frame, from the bones as drawn (viewmodel DME).
     void NoteDrawnMuzzleLocal(const Vector& local);
-    // Lowered set (idletolow / lowidle / lowtoidle, gun held down while aimed
-    // at a friendly): the clip moves the gun's bones, while the two-hand
-    // support glove sits on the controller-derived grip point. The glove
-    // follows the drawn weapon root bone's move away from its idle pose
-    // (the gun body; the arms are separate bones and on the pistols the left
-    // wrist barely moves). State from CalcViewModelView (game thread) for the
-    // weapon's own viewmodel header; bone samples from the draw (render thread).
+    // Viewmodel clip state (game thread, weapon's own viewmodel header):
+    // idle / lowered (idletolow, lowidle, lowtoidle) / other. The stock
+    // off-hand finger sample waits for a settled idle.
     enum : int { kVmLowerIdle = 0, kVmLowerLowered = 1, kVmLowerOther = 2 };
     void NoteViewmodelLowerState(int state, const void* studioHdr);
-    // Weapon root bone origin and unit axes in the gun frame of that draw.
-    void NoteDrawnWeaponRootLocal(const void* studioHdr, const Vector& pos, const Vector axes[3]);
     bool ViewmodelIsRpg() const { return (m_VmClassFlags.load(std::memory_order_relaxed) & kVmFlagRpg) != 0; }
     bool ViewmodelIsGluon() const { return (m_VmClassFlags.load(std::memory_order_relaxed) & kVmFlagGluon) != 0; }
     bool ViewmodelIsScoped() const { return (m_VmClassFlags.load(std::memory_order_relaxed) & kVmFlagScoped) != 0; }
@@ -752,6 +764,12 @@ public:
     int m_TitleFitCount = 0;
     unsigned long long m_TitleHudNextSearchMs = 0;
     bool m_TitleHudActive = false;
+    // A suit boot-up sequence is on the title layer (head-locked).
+    bool m_BootHudActive = false;
+    // Captions (HudCloseCaption) are on the title layer (head-locked).
+    bool m_CaptionHudActive = false;
+    bool m_CaptionOnly = false;          // captions are the only title panel up
+    float m_CaptionCentreY = 0.717f;     // caption box centre, fraction of the screen height
     // The HUD RT paint in flight is the title layer (no menu cursor / colour
     // fix). Read on the material thread for the queued end.
     std::atomic<bool> m_HudPaintTitle{ false };
@@ -984,6 +1002,9 @@ public:
     // ladder, stretched = further). LadderBodyFollowsArms; +-8 units (more
     // where the rungs stand further out than 24 units, up to 24).
     Vector PhysicalLadderViewShift(const Vector& body);
+    // LadderCentreHead (called from PhysicalLadderViewShift): at the start
+    // of a hand climb the head is slid sideways onto the ladder's middle.
+    void PhysicalLadderCentreHead(const Vector& body, ULONGLONG now, float dt);
     struct LadderViewState
     {
         bool active = false;     // climbing by hand (set by PhysicalLadderStep)
@@ -995,7 +1016,28 @@ public:
         Vector shift{};          // last horizontal shift sent (PhysicalLadderViewShift)
         float limit = 8.f;
         ULONGLONG lastMs = 0;
+        // LadderCentreHead: sideways recentre at the start of a climb.
+        ULONGLONG lastActiveMs = 0;   // last frame climbing by hand
+        ULONGLONG centreStartMs = 0;  // centring window start (0 = none)
+        float centreFrom = 0.f;       // head's sideways offset when it started
+        float centred = 0.f;          // moved so far this climb (units)
     } m_LadderView;
+    // Physical crouching (PhysicalCrouch). ProcessInput: head this far below
+    // the recenter height holds IN_DUCK (hysteresis). RenderView: while the
+    // duck is a physical one, the engine's crouch eye drop is added back so
+    // the view stays at the real head (frozen in the air: a duck there lifts
+    // the origin instead).
+    void UpdatePhysicalCrouch(uint32_t& buttons);
+    float PhysicalCrouchViewOffset(float eyeZ);
+    struct CrouchViewState
+    {
+        bool active = false;      // head below the threshold (holds IN_DUCK)
+        bool otherDuck = false;   // stick/button crouch this tick
+        bool owned = false;       // the duck is ours: compensate the view
+        float standEye = 64.f;    // eye above the origin standing (learnt)
+        float offset = 0.f;       // last offset sent
+        ULONGLONG lastMs = 0;
+    } m_CrouchView;
     // ProcessInput: grip state per hand (0 left, 1 right) for PhysicalLadderStep.
     void UpdateLadderGrips();
     std::atomic<bool> m_LadderGrip[2]{};
@@ -1029,6 +1071,7 @@ public:
     // DEBUG "LADDER GRIP TUNING" rows <-> VR/ladder_grip.txt for the ladder
     // model last held (game thread).
     void SyncLadderGripRows();
+    void SyncAmmoHudRows();
     bool UseFollowsLeftHand() const { return m_GrabLatched && m_GrabHandLeft; }
     bool UseGrabActive() const { return m_GrabLatched; }
     // Weapon fire, shoot origin, and flashlight must not follow a leftover
@@ -1039,6 +1082,18 @@ public:
     // gets off), secondary fire shoots, and the barrel swings around its
     // mount opposite to the hands (MountedGunAim).
     bool OnMountedGun() const { return m_OnGun; }
+    // Free-hand Use (VR::UpdateUseGrab): the hand that is not the latched Use
+    // hand, its target (UpdateFreeHandUseTarget, client entity index = server
+    // index, 0 = none) and a press counter for impulse Use (Hooks::dPlayerUse).
+    std::atomic<bool> m_FreeUseHeld{false};
+    std::atomic<bool> m_FreeUseLeft{false};
+    std::atomic<uint32_t> m_FreeUsePressSeq{0};
+    std::atomic<int> m_FreeUseEntIndex{0};
+    void UpdateFreeHandUseTarget();
+    // Alt-fire while carrying a prop: the game's throw (fire press) is due.
+    bool CarryThrowActive() const { return GetTickCount64() < m_CarryThrowUntilMs.load(std::memory_order_acquire); }
+    static constexpr uint64_t kCarryThrowPulseMs = 60;
+    std::atomic<uint64_t> m_CarryThrowUntilMs{0};
     void UpdateMountedGun();
     // Usercmd angles that turn the gun's barrel where the hands push it:
     // hands right = barrel left, hands up = barrel down, relative to where
@@ -1228,6 +1283,11 @@ public:
         // a reload, so the reserve flicked back to its old value.
         bool hudOk = false;
         int hud[6] = { -1, -1, -1, -1, -1, -1 };
+        // Gun-hand angles for the ammo panel: turned with the two-hand aim
+        // while a long gun is held with both hands (TwoHandGunHudAngles).
+        bool gunHudTwoHand = false;
+        QAngle gunHudAng{};
+        Vector gunHudShift{};
     };
     void CaptureHandDrawSnap(HandDrawSnap& s);
     // HUD values for drawing: the drawing frame's snapshot while one is drawn
@@ -1328,6 +1388,7 @@ public:
     // ancestors; returns how many were hidden into `hidden`.
     bool TitleHudPanelShowing(int i) const;
     int IsolateTitleHudPanels(unsigned int* hidden, int cap);
+    void LogBootHudChildren();
     void RestoreTitleHudPanels(const unsigned int* hidden, int count);
     void UpdateScreenEffectNoDraw();
     void UpdateEnvmapScale();
@@ -1575,6 +1636,11 @@ public:
     // Live L_Wrist (or L_Hand) world origin from DrawModelExecute bone matrices.
     void NoteViewmodelOffhandWorld(const Vector& worldOrigin, bool sideHandle = false);
     bool TryGetTwoHandOffhandDrawPose(bool physicalLeft, Vector& trackingPos, QAngle& trackingAng) const;
+    // Two-handed long gun: gunCtrlAng turned from the one-hand gun basis to the
+    // two-hand aim basis, so the ammo panel stays on the gun, not the hand.
+    // shift: move the gun-hand controller position by it (the gun pivots on
+    // the aim pose, the panel hangs off the grip pose).
+    bool TwoHandGunHudAngles(const QAngle& gunCtrlAng, QAngle& out, Vector& shift) const;
     bool HudOverlayReady() const { return m_HudOverlayReady; }
     void EnsureHudOverlay();
     void ClearHudSurface(bool opaque);
@@ -1764,26 +1830,19 @@ private:
     Vector m_TwoHandSmoothF{};
     Vector m_TwoHandSmoothU{};
     bool m_TwoHandSmoothValid = false;
-    // Lowered-gun glove follow (NoteViewmodelLowerState / NoteDrawnWeaponRootLocal).
+    // ApplyTwoHandWeaponAim (long guns): gun basis before / after the two-hand
+    // aim, for TwoHandGunHudAngles.
+    Vector m_TwoHandHudFrom[3]{};
+    Vector m_TwoHandHudTo[3]{};
+    Vector m_TwoHandHudShift{};   // world, added to the gun-hand controller position
+    bool m_TwoHandHudValid = false;
+    // Viewmodel clip state (NoteViewmodelLowerState) + stock off-hand fingers.
     std::atomic<int> m_VmLowerState{ kVmLowerOther };
     std::atomic<const void*> m_VmLowerHdr{ nullptr };
     std::atomic<ULONGLONG> m_VmLowerIdleSinceMs{ 0 };
     mutable std::mutex m_StockFingersMutex;
     float m_StockFingers[15][12]{};
     const void* m_StockFingersHdr = nullptr;
-    Vector m_GunRootRefPos{};
-    Vector m_GunRootRefAx[3]{};
-    Vector m_GunRootLivePos{};
-    Vector m_GunRootLiveAx[3]{};
-    const void* m_GunRootSampleHdr = nullptr;
-    bool m_GunRootRefValid = false;
-    bool m_GunRootLiveValid = false;
-    bool m_TwoHandLoweredLogged = false;
-    float m_TwoHandLoweredMaxMove = 0.f;
-    float m_TwoHandLoweredMaxTurn = 0.f;
-    // Moves the support glove's gun-frame grip point with the gun body's
-    // lowered-vs-idle move; its angles stay. Caller holds m_ControllerMutex.
-    void ApplyLoweredOffhand(Vector& gripLocal);
     int m_AutoMatQueueModeLastRequested = -999;
     std::chrono::steady_clock::time_point m_AutoMatQueueModeLastCmdTime{};
     bool m_VrCvarsApplied = false;

@@ -134,15 +134,25 @@ namespace
             { "PHYSICAL LADDERS (BETA)", RowKind::Section, nullptr, nullptr, nullptr, 0, 0, 0, nullptr },
             { "Physical ladders (beta)", RowKind::Toggle, "PhysicalLadders", &bmvr::g_PhysicalLadders, nullptr, 0, 0, 0, nullptr },
             { "Ladder distance follows arms", RowKind::Toggle, "LadderBodyFollowsArms", &bmvr::g_LadderBodyFollowsArms, nullptr, 0, 0, 0, nullptr },
+            { "Centre on the ladder", RowKind::Toggle, "LadderCentreHead", &bmvr::g_LadderCentreHead, nullptr, 0, 0, 0, nullptr },
             { "Gun hand on ladders", RowKind::Choice, "LadderGunHand", nullptr, &bmvr::g_LadderGunHand, 1.f, 0.f, 2.f, "Holster + draw again|Needs empty hand|Holster only" },
             { "Hand wraps the rung", RowKind::Toggle, "LadderHandWrap", &bmvr::g_LadderHandWrap, nullptr, 0, 0, 0, nullptr },
             { "Hand distance from rung", RowKind::Number, "LadderHandBack", nullptr, &bmvr::g_LadderHandBack, 0.5f, 0.f, 10.f, "%.1f" },
             { "Stick climbs ladders too", RowKind::Toggle, "LadderStickClimb", &bmvr::g_LadderStickClimb, nullptr, 0, 0, 0, nullptr },
+            // Crouch in real life below the recenter height minus this; the view stays at the real head.
+            { "PHYSICAL CROUCHING", RowKind::Section, nullptr, nullptr, nullptr, 0, 0, 0, nullptr },
+            { "Physical crouching", RowKind::Toggle, "PhysicalCrouch", &bmvr::g_PhysicalCrouch, nullptr, 0, 0, 0, nullptr },
+            { "Head drop to crouch", RowKind::Number, "PhysicalCrouchDropCm", nullptr, &bmvr::g_PhysicalCrouchDropCm, 5.f, 15.f, 80.f, "%.0f cm" },
             { "VIEW", RowKind::Section, nullptr, nullptr, nullptr, 0, 0, 0, nullptr },
             { "Recenter after pause menu", RowKind::Toggle, "AutoRecenterOnResume", &bmvr::g_AutoRecenterOnResume, nullptr, 0, 0, 0, nullptr },
             { "Cutscene cameras move the view", RowKind::Toggle, "FollowScriptedCamera", &bmvr::g_FollowScriptedCamera, nullptr, 0, 0, 0, nullptr },
             // Main + pause menu at the room's front (STAGE forward) instead of the head (user 2026-11-24: off by default).
             { "Room-anchored menus", RowKind::Toggle, "MenuRoomFront", &bmvr::g_MenuRoomFront, nullptr, 0, 0, 0, nullptr },
+            // HeightOffset in cm; applies live to the view and hands.
+            { "Height offset", RowKind::Number, "HeightOffset", nullptr, &bmvr::g_HeightOffsetCm, 2.f, -60.f, 60.f, "%+.0f cm" },
+            // Subtitles / closed captions (turn them on in the game's audio options).
+            { "Subtitle height", RowKind::Number, "CaptionHeight", nullptr, &bmvr::g_CaptionHeightDeg, 1.f, -30.f, 30.f, "%+.0f\xB0" },
+            { "Subtitle size", RowKind::Number, "CaptionScale", nullptr, &bmvr::g_CaptionScale, 0.05f, 0.5f, 2.f, "%.2fx" },
             { "Near clip (7 = game)", RowKind::Number, "VrNearZ", nullptr, &bmvr::g_VrNearZ, 0.5f, 1.f, 7.f, "%.1f" },
             // No key/fmt: the button's default action is a recenter (closes the panel).
             { "Recenter", RowKind::Button, nullptr, nullptr, nullptr, 0, 0, 0, nullptr },
@@ -161,7 +171,7 @@ namespace
             { "HANDS & WEAPONS", RowKind::Tab, nullptr, nullptr, nullptr, 0, 0, 0, nullptr },
             // Hands, hand HUD and the weapon menu (user 2026-11-19: one group). The
             // developer rows (size, gun hand, roll, HUD offsets) only show with
-            // "Show developer rows"; the reset covers them all (classic hands off too).
+            // "Show developer rows"; the tab reset covers them.
             { "HANDS & HUD", RowKind::Section, nullptr, nullptr, nullptr, 0, 0, 0, nullptr },
             { "Health/ammo on the hands", RowKind::Toggle, "VrHandHud", &bmvr::g_HandHud, nullptr, 0, 0, 0, nullptr },
             { "Red edges when hit", RowKind::Toggle, "DamageFlash", &bmvr::g_DamageFlash, nullptr, 0, 0, 0, nullptr },
@@ -179,9 +189,15 @@ namespace
             { "Sideways (+ = left)", RowKind::Number, "HandHudSide", nullptr, &bmvr::g_HandHudSide, 0.25f, -6.f, 6.f, "%+.2f" },
             { "Tilt", RowKind::Number, "HandHudTilt", nullptr, &bmvr::g_HandHudTilt, 2.f, -90.f, 90.f, "%+.0f\xB0" },
             { "Roll toward you", RowKind::Number, "HandHudRoll", nullptr, &bmvr::g_HandHudRoll, 2.f, -180.f, 180.f, "%+.0f\xB0" },
-            { "Reset hands + HUD position", RowKind::Button, nullptr, nullptr, nullptr, 0, 0, 0, "handhud_default" },
             { "FLASHLIGHT", RowKind::Section, nullptr, nullptr, nullptr, 0, 0, 0, nullptr },
             { "Flashlight from", RowKind::Choice, "FlashlightFrom", nullptr, &bmvr::g_FlashlightFrom, 1.f, 0.f, 2.f, "Right hand|Left hand|Head" },
+            // Support hand on the gun. Grip area scale sizes the zone where a squeeze takes the gun
+            // (wider + further forward; its rear end, toward the gun hand, stays put).
+            { "WEAPON GRIP", RowKind::Section, nullptr, nullptr, nullptr, 0, 0, 0, nullptr },
+            { "Toggle grip", RowKind::Toggle, "TwoHandGripToggle", &bmvr::g_TwoHandGripToggle, nullptr, 0, 0, 0, nullptr },
+            // Developer row: off = a latched grip lets go only on a second squeeze (or weapon/menu change).
+            { "Toggle grip auto release", RowKind::Toggle, "TwoHandToggleAutoRelease", &bmvr::g_TwoHandToggleAutoRelease, nullptr, 0, 0, 0, nullptr },
+            { "Grip area scale", RowKind::Number, "TwoHandGripScale", nullptr, &bmvr::g_TwoHandGripScale, 0.1f, 0.5f, 2.f, "%.1fx" },
             { "AIMING", RowKind::Section, nullptr, nullptr, nullptr, 0, 0, 0, nullptr },
             { "Aim marker", RowKind::Toggle, "VrCrosshair", &bmvr::g_VrCrosshair, nullptr, 0, 0, 0, nullptr },
             { "Marker as red dot", RowKind::Toggle, "VrCrosshairDot", &bmvr::g_VrCrosshairDot, nullptr, 0, 0, 0, nullptr },
@@ -189,7 +205,6 @@ namespace
             { "Laser beam", RowKind::Toggle, "VrLaserBeam", &bmvr::g_VrLaserBeam, nullptr, 0, 0, 0, nullptr },
             { "Laser width", RowKind::Number, "VrLaserWidth", nullptr, &bmvr::g_VrLaserWidth, 0.01f, 0.01f, 0.3f, "%.2f" },
             { "Gun angle", RowKind::Number, "GunPitchOffset", nullptr, &bmvr::g_GunPitchOffset, 1.f, -45.f, 45.f, "%+.0f\xB0" },
-            { "Two-hand grip toggles", RowKind::Toggle, "TwoHandGripToggle", &bmvr::g_TwoHandGripToggle, nullptr, 0, 0, 0, nullptr },
             { "GRENADES", RowKind::DevSection, nullptr, nullptr, nullptr, 0, 0, 0, nullptr },
             { "Throw at hand speed", RowKind::Toggle, "VrHandThrow", &bmvr::g_VrHandThrow, nullptr, 0, 0, 0, nullptr },
             { "Throw strength", RowKind::Number, "ThrowScale", nullptr, &bmvr::g_ThrowScale, 0.25f, 1.f, 8.f, "%.2f" },
@@ -219,7 +234,6 @@ namespace
             // finger pose + lock and the satchel hands are always on (user 2026-11-19).
             { "PHYSICAL WEAPONS (BETA)", RowKind::Section, nullptr, nullptr, nullptr, 0, 0, 0, nullptr },
             { "Physical weapons (beta)", RowKind::Toggle, "PhysicalWeapons", &bmvr::g_PhysicalWeapons, nullptr, 0, 0, 0, nullptr },
-            { "Grenade pin by hand", RowKind::Toggle, "VrGrenadePin", &bmvr::g_VrGrenadePin, nullptr, 0, 0, 0, nullptr },
             { "Ejected rounds are lost", RowKind::Toggle, "VrMagDiscard", &bmvr::g_VrMagDiscard, nullptr, 0, 0, 0, nullptr },
             { "Reload hints", RowKind::Toggle, "VrReloadHints", &bmvr::g_VrReloadHints, nullptr, 0, 0, 0, nullptr },
             // Developer row: A/B for the hand poses taken from Black Mesa's reload clips.
@@ -428,6 +442,8 @@ namespace
             { "Xen ground fog off", RowKind::Toggle, nullptr, &bmvr::g_XenGlobalFogOff, nullptr, 0, 0, 0, nullptr },
             { "Particles after water", RowKind::Toggle, "ParticlesLast", &bmvr::g_ParticlesLast, nullptr, 0, 0, 0, nullptr },
             { "Titles glow + scanlines", RowKind::Toggle, nullptr, &bmvr::g_TitleGlow, nullptr, 0, 0, 0, nullptr },
+            { "HEV boot-up HUD inset", RowKind::Number, nullptr, nullptr, &bmvr::g_BootHudInset, 25.f, 0.f, 500.f, "%.0f px" },
+            { "HEV boot-up HUD size", RowKind::Number, nullptr, nullptr, &bmvr::g_BootHudScale, 0.05f, 0.5f, 2.f, "%.2fx" },
             { "FIXES: TRACKING, WEAPONS, GAME", RowKind::DevSection, nullptr, nullptr, nullptr, 0, 0, 0, nullptr },
             { "Hands + laser per-frame snapshot", RowKind::Toggle, nullptr, &bmvr::g_McHandSnapshot, nullptr, 0, 0, 0, nullptr },
             { "No stun/blur overlays", RowKind::Toggle, nullptr, &bmvr::g_VrSkipScreenEffects, nullptr, 0, 0, 0, nullptr },
@@ -443,6 +459,20 @@ namespace
             { "Support hand (+ forward)", RowKind::Number, nullptr, nullptr, &bmvr::g_VmTuneSupportCm, 1.f, -20.f, 20.f, "%+.0f cm" },
             { "Mag seat distance", RowKind::Number, nullptr, nullptr, &bmvr::g_VmTuneSeatCm, 0.5f, 1.f, 30.f, "%.1f cm" },
             { "Mag seat angle (180 = any)", RowKind::Number, nullptr, nullptr, &bmvr::g_VmTuneSeatDeg, 5.f, 5.f, 180.f, "%.0f deg" },
+            // Ammo panel beside the gun hand, for the weapon in the hand (VR/ammo_hud.txt,
+            // VR::SyncAmmoHudRows). User 2026-11-25: tune each weapon while playing;
+            // ranges +25% (user 2026-11-25: some guns hit the limits).
+            { "AMMO HUD (SAVED PER WEAPON)", RowKind::DevSection, nullptr, nullptr, nullptr, 0, 0, 0, nullptr },
+            { "Ammo HUD forward (- = back)", RowKind::Number, nullptr, nullptr, &bmvr::g_AmmoHudForward, 0.25f, -10.f, 10.f, "%+.2f" },
+            { "Ammo HUD sideways (+ = out)", RowKind::Number, nullptr, nullptr, &bmvr::g_AmmoHudSide, 0.25f, -7.5f, 7.5f, "%+.2f" },
+            { "Ammo HUD up", RowKind::Number, nullptr, nullptr, &bmvr::g_AmmoHudUp, 0.25f, -7.5f, 7.5f, "%+.2f" },
+            { "Ammo HUD tilt (top toward you)", RowKind::Number, nullptr, nullptr, &bmvr::g_AmmoHudTilt, 5.f, -115.f, 115.f, "%+.0f\xB0" },
+            { "Ammo HUD turn (front toward you)", RowKind::Number, nullptr, nullptr, &bmvr::g_AmmoHudTurn, 5.f, -115.f, 115.f, "%+.0f\xB0" },
+            { "Ammo HUD roll", RowKind::Number, nullptr, nullptr, &bmvr::g_AmmoHudRoll, 5.f, -225.f, 225.f, "%+.0f\xB0" },
+            { "Ammo HUD size", RowKind::Number, nullptr, nullptr, &bmvr::g_AmmoHudSize, 0.25f, 0.4f, 7.5f, "%.2f" },
+            // A/B (user 2026-11-25): off = with both hands on a long gun the panel
+            // stays on the gun's aim; on = the old gun-hand controller rotation.
+            { "Two hands: ammo HUD follows hand", RowKind::Toggle, nullptr, &bmvr::g_TwoHandAmmoHudFollowsHand, nullptr, 0, 0, 0, nullptr },
             // Per ladder model, for the last rung held (VR::SyncLadderGripRows).
             { "LADDER GRIP TUNING (SAVED PER LADDER MODEL)", RowKind::DevSection, nullptr, nullptr, nullptr, 0, 0, 0, nullptr },
             { "Grip out (toward you)", RowKind::Number, nullptr, nullptr, &bmvr::g_LadderTuneOutCm, 0.5f, -10.f, 10.f, "%+.1f cm" },
@@ -469,10 +499,11 @@ namespace
         if (!k)
             return false;
         static const char* kDev[] = {
-            "LadderBodyFollowsArms", "LadderHandBack", "LadderHandWrap", "VrNearZ", "MenuHeightOffsetMeters", "MenuCursorSmoothSec",
+            "LadderBodyFollowsArms", "LadderCentreHead", "LadderHandBack", "LadderHandWrap", "VrNearZ", "MenuHeightOffsetMeters", "MenuCursorSmoothSec",
             "ControlsPicture", "DamageFlashStrength", "VrHandsBlackMesaScale", "VrGunRightHand", "VrHandsRollDeg",
             "HandHudUp", "HandHudForward", "HandHudSide", "HandHudTilt", "HandHudRoll",
             "ScopeRaiseMeters", "ScopeGunSmoothSec", "ThrowStroke", "MountedGunGain", "LastShotHapticStrength", "DryFireHapticStrength", "VrClipHandPose", "VrClipHandSnap",
+            "TwoHandToggleAutoRelease",
             "MsaaParticles1x", "FxaaSubpixel", "FxaaEdgeThreshold", "FxaaEdgeThresholdMin",
             "EnvmapScaleWorld", "EnvmapScaleModels", "LodBias",
             "FlareFadeAngle", "FlareLightScale", "FlareHazeScale", "FlareHazeMinSize", "FlareGhostScale", "flare_default",
@@ -489,7 +520,7 @@ namespace
     // under a texture point (px absolute, ly from the row top), and the grab
     // zones a hand is in now (bit z = left hand, bit 8 + z = right hand; set
     // by VR::DrawSettingsPanel while the tab shows, lights the zone up).
-    constexpr int kGestureFigureH = 900;
+    constexpr int kGestureFigureH = 990;
     int GestureFigureHit(bool rightSide, int px, int ly);
     bool IsGestureSlotRow(const Row& r);
     unsigned g_GestureHot = 0;
@@ -1016,6 +1047,16 @@ namespace
                 Game::logMsg("VR settings reset: %s -> %s", r.label, r.defB ? "on" : "off");
                 ++changed;
             }
+            else if (float ammoDef = 0.f; r.kind == RowKind::Number && bmvr::AmmoHudRowDefault(r.f, ammoDef))
+            {
+                // Per-weapon ammo HUD rows: back to the held weapon's built-in values.
+                if (std::fabs(*r.f - ammoDef) > 1e-4f)
+                {
+                    *r.f = ammoDef;
+                    Game::logMsg("VR settings reset: %s -> %g", r.label, ammoDef);
+                    ++changed;
+                }
+            }
             else if ((r.kind == RowKind::Number || r.kind == RowKind::Choice) && r.f
                 && (r.f == &bmvr::g_VmTuneSeatCm || r.f == &bmvr::g_VmTuneSeatDeg))
             {
@@ -1400,13 +1441,15 @@ namespace
             return !g_SnapTurning;
         if (is({ "TurnSpeed" }))
             return g_SnapTurning;
-        if (is({ "LadderBodyFollowsArms", "LadderGunHand", "LadderHandBack", "LadderHandWrap", "LadderStickClimb" }))
+        if (is({ "LadderBodyFollowsArms", "LadderCentreHead", "LadderGunHand", "LadderHandBack", "LadderHandWrap", "LadderStickClimb" }))
             return !g_PhysicalLadders;
+        if (is({ "PhysicalCrouchDropCm" }))
+            return !g_PhysicalCrouch;
         if (is({ "DamageFlashStrength" }))
             return !g_DamageFlash;
         if (is({ "HandHudSize", "HandHudUp", "HandHudForward", "HandHudSide", "HandHudTilt", "HandHudRoll" }))
             return !g_HandHud;
-        if (is({ "VrRecoil", "VrGrenadePin", "VrMagDiscard", "VrReloadHints", "VrClipHandPose", "VrClipHandSnap", "VrClipHandRpg", "VrClipHandRpgFlip" }))
+        if (is({ "VrRecoil", "VrMagDiscard", "VrReloadHints", "VrClipHandPose", "VrClipHandSnap", "VrClipHandRpg", "VrClipHandRpgFlip" }))
             return !g_PhysicalWeapons;
         if (is({ "VrRecoilScale", "VrRecoilTwoHand" }))
             return !PhysicalWeapon(g_VrRecoil);
@@ -1507,6 +1550,8 @@ namespace
             return false;
         // Key-less rows (bmvr_* fixes, tests, tuning) count too: "Reset tab" puts them back,
         // so they must be marked and counted (user 2026-11-22: render fixes were not).
+        if (float ammoDef = 0.f; bmvr::AmmoHudRowDefault(r.f, ammoDef))
+            return std::fabs(*r.f - ammoDef) > 1e-4f;
         if (r.f && (r.f == &bmvr::g_VmTuneSeatCm || r.f == &bmvr::g_VmTuneSeatDeg))
         {
             float cm = 0.f, deg = 0.f;
@@ -1924,19 +1969,26 @@ namespace
     constexpr int kFigCx = kColW;
     constexpr int kGCardW = 540;
     constexpr int kGCardL0 = 40, kGCardR0 = kTexW - 40 - kGCardW;
+    // The figure sits kFigDy below the row top (user 2026-11-24: lower, so the
+    // hip leader lines run straight; only the forehead's slants).
+    constexpr int kFigDy = 94;
     struct ZoneBox { int x0, y0, x1, y1; };
     ZoneBox GestureZoneBox(int z)
     {
+        ZoneBox b;
         switch (z)
         {
-        // Fitted to VR/panel/gesture_body.png (345x860, drawn from y 10):
+        // Fitted to VR/panel/gesture_body.png (345x860, drawn from y kFigDy):
         // behind the shoulder pads beside the head, the hands / belt sides.
-        case bmvr::kGestureShoulderLeft:  return { kFigCx - 185, 95, kFigCx - 50, 235 };
-        case bmvr::kGestureShoulderRight: return { kFigCx + 50, 95, kFigCx + 185, 235 };
-        case bmvr::kGestureHipLeft:       return { kFigCx - 205, 385, kFigCx - 85, 545 };
-        case bmvr::kGestureHipRight:      return { kFigCx + 85, 385, kFigCx + 205, 545 };
-        default:                          return { kFigCx - 58, 12, kFigCx + 58, 92 };   // forehead (seen through the head)
+        case bmvr::kGestureShoulderLeft:  b = { kFigCx - 185, 85, kFigCx - 50, 225 }; break;
+        case bmvr::kGestureShoulderRight: b = { kFigCx + 50, 85, kFigCx + 185, 225 }; break;
+        case bmvr::kGestureHipLeft:       b = { kFigCx - 205, 375, kFigCx - 85, 535 }; break;
+        case bmvr::kGestureHipRight:      b = { kFigCx + 85, 375, kFigCx + 205, 535 }; break;
+        default:                          b = { kFigCx - 58, 2, kFigCx + 58, 82 }; break;   // forehead (seen through the head)
         }
+        b.y0 += kFigDy;
+        b.y1 += kFigDy;
+        return b;
     }
     bool IsGestureSlotRow(const Row& r)
     {
@@ -1993,12 +2045,12 @@ namespace
         if (!rightSide)
         {
             add(bmvr::kGestureHead, 10, false);
-            add(bmvr::kGestureShoulderLeft, 150, true);
+            add(bmvr::kGestureShoulderLeft, 230, true);
             add(bmvr::kGestureHipLeft, 530, true);
         }
         else
         {
-            add(bmvr::kGestureShoulderRight, 150, true);
+            add(bmvr::kGestureShoulderRight, 230, true);
             add(bmvr::kGestureHipRight, 530, true);
         }
         return cards;
@@ -2102,9 +2154,10 @@ namespace
         const BodyPicture& pic = GestureBodyPicture();
         if (pic.w > 0)
         {
-            BlendPicture(c, pic, cx - pic.w / 2, top + 10);
+            BlendPicture(c, pic, cx - pic.w / 2, top + kFigDy);
             return;
         }
+        top += kFigDy - 10;   // drawn fallback, laid out for the picture at y 10
         const COLORREF body = RGB(66, 74, 86), shade = RGB(50, 57, 67);
         HDC dc = c.dc;
         HBRUSH br = CreateSolidBrush(body);
@@ -3139,22 +3192,6 @@ void VR::UpdateSettingsPanel()
         CloseSettingsPanel("close row");
         return;
     case RowKind::Button:
-        // Hands + hand HUD placement back at their defaults (thumb-up roll,
-        // gun grip, HUD spot); HUD and hit flash on/off stay as they are.
-        if (r.fmt && std::strcmp(r.fmt, "handhud_default") == 0)
-        {
-            bmvr::g_VrHandsRollDeg = 90.f;
-            bmvr::g_VrHandsGunGripRight = 1.2f;
-            bmvr::g_VrHandsGunGripUp = 0.f;
-            bmvr::g_VrHandsGunGripForward = 0.f;
-            bmvr::g_HandHudSize = 2.5f;
-            bmvr::g_HandHudUp = 2.2f;
-            bmvr::g_HandHudForward = -0.55f;
-            bmvr::g_HandHudSide = 0.3f;
-            bmvr::g_HandHudTilt = -18.f;
-            bmvr::g_HandHudRoll = 14.f;
-            break;
-        }
         // First click arms, a second one within 3 s resets the tab (nothing is lost by a stray click).
         if (r_IsTabReset(r))
         {
